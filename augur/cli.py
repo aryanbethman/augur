@@ -16,7 +16,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", required=True, help="e.g. meta-llama/Llama-3.1-8B")
     p.add_argument("--workload", required=True, help="JSONL in the fork's format (flat and/or agentic)")
     p.add_argument("--num-entries", type=int, default=None, help="first N requests/sessions only")
-    p.add_argument("--engines", type=int, default=1)
+    p.add_argument("--engines", type=int, default=1, help="colocated engines (ignored with --prefill-engines)")
+    p.add_argument("--prefill-engines", type=int, default=0, help="PD: prefill engines (NIXL kv_producer)")
+    p.add_argument("--decode-engines", type=int, default=0, help="PD: decode engines (NIXL kv_consumer)")
+    p.add_argument("--pd-link-bw", type=float, default=16.0, help="PD KV pull bandwidth, GB/s")
+    p.add_argument("--pd-link-latency-ns", type=int, default=20_000)
     p.add_argument("--router", default="least-loaded")
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--hbm-gb", type=float, default=80.0, help="simulated GPU memory")
@@ -77,12 +81,20 @@ def main(argv: list[str] | None = None) -> int:
                       max_num_seqs=a.max_num_seqs, block_size=a.block_size,
                       enable_prefix_caching=not a.no_prefix_caching, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager)
-    engines = [SimEngine(i, spec, cost) for i in range(a.engines)]
+    import dataclasses
+    if a.prefill_engines:
+        roles = ["kv_producer"] * a.prefill_engines + ["kv_consumer"] * a.decode_engines
+        engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), cost) for i, r in enumerate(roles)]
+    else:
+        engines = [SimEngine(i, spec, cost) for i in range(a.engines)]
     if a.step_log:
         for e in engines:
             e.step_log = []
+    from augur.engine import PDLink
     coord = Coordinator(engines, ROUTERS[a.router](), Workload(a.workload, max_entries=a.num_entries),
-                        lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0)
+                        lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
+                        decode_router=ROUTERS[a.router](),
+                        pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns))
     rec = coord.run()
     if a.output:
         rec.write_csv(a.output)
@@ -99,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     cpu = sum(e.sched_cpu_s for e in engines)
     if hasattr(cost, "oracle") and cost.oracle is not None:
         summary["astra_runs"] = cost.oracle.runs
-    summary.update({"engines": a.engines, "steps": steps, "wall_s": round(coord.wall_s, 2),
+    summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
                     "vllm_step_cpu_ms_per_step": round(1e3 * cpu / max(steps, 1), 3),
                     "kv_cache_gib_per_engine": round(kv_bytes / 2**30, 2),
                     "num_gpu_blocks": engines[0].vllm_config.cache_config.num_gpu_blocks})

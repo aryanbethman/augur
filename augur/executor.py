@@ -26,7 +26,7 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 from augur.cost import CostModel, SeqWork, StepShape
 
@@ -53,6 +53,13 @@ class SimContext:
     last_shape: StepShape | None = None
     last_new_req_ids: dict[str, int] = field(default_factory=dict)
     last_preempted_req_ids: list[str] = field(default_factory=list)
+    # PD (KV connector) plumbing. The real connector's scheduler half runs in
+    # vLLM; this stands in for its worker half.
+    kv_block_bytes: int = 0  # KV bytes of one block on this rank, all layers
+    new_recvs: list = field(default_factory=list)  # (req_id, blocks, remote_engine_id, remote_req_id)
+    deliver_recving: set = field(default_factory=set)  # reported as finished_recving next step
+    deliver_sending: set = field(default_factory=set)  # reported as finished_sending next step
+    last_delivered: bool = False
 
 
 @dataclass
@@ -90,6 +97,7 @@ class SimWorker:
             head_size=head_size,
             dtype=torch_dtype,
         )
+        self.ctx.kv_block_bytes = spec.page_size_bytes * num_layers
         return {f"model.layers.{i}.self_attn.attn": spec for i in range(num_layers)}
 
     def get_supported_kv_cache_layouts(self) -> list[str]:
@@ -114,6 +122,23 @@ class SimWorker:
         if so.preempted_req_ids:
             for rid in so.preempted_req_ids:
                 self.reqs.pop(rid, None)
+
+        # KV connector: requests whose KV the worker starts pulling this step.
+        self.ctx.new_recvs = []
+        meta = so.kv_connector_metadata
+        for rid, rm in (getattr(meta, "reqs_to_recv", None) or {}).items():
+            n_local = sum(len(g) for g in rm.local_block_ids)
+            n_done = sum(rm.local_num_computed_blocks) if rm.local_num_computed_blocks else 0
+            r = rm.remote
+            self.ctx.new_recvs.append((rid, max(n_local - n_done, 0),
+                                       r.engine_id if r else None, r.request_id if r else None))
+        kvo = None
+        self.ctx.last_delivered = bool(self.ctx.deliver_recving or self.ctx.deliver_sending)
+        if self.ctx.last_delivered:
+            kvo = KVConnectorOutput(finished_sending=set(self.ctx.deliver_sending) or None,
+                                    finished_recving=set(self.ctx.deliver_recving) or None)
+            self.ctx.deliver_recving.clear()
+            self.ctx.deliver_sending.clear()
 
         work: list[tuple[str, int, int]] = []  # (req_id, computed_before, num_new)
         # A new request's computed tokens at its first schedule are its prefix-cache hit.
@@ -163,6 +188,7 @@ class SimWorker:
             req_ids=req_ids,
             req_id_to_index={r: i for i, r in enumerate(req_ids)},
             sampled_token_ids=sampled,
+            kv_connector_output=kvo,
         )
 
 

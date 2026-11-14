@@ -158,7 +158,54 @@ starts at its release (the other ranks' reports route and schedule again).
 
 Wall time: TP2 ShareGPT 6.6 s vs LLMServingSim 13 s; TP2 SWE-bench 12.5 s vs 52 s.
 
+## M7: prefill/decode disaggregation (2026-11-14) — done
+
+vLLM's own NIXL connector runs on both engines, scheduler half as shipped
+(`kv_producer` on prefill, `kv_consumer` on decode). `augur/nixl_sim.py`
+subclasses it only to skip the ZeroMQ side-channel handshake, which binds a
+port at engine start and collides when engines share a process. The worker
+half is never built; the executor stands in for it:
+
+- The coordinator plays vLLM's PD proxy (as in vLLM's toy proxy): prefill
+  request with `max_tokens=1` and `do_remote_decode`; the `kv_transfer_params`
+  the prefill engine's NIXL scheduler returns (remote block ids, engine id,
+  ...) go with the full request to a decode engine.
+- The decode scheduler parks it in `WAITING_FOR_REMOTE_KVS`. The executor
+  sees `reqs_to_recv` in that step's connector metadata and starts a pull of
+  the uncomputed blocks: `latency + bytes / bandwidth` (`--pd-link-bw`,
+  `--pd-link-latency-ns`; defaults are the fork's 16 GB/s, 20 µs; no
+  contention between pulls yet).
+- When the pull ends, the decode engine reports `finished_recving` and the
+  prefill engine `finished_sending` at their next step, as vLLM's workers do.
+  vLLM then promotes the request, recomputes the last prompt token and
+  samples the first output token on the decode engine. Pinned prefill blocks
+  are released (checked: all blocks free at the end).
+- TTFT is the decode engine's first token, which is what the client of vLLM's
+  proxy sees. `prefill_done` is a new CSV column.
+
+Against LLMServingSim's PD config (1 prefill + 1 decode, ShareGPT 300):
+
+| | augur | LLMServingSim |
+| --- | --- | --- |
+| Prefill done (augur) vs TTFT (LLMServingSim), mean | 56.02 ms | 56.20 ms (p50 diff 0.30%) |
+| TPOT, `max_num_seqs` 1024 | 30.62 ms | 30.64 ms (0.09%) |
+| Latency, `max_num_seqs` 1024 | 19,990.6 ms | 19,912.4 ms (0.39%) |
+| TTFT, `max_num_seqs` 1024 | 152.5 ms | 56.2 ms |
+| TTFT, `max_num_seqs` 128 | 3,014 ms | 56.2 ms |
+
+The TTFT gap is behaviour LLMServingSim leaves out, not an error in either:
+
+- LLMServingSim's PD TTFT is the prefill finishing. In vLLM the client's first
+  token comes from the decode engine after the pull, the decode worker
+  reporting it at a step boundary, and the one-token recompute: 96 ms mean
+  here (p99 145 ms), about 2.7x LLMServingSim's TTFT.
+- LLMServingSim's decode instance adds requests straight to its running set,
+  bypassing `max_num_seqs`. vLLM's decode scheduler respects it, so at
+  `max_num_seqs` 128 requests queue on the decode engine for seconds.
+- LLMServingSim sends KV per layer inside the prefill step (slightly longer
+  prefill steps); vLLM's NIXL decode side pulls after the prefill.
+
 ## Next
 
-- M7: PD disaggregation via a simulated KV connector.
 - M8: DP+EP MoE lockstep. M9: async scheduling.
+- PD: pull contention (ASTRA-Sim congestion-aware), multiple P/D engines.

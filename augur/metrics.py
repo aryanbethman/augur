@@ -15,7 +15,7 @@ import numpy as np
 
 FORK_COLUMNS = ['instance id', 'request id', 'model', 'input', 'output', 'arrival', 'end_time',
                 'latency', 'queuing_delay', 'TTFT', 'TPOT', 'ITL']
-EXTRA_COLUMNS = ['session_id', 'sub_request_index', 'cached_tokens', 'num_preemptions']
+EXTRA_COLUMNS = ['session_id', 'sub_request_index', 'cached_tokens', 'num_preemptions', 'prefill_done']
 
 
 @dataclass
@@ -34,6 +34,7 @@ class CallRecord:
     end_ns: int | None = None
     cached_tokens: int = 0
     num_preemptions: int = 0
+    prefill_done_ns: int | None = None  # PD: when the prefill engine finished
 
     @property
     def ttft(self) -> int:
@@ -67,7 +68,8 @@ class Recorder:
                             r.end_ns, r.latency,
                             (r.first_sched_ns - r.arrival_ns) if r.first_sched_ns is not None else -1,
                             r.ttft, r.tpot, r.itl,
-                            r.session_id or '', r.index, r.cached_tokens, r.num_preemptions])
+                            r.session_id or '', r.index, r.cached_tokens, r.num_preemptions,
+                            r.prefill_done_ns if r.prefill_done_ns is not None else ''])
 
     def summary(self) -> dict:
         if not self.done:

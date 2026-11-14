@@ -53,7 +53,21 @@ class EngineSpec:
     tensor_parallel_size: int = 1
     dtype: str = "bfloat16"
     enforce_eager: bool = False  # vLLM's default: CUDA graphs on, so steps are padded
+    kv_role: str | None = None  # "kv_producer" (prefill) / "kv_consumer" (decode) for PD
 
+
+@dataclass
+class PDLink:
+    """KV pull from a prefill to a decode engine: latency + bytes / bandwidth.
+
+    No contention between concurrent pulls yet (ASTRA-Sim congestion-aware
+    mode is the planned upgrade). Defaults are the fork's single-node link."""
+
+    bw_gbps: float = 16.0
+    latency_ns: int = 20_000
+
+    def transfer_ns(self, nbytes: int) -> int:
+        return self.latency_ns + int(nbytes / self.bw_gbps)
 
 class SimEngine:
     def __init__(self, engine_id: int, spec: EngineSpec, cost: CostModel):
@@ -75,6 +89,7 @@ class SimEngine:
             async_scheduling=False,
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
+            kv_transfer_config=self._kv_transfer_config(engine_id, spec),
         )
         self.vllm_config = args.create_engine_config()
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
@@ -89,19 +104,37 @@ class SimEngine:
         self.wake_at: int | None = None
         self.step_log: list[tuple] | None = None  # (start_ns, dur_ns, total, prefill_tokens, n_decode, n_prefill)
 
+    @staticmethod
+    def _kv_transfer_config(engine_id: int, spec: EngineSpec):
+        if spec.kv_role is None:
+            return None
+        from vllm.config import KVTransferConfig
+        # vLLM's real NIXL connector; only its scheduler half is built (our
+        # executor stands in for the worker half and never loads NIXL).
+        return KVTransferConfig(kv_connector="SimNixlConnector", kv_connector_module_path="augur.nixl_sim",
+                                kv_role=spec.kv_role, engine_id=f"augur-{engine_id}")
+
+    @property
+    def vllm_engine_id(self) -> str:
+        return f"augur-{self.engine_id}"
+
     def load(self) -> int:
         s = self.core.scheduler
         return len(s.waiting) + len(s.running)
 
-    def add(self, call: Call, now_ns: int) -> None:
-        sp = SamplingParams(max_tokens=call.output_toks, ignore_eos=True, min_tokens=call.output_toks,
-                            output_kind=RequestOutputKind.DELTA, detokenize=False)
+    def add(self, call: Call, now_ns: int, request_id: str | None = None, max_tokens: int | None = None,
+            kv_transfer_params: dict | None = None) -> None:
+        n = call.output_toks if max_tokens is None else max_tokens
+        sp = SamplingParams(max_tokens=n, ignore_eos=True, min_tokens=n,
+                            output_kind=RequestOutputKind.DELTA, detokenize=False,
+                            extra_args={"kv_transfer_params": kv_transfer_params} if kv_transfer_params else None)
+        rid = request_id or call.call_id
         req = EngineCoreRequest(
-            request_id=call.call_id, prompt_token_ids=call.prompt_ids, mm_features=None,
+            request_id=rid, prompt_token_ids=call.prompt_ids, mm_features=None,
             sampling_params=sp, pooling_params=None, arrival_time=now_ns / 1e9,
             lora_request=None, cache_salt=None, data_parallel_rank=None,
         )
-        self.ctx.output_ids[call.call_id] = call.output_ids
+        self.ctx.output_ids[rid] = call.output_ids
         r, wave = self.core.preprocess_add_request(req)
         self.core.add_request(r, wave)
 
@@ -124,8 +157,24 @@ class _Event:
 
 class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
-                 lss_idle_quantum_ns: int = 0):
+                 lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
+                 pd_link: PDLink | None = None):
         self.engines = engines
+        # PD disaggregation: the coordinator plays vLLM's PD proxy. A call goes
+        # to a prefill engine with max_tokens=1 and do_remote_decode; the
+        # kv_transfer_params that engine's NIXL scheduler returns go with the
+        # full request to a decode engine, whose NIXL scheduler parks it until
+        # its KV has been pulled. Colocated when no engine has a kv_role.
+        self.prefill_engines = [e for e in engines if e.spec.kv_role == "kv_producer"]
+        self.decode_engines = [e for e in engines if e.spec.kv_role == "kv_consumer"]
+        self.pd = bool(self.prefill_engines)
+        if self.pd and not self.decode_engines:
+            raise ValueError("PD needs at least one decode engine")
+        self.entry_engines = self.prefill_engines if self.pd else engines
+        self.decode_router = decode_router
+        self.pd_link = pd_link or PDLink()
+        self._by_vllm_id = {e.vllm_engine_id: e for e in engines}
+        self._xfers_started: set[str] = set()
         # LLMServingSim loop compatibility, for comparisons only (off by
         # default; none of this is vLLM behaviour):
         # - A fully idle cluster advances in fixed quanta (1 ms): a session call
@@ -165,8 +214,16 @@ class Coordinator:
         self._last_entry_ns = t
         self._push(t, ARRIVAL, "entry", e)
 
+    @staticmethod
+    def _cid(request_id: str) -> str:
+        return request_id.split("@", 1)[0]  # PD request ids are <call>@p / <call>@d
+
+    def _pick(self, router: Router, call: Call, engines: list[SimEngine]) -> SimEngine:
+        eid = router.route(call, engines)
+        return next(e for e in engines if e.engine_id == eid)
+
     def _release(self, call: Call, exact: bool = True) -> None:
-        eng = self.engines[self.router.route(call, self.engines)]
+        eng = self._pick(self.router, call, self.entry_engines)
         if exact and not eng.busy:
             eng.idle_since = None
         if len(call.prompt_ids) + call.output_toks > eng.max_model_len:
@@ -178,7 +235,11 @@ class Coordinator:
         self._records[call.call_id] = rec
         self._calls[call.call_id] = call
         self._call_engine[call.call_id] = eng
-        eng.add(call, self.now)
+        if self.pd:
+            eng.add(call, self.now, request_id=call.call_id + "@p", max_tokens=1,
+                    kv_transfer_params={"do_remote_decode": True})
+        else:
+            eng.add(call, self.now)
 
     def _on_arrival(self, ev: _Event) -> None:
         p = ev.payload
@@ -194,16 +255,41 @@ class Coordinator:
             self._release(self.workload.next_call(s, self.now), exact=False)
         elif ev.kind == "wake":
             p.wake_at = None
+        elif ev.kind == "decode_dispatch":
+            cid, params = p
+            call = self._calls[cid]
+            d = self._pick(self.decode_router, call, self.decode_engines)
+            self._call_engine[cid] = d
+            self._records[cid].instance_id = d.engine_id
+            d.add(call, self.now, request_id=cid + "@d", kv_transfer_params=params)
+
+    def _on_transfer_done(self, ev: _Event) -> None:
+        d, d_rid, p, p_rid = ev.payload
+        d.ctx.deliver_recving.add(d_rid)
+        if p is not None and p_rid is not None:
+            p.ctx.deliver_sending.add(p_rid)
 
     def _on_step_done(self, ev: _Event) -> None:
         eng, outputs = ev.payload
         eng.busy = False
         for eco in outputs.values():
             for o in eco.outputs:
-                rec = self._records[o.request_id]
+                cid = self._cid(o.request_id)
+                rec = self._records[cid]
+                if o.request_id.endswith("@p"):
+                    # The prefill engine's one token goes back to the proxy, not
+                    # the client; the client's tokens come from the decode engine.
+                    if o.finish_reason is not None:
+                        eng.ctx.output_ids.pop(o.request_id, None)
+                        rec.prefill_done_ns = self.now
+                        if not o.kv_transfer_params:
+                            raise RuntimeError(f"{o.request_id}: prefill engine returned no kv_transfer_params")
+                        # The proxy forwards to decode once it has this response.
+                        self._push(self.now, CAUSED_ARRIVAL, "decode_dispatch", (cid, o.kv_transfer_params))
+                    continue
                 rec.token_times.extend([self.now] * len(o.new_token_ids))
                 if o.finish_reason is not None:
-                    self._finish(o.request_id, rec, eng)
+                    self._finish(cid, rec, eng)
         if eng.core.scheduler.get_num_unfinished_requests() == 0 and eng.idle_since is None:
             # Idle from the moment its last step completes, before any session
             # call released at this same instant (matters only for the quantum).
@@ -215,7 +301,7 @@ class Coordinator:
         call = self._calls.pop(call_id)
         del self._records[call_id]
         self._call_engine.pop(call_id, None)
-        eng.ctx.output_ids.pop(call_id, None)
+        eng.ctx.output_ids.pop(call_id + "@d" if self.pd else call_id, None)
         if call.session_id is not None:
             s = self._sessions[call.session_id]
             s.calls_done += 1
@@ -236,7 +322,8 @@ class Coordinator:
         for eng in self.engines:
             if eng.busy:
                 continue
-            if not eng.core.scheduler.has_requests():
+            pending_kv = bool(eng.ctx.deliver_recving or eng.ctx.deliver_sending)
+            if not eng.core.scheduler.has_requests() and not pending_kv:
                 if eng.idle_since is None:
                     eng.idle_since = self.now
                 continue
@@ -252,14 +339,21 @@ class Coordinator:
                         self._push(start, ARRIVAL, "wake", eng)
                     continue
             eng.idle_since = None
-            outputs, executed, step_ns = eng.step()
+            for _ in range(4):
+                outputs, executed, step_ns = eng.step()
+                self._start_transfers(eng)
+                if executed or step_ns or not eng.ctx.last_delivered:
+                    break
+                # An empty step that only delivered finished KV transfers: vLLM
+                # promotes those requests at the next schedule, right away.
+                self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (eng, outputs)))
             for rid, hit in eng.ctx.last_new_req_ids.items():
-                rec = self._records.get(rid)
+                rec = self._records.get(self._cid(rid))
                 if rec is not None and rec.first_sched_ns is None:
                     rec.first_sched_ns = self.now
                     rec.cached_tokens = hit
             for rid in eng.ctx.last_preempted_req_ids:
-                rec = self._records.get(rid)
+                rec = self._records.get(self._cid(rid))
                 if rec is not None:
                     rec.num_preemptions += 1
             if not executed and step_ns == 0:
@@ -274,6 +368,19 @@ class Coordinator:
             eng.busy = True
             self._push(self.now + step_ns, STEP_DONE, "step_done", (eng, outputs))
 
+    def _start_transfers(self, eng: SimEngine) -> None:
+        """The decode worker starts pulling KV in the step its scheduler parks
+        the request (WAITING_FOR_REMOTE_KVS); finished_recving and the prefill
+        side's finished_sending are reported at each engine's next step after
+        the pull completes."""
+        for rid, blocks, remote_engine, remote_rid in eng.ctx.new_recvs:
+            if rid in self._xfers_started:
+                continue
+            self._xfers_started.add(rid)
+            ns = self.pd_link.transfer_ns(blocks * eng.ctx.kv_block_bytes)
+            self._push(self.now + ns, TRANSFER_DONE, "kv_pull",
+                       (eng, rid, self._by_vllm_id.get(remote_engine), remote_rid))
+
     def run(self) -> Recorder:
         t0 = time.perf_counter()
         self._pull_entry()
@@ -283,6 +390,8 @@ class Coordinator:
                 ev = heapq.heappop(self._q)
                 if ev.prio == ARRIVAL:
                     self._on_arrival(ev)
+                elif ev.prio == TRANSFER_DONE:
+                    self._on_transfer_done(ev)
                 else:
                     self._on_step_done(ev)
             self._start_steps()
