@@ -1,0 +1,109 @@
+"""Workload loader for the LLMServingSim fork's JSONL format.
+
+Every line is either a flat request or an agentic session (it has
+``sub_requests``); a file may mix them. Semantics follow the fork's router:
+
+* A flat request arrives at ``arrival_time_ns``.
+* A session's first call arrives at the session's ``arrival_time_ns``. Call
+  ``i+1`` is released at call ``i``'s completion plus call ``i``'s
+  ``tool_duration_ns`` (the wait *after* that call).
+* ``input_toks`` / ``output_toks`` set the prompt and output lengths.
+  ``input_tok_ids`` drive prefix caching only: the prompt's ids are the
+  recorded ones, and any tokens past them are filled with ids unique to the
+  request, so that tail never hits the cache (the fork leaves it unhashed).
+  ``output_tok_ids`` are what the simulated model emits; past them, unique ids.
+
+The file is streamed: sessions are read in arrival order, and a session's
+calls are kept only until the session ends.
+"""
+
+from __future__ import annotations
+
+import itertools
+import json
+from dataclasses import dataclass, field
+from typing import Iterator
+
+# Filler ids live far above any real vocabulary, each request in its own range.
+_FILLER_BASE = 1 << 40
+_FILLER_STRIDE = 1 << 24
+
+
+@dataclass
+class Call:
+    call_id: str
+    session_id: str | None
+    index: int  # position in the session (0 for flat requests)
+    arrival_ns: int  # set when released
+    prompt_ids: list[int]
+    output_toks: int
+    output_ids: list[int]
+    tool_wait_ns: int  # wait after this call before the session's next one
+
+
+@dataclass
+class Session:
+    session_id: str
+    arrival_ns: int
+    sub_requests: list[dict]
+    next_index: int = 0
+    calls_done: int = 0
+    finish_ns: int | None = None
+
+
+class _Filler:
+    def __init__(self) -> None:
+        self._n = itertools.count()
+
+    def ids(self, count: int) -> list[int]:
+        base = _FILLER_BASE + next(self._n) * _FILLER_STRIDE
+        return list(range(base, base + count))
+
+
+@dataclass
+class Workload:
+    """Streams top-level entries (flat requests and sessions) in file order."""
+
+    path: str
+    max_entries: int | None = None
+    _filler: _Filler = field(default_factory=_Filler)
+
+    def entries(self) -> Iterator[Call | Session]:
+        with open(self.path) as f:
+            n = 0
+            for line_no, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                if self.max_entries is not None and n >= self.max_entries:
+                    return
+                d = json.loads(line)
+                if "sub_requests" in d:
+                    subs = d["sub_requests"]
+                    if not subs:  # the fork skips empty sessions silently
+                        continue
+                    sid = str(d.get("session_id", f"session_{line_no}"))
+                    yield Session(session_id=sid, arrival_ns=int(d["arrival_time_ns"]), sub_requests=subs)
+                else:
+                    yield self.make_call(d, call_id=f"req_{line_no}", session_id=None, index=0,
+                                         arrival_ns=int(d["arrival_time_ns"]))
+                n += 1
+
+    def make_call(self, d: dict, call_id: str, session_id: str | None, index: int, arrival_ns: int) -> Call:
+        n_in = int(d["input_toks"])
+        n_out = int(d["output_toks"])
+        rec_in = list(d.get("input_tok_ids") or ())[:n_in]
+        if len(rec_in) < n_in:
+            rec_in += self._filler.ids(n_in - len(rec_in))
+        rec_out = list(d.get("output_tok_ids") or ())[:n_out]
+        if len(rec_out) < n_out:
+            rec_out += self._filler.ids(n_out - len(rec_out))
+        return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,
+                    prompt_ids=rec_in, output_toks=n_out, output_ids=rec_out,
+                    tool_wait_ns=int(d.get("tool_duration_ns", 0) or 0))
+
+    def next_call(self, s: Session, arrival_ns: int) -> Call:
+        i = s.next_index
+        s.next_index += 1
+        return self.make_call(s.sub_requests[i], call_id=f"{s.session_id}#{i}", session_id=s.session_id,
+                              index=i, arrival_ns=arrival_ns)
