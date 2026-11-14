@@ -63,6 +63,9 @@ class SimContext:
     # DP ranks: the coordinator prices the whole round (all ranks together,
     # padded per vLLM's DP rule), so the executor only reports its shape.
     defer_cost: bool = False
+    # Async scheduling: every execute_model call is a launch onto the GPU
+    # stream; the coordinator drains these durations (0 for an empty batch).
+    launches: list = field(default_factory=list)
 
 
 @dataclass
@@ -226,8 +229,16 @@ def make_sim_executor(ctx: SimContext) -> type[Executor]:
                 return fut
             return result
 
+        _pending = None
+
         def execute_model(self, scheduler_output, non_block=False):
             out = self.worker.execute_model(scheduler_output)
+            self._ctx.launches.append(self._ctx.last_step_ns)
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                # As vLLM's GPU runner: the forward returns None and the
+                # output comes from sample_tokens.
+                self._pending = out
+                out = None
             if non_block:
                 fut: Future = Future()
                 fut.set_result(out)
@@ -235,7 +246,13 @@ def make_sim_executor(ctx: SimContext) -> type[Executor]:
             return out
 
         def sample_tokens(self, grammar_output, non_block=False):
-            raise AssertionError("SimExecutor samples inside execute_model")
+            out, self._pending = self._pending, None
+            assert out is not None, "sample_tokens without a forward"
+            if non_block:
+                fut: Future = Future()
+                fut.set_result(out)
+                return fut
+            return out
 
         def compile_or_warm_up_model(self) -> None:
             return None
@@ -248,6 +265,6 @@ def make_sim_executor(ctx: SimContext) -> type[Executor]:
 
         @classmethod
         def supports_async_scheduling(cls) -> bool:
-            return False
+            return True
 
     return SimExecutor

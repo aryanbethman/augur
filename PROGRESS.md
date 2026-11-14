@@ -258,8 +258,46 @@ Speed: each DP round is a full ASTRA-Sim run (no cache yet). ShareGPT 300:
 round into per-segment compute maxima plus a cached comm-only ASTRA run;
 to be checked exact first).
 
+## M9: async scheduling (2026-11-14) — done
+
+vLLM 0.33's default, now augur's default too (`--no-async-scheduling` for
+synchronous). The engine runs vLLM's own `EngineCore.step_with_batch_queue`
+(batch queue of 2):
+
+- The executor now behaves like vLLM's GPU runner: `execute_model` returns
+  None and the output comes from `sample_tokens`. Each launch's duration is
+  recorded.
+- Each engine has a GPU stream: a launched batch starts when the stream is
+  free. A call that pops the oldest batch returns at that batch's finish
+  time, so the CPU is blocked until then and schedules again at that moment.
+  A batch scheduled while the previous one runs sees only arrivals up to its
+  schedule time, and placeholder tokens for the running step, as in vLLM.
+- Async with DP is not modeled yet: `--dp` runs fall back to synchronous and
+  say so in the summary.
+
+Against LLMServingSim's `--async-scheduling` (ShareGPT 300, Llama-3.1-8B):
+step-for-step identical for 531 steps (14.6 s), then they part. TTFT mean
+6,575.9 vs 6,559.8 ms (0.25%), TPOT 31.53 vs 31.54, latency 0.02%. The cause
+is in LLMServingSim: its async mode only delays arrivals by a step. When a
+request reaches its last token in step k, vLLM's scheduler (building k+1
+during k) leaves it out but cannot free its slot until k's output is
+processed, so a waiting request starts at k+2. LLMServingSim frees the slot
+and admits it at k+1.
+
+What async costs, from augur (vLLM's real scheduler), vs synchronous:
+
+| Workload | TTFT sync → async | TPOT |
+| --- | --- | --- |
+| ShareGPT 300, Llama-3.1-8B | 6,517 → 6,576 ms | 31.52 → 31.53 ms |
+| SWE-bench 50 sessions, Qwen3-30B-A3B | 102.7 → 137.4 ms (+34%) | 36.29 → 36.15 ms |
+| PD 1+1, ShareGPT, `max_num_seqs` 1024 | 152.5 → 207.8 ms (+36%) | 30.62 → 30.60 ms |
+
+Agent follow-up calls and PD handoffs each wait one more step, because the
+engine has already scheduled its next step when they arrive. Runs remain
+deterministic (checked). `scripts/validate.sh` pins synchronous mode for the
+exact cases and adds the async case.
+
 ## Next
 
-- M9: async scheduling.
-- Phase 3: speed of DP rounds; 256 GPUs.
+- Phase 3: speed of DP rounds; 256 GPUs; async with DP.
 - PD: pull contention (ASTRA-Sim congestion-aware), multiple P/D engines.

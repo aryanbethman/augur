@@ -19,6 +19,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--engines", type=int, default=1, help="colocated engines (ignored with --prefill-engines)")
     p.add_argument("--prefill-engines", type=int, default=0, help="PD: prefill engines (NIXL kv_producer)")
     p.add_argument("--decode-engines", type=int, default=0, help="PD: decode engines (NIXL kv_consumer)")
+    p.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=True,
+                   help="vLLM async scheduling, on by default as in vLLM 0.33: schedule step k+1 while step k runs")
     p.add_argument("--dp", type=int, default=1, help="DP ranks in one lockstep group (vLLM data_parallel_size)")
     p.add_argument("--enable-expert-parallel", action="store_true", help="MoE experts split across DP x TP ranks")
     p.add_argument("--pd-link-bw", type=float, default=16.0, help="PD KV pull bandwidth, GB/s")
@@ -84,7 +86,12 @@ def main(argv: list[str] | None = None) -> int:
                       max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
                       max_num_seqs=a.max_num_seqs, block_size=a.block_size,
                       enable_prefix_caching=not a.no_prefix_caching, tensor_parallel_size=a.tp,
-                      enforce_eager=a.enforce_eager)
+                      enforce_eager=a.enforce_eager,
+                      async_scheduling=a.async_scheduling and a.dp == 1)
+    notes = []
+    if a.async_scheduling and a.dp > 1:
+        notes.append("async scheduling is not modeled with DP yet; this run is synchronous")
+        print("augur: " + notes[-1], file=sys.stderr)
     import dataclasses
     if a.dp > 1:
         engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
@@ -123,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     if coord.dp_group:
         summary["dp_rounds"] = coord.dp_rounds
         summary["dp_dummy_forwards"] = coord.dp_dummy_forwards
+    summary["async_scheduling"] = spec.async_scheduling
+    if notes:
+        summary["notes"] = notes
     summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
                     "vllm_step_cpu_ms_per_step": round(1e3 * cpu / max(steps, 1), 3),
                     "kv_cache_gib_per_engine": round(kv_bytes / 2**30, 2),

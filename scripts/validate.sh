@@ -7,7 +7,7 @@ W=${AUGUR_FORK:-$HOME/llmss-vllm-sim-20261114}/workloads
 PY=.venv/bin/python
 export VLLM_LOGGING_LEVEL=WARNING
 mkdir -p out/validate
-COMMON="--cost llmservingsim --hardware RTXPRO6000 --max-num-seqs 128 --max-num-batched-tokens 2048 --lss-loop-compat"
+COMMON="--cost llmservingsim --hardware RTXPRO6000 --max-num-seqs 128 --max-num-batched-tokens 2048 --lss-loop-compat --no-async-scheduling"
 LLAMA="--model meta-llama/Llama-3.1-8B --hbm-gb 96 --workload $W/sharegpt-llama-3.1-8b-300-sps10.jsonl"
 QWEN="--model Qwen/Qwen3-30B-A3B-Instruct-2507 --max-model-len 131072 --workload out/lss/swe50_fullids.jsonl"
 
@@ -31,3 +31,8 @@ run sharegpt_tp2        out/lss/sharegpt300_tp2.csv         $LLAMA --tp 2 --lss-
 run swebench_tp1        out/lss/swe50_fullids.csv           $QWEN --hbm-gb 96
 run swebench_tp2        out/lss/swe50_fullids_tp2.csv       $QWEN --kv-cache-gb 30.95 --tp 2 --lss-cluster-config out/lss/qwen3moe_tp2.json
 run sharegpt_dp2_ep       out/lss/qwen_sharegpt300_dpep.csv  --model Qwen/Qwen3-30B-A3B-Instruct-2507 --workload $W/sharegpt-qwen3-30b-a3b-300-sps10.jsonl --kv-cache-gb 56.53 --dp 2 --enable-expert-parallel --router round-robin --lss-cluster-config ${AUGUR_FORK:-$HOME/llmss-vllm-sim-20261114}/configs/cluster/single_node_moe_dp_ep_instance.json
+
+# Async scheduling (vLLM's default). Not call-for-call: LLMServingSim's async
+# mode frees a finishing request's slot one step earlier than vLLM (see M9).
+COMMON="--cost llmservingsim --hardware RTXPRO6000 --max-num-seqs 128 --max-num-batched-tokens 2048"
+run sharegpt_tp1_async      out/lss/sharegpt300_async.csv     $LLAMA --async-scheduling

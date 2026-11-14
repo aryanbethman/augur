@@ -17,6 +17,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from vllm.engine.arg_utils import EngineArgs
@@ -57,6 +58,7 @@ class EngineSpec:
     data_parallel_size: int = 1  # >1: this engine is one rank of a DP group (lockstep rounds)
     data_parallel_rank: int = 0
     enable_expert_parallel: bool = False
+    async_scheduling: bool = False  # vLLM 0.33's default is True
 
 
 @dataclass
@@ -89,7 +91,7 @@ class SimEngine:
             block_size=spec.block_size,
             enable_prefix_caching=spec.enable_prefix_caching,
             enable_chunked_prefill=spec.enable_chunked_prefill,
-            async_scheduling=False,
+            async_scheduling=spec.async_scheduling,
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
             kv_transfer_config=self._kv_transfer_config(engine_id, spec),
@@ -103,6 +105,11 @@ class SimEngine:
                                log_stats=False)
         self.max_model_len = self.vllm_config.model_config.max_model_len
         self.busy = False
+        self.async_sched = self.core.batch_queue is not None
+        if self.async_sched and spec.data_parallel_size > 1:
+            raise NotImplementedError("async scheduling with DP is not modeled yet")
+        self.gpu_free_at = 0  # async: when the GPU stream finishes its queued batches
+        self.batch_finish: "deque[int]" = deque()  # async: finish time per queued batch, FIFO
         self.sched_cpu_s = 0.0
         self.steps = 0
         # Only for --lss-idle-quantum (diagnostic): when this engine went idle,
@@ -148,6 +155,7 @@ class SimEngine:
     def step(self):
         t0 = time.perf_counter()
         outputs, executed = self.core.step()
+        self.ctx.launches.clear()
         self.sched_cpu_s += time.perf_counter() - t0
         self.steps += 1
         return outputs, executed, self.ctx.last_step_ns
@@ -435,12 +443,62 @@ class Coordinator:
             if rec is not None:
                 rec.num_preemptions += 1
 
+    def _step_async(self, eng: SimEngine) -> None:
+        """vLLM's async scheduling (EngineCore.step_with_batch_queue).
+
+        Each call may schedule a batch and launch it; a launched batch starts
+        when the GPU stream is free. A call that pops the oldest batch returns
+        when that batch finishes, so the engine's CPU is blocked until then and
+        the next schedule happens at that time. A batch scheduled while the
+        previous one runs therefore sees arrivals only up to its own schedule
+        time, one step stale, as in vLLM."""
+        progressed = False
+        for _ in range(10_000):
+            t0 = time.perf_counter()
+            outputs, executed = eng.core.step_fn()
+            progressed = progressed or executed or eng.ctx.last_delivered
+            eng.sched_cpu_s += time.perf_counter() - t0
+            eng.steps += 1
+            for ns in eng.ctx.launches:
+                start = max(self.now, eng.gpu_free_at)
+                eng.gpu_free_at = start + ns
+                eng.batch_finish.append(eng.gpu_free_at)
+                if ns and eng.step_log is not None and eng.ctx.last_shape is not None:
+                    sh = eng.ctx.last_shape
+                    eng.step_log.append((start, ns, sh.total_tokens,
+                                         sum(x.num_new for x in sh.seqs if not x.is_decode), sh.num_decode,
+                                         sh.num_prefill, sh.forward_tokens, 0))
+            launched = bool(eng.ctx.launches)
+            eng.ctx.launches.clear()
+            self._after_step(eng)
+            if outputs is None:
+                if launched:
+                    continue  # queue not full: schedule the next batch now
+                return  # nothing queued, nothing to schedule: idle
+            done_at = max(self.now, eng.batch_finish.popleft())
+            if done_at == self.now:
+                self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (eng, outputs)))
+                if not progressed or (not eng.core.scheduler.has_requests() and not eng.batch_finish):
+                    # Nothing computed or delivered (e.g. only requests waiting
+                    # for remote KV): wait for the next event.
+                    return
+                progressed = False
+                continue
+            eng.busy = True
+            self._push(done_at, STEP_DONE, "step_done", (eng, outputs))
+            return
+        raise RuntimeError("async engine loop did not settle")
+
     def _start_steps(self) -> None:
         q = self.lss_idle_quantum_ns
         if self.dp_group:
             self._start_dp_round()
         for eng in self.engines:
             if eng.busy or eng.spec.data_parallel_size > 1:
+                continue
+            if eng.async_sched:
+                if eng.core.scheduler.has_requests() or eng.batch_finish:
+                    self._step_async(eng)
                 continue
             pending_kv = bool(eng.ctx.deliver_recving or eng.ctx.deliver_sending)
             if not eng.core.scheduler.has_requests() and not pending_kv:
