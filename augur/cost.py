@@ -27,6 +27,9 @@ class StepShape:
     # Token count the forward pass runs at after vLLM's CUDA-graph padding
     # (vLLM's own CudagraphDispatcher decides it). None: no padding.
     padded_tokens: int | None = None
+    # An idle DP rank's dummy forward (vLLM execute_dummy_batch): runs the
+    # layers and the EP collectives, but no logits or sampler.
+    dummy: bool = False
 
     @property
     def forward_tokens(self) -> int:

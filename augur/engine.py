@@ -54,6 +54,9 @@ class EngineSpec:
     dtype: str = "bfloat16"
     enforce_eager: bool = False  # vLLM's default: CUDA graphs on, so steps are padded
     kv_role: str | None = None  # "kv_producer" (prefill) / "kv_consumer" (decode) for PD
+    data_parallel_size: int = 1  # >1: this engine is one rank of a DP group (lockstep rounds)
+    data_parallel_rank: int = 0
+    enable_expert_parallel: bool = False
 
 
 @dataclass
@@ -90,7 +93,11 @@ class SimEngine:
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
             kv_transfer_config=self._kv_transfer_config(engine_id, spec),
+            data_parallel_size=spec.data_parallel_size,
+            data_parallel_rank=spec.data_parallel_rank if spec.data_parallel_size > 1 else None,
+            enable_expert_parallel=spec.enable_expert_parallel,
         )
+        self.ctx.defer_cost = spec.data_parallel_size > 1
         self.vllm_config = args.create_engine_config()
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
                                log_stats=False)
@@ -174,6 +181,13 @@ class Coordinator:
         self.decode_router = decode_router
         self.pd_link = pd_link or PDLink()
         self._by_vllm_id = {e.vllm_engine_id: e for e in engines}
+        # DP groups (one for now): ranks step in lockstep rounds.
+        self.dp_group = [e for e in engines if e.spec.data_parallel_size > 1]
+        self.dp_rounds = 0
+        self.dp_dummy_forwards = 0
+        self._dp_pending: dict[int, tuple] = {}  # engine_id -> (outputs, shape or None)
+        self._dp_ready_at: int | None = None  # --lss-loop-compat only
+        self._entries_done = False
         self._xfers_started: set[str] = set()
         # LLMServingSim loop compatibility, for comparisons only (off by
         # default; none of this is vLLM behaviour):
@@ -207,6 +221,7 @@ class Coordinator:
         """Stream the next top-level entry (flat request or session) from the file."""
         e = next(self._entries, None)
         if e is None:
+            self._entries_done = True
             return
         t = e.arrival_ns
         if t < self._last_entry_ns:
@@ -317,10 +332,115 @@ class Coordinator:
                 s.finish_ns = self.now
                 del self._sessions[s.session_id]
 
+    def _dp_padded_tokens(self, wants: list[tuple[int, bool]]) -> list[int]:
+        """vLLM's DP padding (coordinate_batch_across_dp): each rank dispatches
+        locally; the ranks agree on the minimum CUDA-graph mode; if that mode
+        keeps graphs, every rank pads to the largest padded size and
+        re-dispatches. Uses each rank's own CudagraphDispatcher."""
+        from vllm.config import CUDAGraphMode
+        local = []
+        for e, (n, uniform) in zip(self.dp_group, wants):
+            mode, desc = e.core.model_executor.worker.cudagraph.dispatch(num_tokens=n, uniform_decode=uniform)
+            local.append((mode, desc.num_tokens))
+        synced = CUDAGraphMode(min(m.value for m, _ in local))
+        if synced == CUDAGraphMode.NONE:
+            return [p for _, p in local]
+        target = max(p for _, p in local)
+        out = []
+        for e, (n, uniform) in zip(self.dp_group, wants):
+            _, desc = e.core.model_executor.worker.cudagraph.dispatch(
+                num_tokens=target, uniform_decode=uniform, valid_modes={synced})
+            out.append(desc.num_tokens)
+        return out
+
+    def _start_dp_round(self) -> None:
+        """Lockstep steps of the DP group, as vLLM's DP engine loop runs them.
+
+        A rank schedules its next step as soon as its own previous forward
+        finishes (it then blocks in the first collective). While any rank has
+        work, a rank with nothing to schedule joins with a dummy forward so the
+        EP collectives line up. The round starts once every rank has joined;
+        each rank's outputs land when its own forward finishes."""
+        g = self.dp_group
+        # Ranks free at the same instant join in descending rank order (the
+        # order ASTRA-Sim polls NPUs in LLMServingSim); idle ranks join last
+        # with a dummy. The last to join is handed the round first, which
+        # matters only for who waits on the shared CPU-memory device.
+        for e in sorted(g, key=lambda e: -e.engine_id):
+            if not e.busy and e.engine_id not in self._dp_pending and e.core.scheduler.has_requests():
+                outputs, executed, _ = e.step()
+                self._after_step(e)
+                shape = e.ctx.last_shape if executed and e.ctx.last_shape is not None and e.ctx.last_shape.seqs else None
+                self._dp_pending[e.engine_id] = (outputs, shape)
+        if not any(p[1] is not None or p[0] for p in self._dp_pending.values()):
+            if self._dp_pending and all(not e.busy for e in g):
+                # Every rank stepped and nothing was scheduled anywhere: apply
+                # the outputs; the group waits for the next event.
+                for e in g:
+                    outputs, _ = self._dp_pending.pop(e.engine_id, ({}, None))
+                    self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, outputs)))
+            return
+        for e in sorted(g, key=lambda e: -e.engine_id):
+            if not e.busy and e.engine_id not in self._dp_pending:
+                self._dp_pending[e.engine_id] = ({}, None)  # idle rank joins with a dummy
+        if any(e.busy for e in g):
+            return
+        outs = [self._dp_pending[e.engine_id][0] for e in g]
+        shapes = [self._dp_pending[e.engine_id][1] for e in g]
+        q = self.lss_idle_quantum_ns
+        if q and self._entries_done and not any(ev.kind == "session_call" for ev in self._q) and any(
+                not e.core.scheduler.has_requests() for e in g):
+            # LLMServingSim compat only: once no arrivals remain, an instance
+            # with no requests is put to sleep ("done") and its dummy joins
+            # each round only on ASTRA-Sim's 1 ms poll. vLLM's idle rank runs
+            # its dummy at once.
+            if self._dp_ready_at is None:
+                self._dp_ready_at = self.now + q
+                self._push(self._dp_ready_at, ARRIVAL, "dp_wake", None)
+            if self.now < self._dp_ready_at:
+                return
+        self._dp_ready_at = None
+        last_joined = list(self._dp_pending)[-1]
+        first_rank = next(i for i, e in enumerate(g) if e.engine_id == last_joined)
+        self._dp_pending.clear()
+        wants = [(s.total_tokens, all(x.num_new == 1 for x in s.seqs)) if s else (1, True) for s in shapes]
+        padded = self._dp_padded_tokens(wants)
+        from augur.cost import SeqWork, StepShape
+        final = []
+        for s, p in zip(shapes, padded):
+            if s is None:
+                self.dp_dummy_forwards += 1
+                final.append(StepShape(seqs=(SeqWork(1, 1, True),), padded_tokens=p, dummy=True))
+            else:
+                final.append(StepShape(seqs=s.seqs, padded_tokens=p))
+        per_rank = g[0].ctx.cost.round_ns(final, first_rank=first_rank)
+        self.dp_rounds += 1
+        for e, sh, ns in zip(g, final, per_rank):
+            if e.step_log is not None:
+                e.step_log.append((self.now, ns, sh.total_tokens, sum(x.num_new for x in sh.seqs if not x.is_decode),
+                                   sh.num_decode, sh.num_prefill, sh.forward_tokens, int(sh.dummy)))
+        for e, outputs, ns in zip(g, outs, per_rank):
+            e.busy = True
+            self._push(self.now + ns, STEP_DONE, "step_done", (e, outputs))
+
+    def _after_step(self, eng: SimEngine) -> None:
+        self._start_transfers(eng)
+        for rid, hit in eng.ctx.last_new_req_ids.items():
+            rec = self._records.get(self._cid(rid))
+            if rec is not None and rec.first_sched_ns is None:
+                rec.first_sched_ns = self.now
+                rec.cached_tokens = hit
+        for rid in eng.ctx.last_preempted_req_ids:
+            rec = self._records.get(self._cid(rid))
+            if rec is not None:
+                rec.num_preemptions += 1
+
     def _start_steps(self) -> None:
         q = self.lss_idle_quantum_ns
+        if self.dp_group:
+            self._start_dp_round()
         for eng in self.engines:
-            if eng.busy:
+            if eng.busy or eng.spec.data_parallel_size > 1:
                 continue
             pending_kv = bool(eng.ctx.deliver_recving or eng.ctx.deliver_sending)
             if not eng.core.scheduler.has_requests() and not pending_kv:
@@ -364,7 +484,8 @@ class Coordinator:
             if eng.step_log is not None and eng.ctx.last_shape is not None:
                 sh = eng.ctx.last_shape
                 eng.step_log.append((self.now, step_ns, sh.total_tokens,
-                                     sum(x.num_new for x in sh.seqs if not x.is_decode), sh.num_decode, sh.num_prefill))
+                                     sum(x.num_new for x in sh.seqs if not x.is_decode), sh.num_decode, sh.num_prefill,
+                                     sh.forward_tokens, 0))
             eng.busy = True
             self._push(self.now + step_ns, STEP_DONE, "step_done", (eng, outputs))
 

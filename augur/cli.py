@@ -19,6 +19,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--engines", type=int, default=1, help="colocated engines (ignored with --prefill-engines)")
     p.add_argument("--prefill-engines", type=int, default=0, help="PD: prefill engines (NIXL kv_producer)")
     p.add_argument("--decode-engines", type=int, default=0, help="PD: decode engines (NIXL kv_consumer)")
+    p.add_argument("--dp", type=int, default=1, help="DP ranks in one lockstep group (vLLM data_parallel_size)")
+    p.add_argument("--enable-expert-parallel", action="store_true", help="MoE experts split across DP x TP ranks")
     p.add_argument("--pd-link-bw", type=float, default=16.0, help="PD KV pull bandwidth, GB/s")
     p.add_argument("--pd-link-latency-ns", type=int, default=20_000)
     p.add_argument("--router", default="least-loaded")
@@ -61,7 +63,8 @@ def main(argv: list[str] | None = None) -> int:
     if a.kv_cache_gb is not None:
         kv_bytes = int(a.kv_cache_gb * 2**30)
     else:
-        weights = estimate_weight_bytes(os.path.join(mdir, "config.json"), tp=a.tp)
+        ep = a.dp * a.tp if a.enable_expert_parallel else 1
+        weights = estimate_weight_bytes(os.path.join(mdir, "config.json"), tp=a.tp, ep=ep)
         kv_bytes = int(a.hbm_gb * 2**30 * a.mem_util) - weights
         if kv_bytes <= 0:
             print(f"model weights ({weights / 2**30:.1f} GiB/GPU) do not fit in {a.hbm_gb} GB", file=sys.stderr)
@@ -74,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         cost = LLMServingSimCost(fork_root=a.fork, hardware=a.hardware, model=a.model, tp=a.tp,
                                  max_num_batched_tokens=a.max_num_batched_tokens or 2048,
                                  cpu_mem_bw_gbps=a.cpu_mem_bw, cpu_mem_latency_ns=a.cpu_mem_latency_ns,
-                                 cluster_config=a.lss_cluster_config)
+                                 cluster_config=a.lss_cluster_config, dp=a.dp,
+                                 ep=a.dp * a.tp if a.enable_expert_parallel else 1)
 
     spec = EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=kv_bytes,
                       max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
@@ -82,7 +86,11 @@ def main(argv: list[str] | None = None) -> int:
                       enable_prefix_caching=not a.no_prefix_caching, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager)
     import dataclasses
-    if a.prefill_engines:
+    if a.dp > 1:
+        engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
+                                                    enable_expert_parallel=a.enable_expert_parallel), cost)
+                   for i in range(a.dp)]
+    elif a.prefill_engines:
         roles = ["kv_producer"] * a.prefill_engines + ["kv_consumer"] * a.decode_engines
         engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), cost) for i, r in enumerate(roles)]
     else:
@@ -102,7 +110,8 @@ def main(argv: list[str] | None = None) -> int:
         import csv as _csv
         with open(a.step_log, "w", newline="") as f:
             w = _csv.writer(f)
-            w.writerow(["engine", "start_ns", "dur_ns", "total_tokens", "prefill_tokens", "n_decode", "n_prefill"])
+            w.writerow(["engine", "start_ns", "dur_ns", "total_tokens", "prefill_tokens", "n_decode", "n_prefill",
+                        "forward_tokens", "dummy"])
             for e in engines:
                 for row in e.step_log:
                     w.writerow([e.engine_id, *row])
@@ -111,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
     cpu = sum(e.sched_cpu_s for e in engines)
     if hasattr(cost, "oracle") and cost.oracle is not None:
         summary["astra_runs"] = cost.oracle.runs
+    if coord.dp_group:
+        summary["dp_rounds"] = coord.dp_rounds
+        summary["dp_dummy_forwards"] = coord.dp_dummy_forwards
     summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
                     "vllm_step_cpu_ms_per_step": round(1e3 * cpu / max(steps, 1), 3),
                     "kv_cache_gib_per_engine": round(kv_bytes / 2**30, 2),

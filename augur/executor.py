@@ -60,6 +60,9 @@ class SimContext:
     deliver_recving: set = field(default_factory=set)  # reported as finished_recving next step
     deliver_sending: set = field(default_factory=set)  # reported as finished_sending next step
     last_delivered: bool = False
+    # DP ranks: the coordinator prices the whole round (all ranks together,
+    # padded per vLLM's DP rule), so the executor only reports its shape.
+    defer_cost: bool = False
 
 
 @dataclass
@@ -178,12 +181,16 @@ class SimWorker:
             else:
                 sampled.append([])
 
-        num_tokens = sum(x.num_new for x in seqs)
-        uniform_decode = bool(seqs) and all(x.num_new == 1 for x in seqs)
-        _, desc = self.cudagraph.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode)
-        shape = StepShape(seqs=tuple(seqs), padded_tokens=desc.num_tokens)
-        self.ctx.last_shape = shape
-        self.ctx.last_step_ns = self.ctx.cost.step_ns(shape) if seqs else 0
+        if self.ctx.defer_cost:
+            self.ctx.last_shape = StepShape(seqs=tuple(seqs))
+            self.ctx.last_step_ns = 0
+        else:
+            num_tokens = sum(x.num_new for x in seqs)
+            uniform_decode = bool(seqs) and all(x.num_new == 1 for x in seqs)
+            _, desc = self.cudagraph.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode)
+            shape = StepShape(seqs=tuple(seqs), padded_tokens=desc.num_tokens)
+            self.ctx.last_shape = shape
+            self.ctx.last_step_ns = self.ctx.cost.step_ns(shape) if seqs else 0
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={r: i for i, r in enumerate(req_ids)},

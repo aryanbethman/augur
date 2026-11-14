@@ -25,8 +25,11 @@ def model_dir(fork_root: str, model: str, cache_root: str) -> str:
     return dst_dir
 
 
-def estimate_weight_bytes(config_json: str, dtype_bytes: int = 2, tp: int = 1) -> int:
-    """Parameter bytes per GPU for decoder-only dense and MoE models (estimate)."""
+def estimate_weight_bytes(config_json: str, dtype_bytes: int = 2, tp: int = 1, ep: int = 1) -> int:
+    """Parameter bytes per GPU for decoder-only dense and MoE models (estimate).
+
+    As in vLLM: attention and dense layers are split by TP; routed experts are
+    split by EP when expert parallelism is on (``ep`` = DP x TP), else by TP."""
     c = json.load(open(config_json))
     c = c.get("text_config", c)
     h = c["hidden_size"]
@@ -37,13 +40,16 @@ def estimate_weight_bytes(config_json: str, dtype_bytes: int = 2, tp: int = 1) -
     hd = c.get("head_dim") or h // nh
     attn = h * nh * hd + 2 * h * nkv * hd + nh * hd * h
     n_exp = c.get("num_experts") or c.get("n_routed_experts") or 0
+    experts = 0
     if n_exp:
         inter = c.get("moe_intermediate_size") or c["intermediate_size"]
-        mlp = n_exp * 3 * h * inter + h * n_exp  # experts + gate
+        experts = n_exp * 3 * h * inter
+        mlp = h * n_exp  # gate
         shared = c.get("n_shared_experts") or 0
         if shared:
             mlp += shared * 3 * h * inter
     else:
         mlp = 3 * h * c["intermediate_size"]
     embed = v * h * (1 if c.get("tie_word_embeddings") else 2)
-    return (L * (attn + mlp) + embed) * dtype_bytes // tp
+    expert_split = ep if ep > 1 else tp
+    return ((L * (attn + mlp) + embed) // tp + L * experts // expert_split) * dtype_bytes

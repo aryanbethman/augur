@@ -91,15 +91,23 @@ class AstraOracle:
 
     def run(self, rows, header_line: str, model: str, hardware: str, num_npus: int) -> int:
         """Run one trace on NPUs 0..num_npus-1 (instance 0) and return its duration in ns."""
+        return self.run_group([(rows, header_line, 0)], model, hardware)[0]
+
+    def run_group(self, members, model: str, hardware: str, first_member: int = 0) -> list[int]:
+        """Run one trace per instance together (a DP round). Returns, per
+        member, when its last NPU finished, measured from the round's first
+        handover. ``members``: (rows, header_line, instance_id).
+        As in LLMServingSim's DP path, all members' graphs share one workload
+        folder; each NPU picks its own rank's graph."""
         self.runs += 1
         cwd = os.getcwd()
         os.chdir(self.run_dir)
         try:
-            return self._run(rows, header_line, model, hardware, num_npus)
+            return self._run(members, model, hardware, first_member)
         finally:
             os.chdir(cwd)
 
-    def _run(self, rows, header_line, model, hardware, num_npus):
+    def _run(self, members, model, hardware, first_member=0):
         inputs = self.workdir
         ev = self._generate_event(1, inputs_root=inputs)
         self._generate_graph(None, None, self.total_npu, event=True, inputs_root=inputs, trace=ev)
@@ -107,14 +115,33 @@ class AstraOracle:
 
         class _B:  # what generate_graph / get_workload read from a batch
             pass
-        b = _B()
-        b.batch_id = next(self._ids)
-        b.model = model
-        b.workload_name = None
-        trace = self._TraceData(header_line=header_line, rows=list(rows),
-                                path=os.path.join(inputs, "trace", hardware, model, f"instance0_batch{b.batch_id}.txt"))
-        self._generate_graph(b, hardware, num_npus, 0, 0, 0, inputs_root=inputs, trace=trace)
-        wl = self._get_workload(b, hardware, 0, inputs_root=inputs)
+        insts = self.cluster["instances"]
+        npu_of = self.cluster["inst2npu_mapping"]
+        node_of = self.cluster["inst2node_mapping"]
+        round_id = next(self._ids)
+        shared = f"{hardware}/{model}/augur_round{round_id}" if len(members) > 1 else None
+        wl_of_npu: dict[int, str] = {}
+        npus_of_member: list[range] = []
+        first_npu = None
+        for rows, header_line, inst_id in members:
+            b = _B()
+            b.batch_id = round_id
+            b.model = model
+            b.workload_name = shared
+            n = insts[inst_id]["num_npus"]
+            off = npu_of[inst_id]
+            trace = self._TraceData(header_line=header_line, rows=list(rows),
+                                    path=os.path.join(inputs, "trace", hardware, model,
+                                                      f"instance{inst_id}_batch{round_id}.txt"))
+            self._generate_graph(b, hardware, n, node_of[inst_id], inst_id, off, workload_name=shared,
+                                 inputs_root=inputs, trace=trace)
+            wl = self._get_workload(b, hardware, inst_id, workload_name=shared, inputs_root=inputs)
+            for npu in range(off, off + n):
+                wl_of_npu[npu] = wl
+            npus_of_member.append(range(off, off + n))
+            if len(npus_of_member) - 1 == first_member:
+                first_npu = off
+        num_npus = len(wl_of_npu)
 
         args = [self.binary, "--workload-configuration=" + event_wl,
                 "--system-configuration=" + os.path.join(inputs, "system", "system.json"),
@@ -141,15 +168,15 @@ class AstraOracle:
                     ctl.write_flush(p, "pass")
                     continue
                 npu, cycle = rec["sys"], rec["cycle"]
-                if npu < num_npus and npu not in given:
+                if npu in wl_of_npu and npu not in given:
                     # LLMServingSim hands a batch to the instance's first NPU
                     # first; the others pass until then. The order matters:
                     # the NPUs share one CPU-memory device.
-                    if npu != 0 and 0 not in given:
+                    if npu != first_npu and first_npu not in given:
                         ctl.write_flush(p, "pass")
                         continue
                     given[npu] = cycle
-                    ctl.write_flush(p, wl)
+                    ctl.write_flush(p, wl_of_npu[npu])
                     continue
                 if npu in given and npu not in done and rec["id"] > 0:
                     done[npu] = cycle
@@ -170,8 +197,10 @@ class AstraOracle:
                 p.kill()
         if os.environ.get("AUGUR_ASTRA_DEBUG"):
             print("ASTRA given", given, "done", done, file=sys.stderr, flush=True)
-        # The step runs from the first handover to the last NPU finishing.
-        return max(done.values()) - min(given.values())
+        # Each member's step runs from the round's first handover to its own
+        # last NPU finishing.
+        t0 = min(given.values())
+        return [max(done[n] for n in npus) - t0 for npus in npus_of_member]
 
     def close(self) -> None:
         shutil.rmtree(self.workdir, ignore_errors=True)

@@ -30,3 +30,4 @@ run sharegpt_tp1_2eng   out/lss/sharegpt300_2inst_rr.csv    $LLAMA --engines 2 -
 run sharegpt_tp2        out/lss/sharegpt300_tp2.csv         $LLAMA --tp 2 --lss-cluster-config out/lss/llama_tp2.json
 run swebench_tp1        out/lss/swe50_fullids.csv           $QWEN --hbm-gb 96
 run swebench_tp2        out/lss/swe50_fullids_tp2.csv       $QWEN --kv-cache-gb 30.95 --tp 2 --lss-cluster-config out/lss/qwen3moe_tp2.json
+run sharegpt_dp2_ep       out/lss/qwen_sharegpt300_dpep.csv  --model Qwen/Qwen3-30B-A3B-Instruct-2507 --workload $W/sharegpt-qwen3-30b-a3b-300-sps10.jsonl --kv-cache-gb 56.53 --dp 2 --enable-expert-parallel --router round-robin --lss-cluster-config ${AUGUR_FORK:-$HOME/llmss-vllm-sim-20261114}/configs/cluster/single_node_moe_dp_ep_instance.json

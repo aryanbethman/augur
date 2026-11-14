@@ -33,9 +33,7 @@ class LLMServingSimCost:
     def __init__(self, fork_root: str, hardware: str, model: str, tp: int = 1, ep: int = 1,
                  max_num_batched_tokens: int = 2048, dtype: str = "bfloat16",
                  cpu_mem_bw_gbps: float = 256.0, cpu_mem_latency_ns: int = 0,
-                 cluster_config: str | None = None):
-        if ep != 1:
-            raise NotImplementedError("EP collectives are not modeled yet; use ep=1")
+                 cluster_config: str | None = None, dp: int = 1):
         self.fork_root = os.path.abspath(fork_root)
         if self.fork_root not in sys.path:
             sys.path.insert(0, self.fork_root)
@@ -67,9 +65,10 @@ class LLMServingSimCost:
         # TP>1 (collectives): ASTRA-Sim prices everything that is not compute,
         # from LLMServingSim's cluster config (link bandwidth, latency, topology).
         self.oracle = None
-        if tp > 1:
+        self.dp = dp
+        if tp > 1 or ep > 1 or dp > 1:
             if cluster_config is None:
-                raise ValueError("tp > 1 needs an LLMServingSim cluster config for ASTRA-Sim (--lss-cluster-config)")
+                raise ValueError("tp/ep/dp > 1 needs an LLMServingSim cluster config for ASTRA-Sim (--lss-cluster-config)")
             from augur.astra_oracle import AstraOracle
             self.oracle = AstraOracle(self.fork_root, cluster_config)
         self._cache: dict[tuple, int] = {}
@@ -95,7 +94,8 @@ class LLMServingSimCost:
         # real query/KV lists (the fork's _pad_batch_to_max does the same).
         b = self._Batch(self._batch_id, self.model, shape.forward_tokens, kv_len, q_list, k_list,
                         len(prefill_q), len(decode_k), prefill_q, prefill_k, decode_k, 0, 0)
-        b.requests = [_Req(i) for i in range(len(shape.seqs))]
+        # A DP dummy forward has no requests: no logits, no sampler.
+        b.requests = [] if shape.dummy else [_Req(i) for i in range(len(shape.seqs))]
         return b
 
     def _trace(self, shape: StepShape):
@@ -109,6 +109,36 @@ class LLMServingSimCost:
             )
         finally:
             os.chdir(cwd)
+
+    def round_ns(self, shapes: list[StepShape], first_rank: int = 0) -> list[int]:
+        """One DP round: every rank's step (or dummy) runs together in one
+        ASTRA-Sim run, joined by the EP collectives. Each rank's trace carries
+        the round's token counts, as LLMServingSim's DP path generates it.
+        Returns each rank's own finish time: the ranks meet at every
+        collective, but differ in the work after the last one."""
+        counts = tuple(s.forward_tokens for s in shapes)
+        insts = self.oracle.cluster["instances"]
+        members = []
+        cwd = os.getcwd()
+        os.chdir(self._run_dir)
+        try:
+            for rank, shape in enumerate(shapes):
+                inst = insts[rank]
+                trace = self._tg.generate_trace(
+                    self._batch(shape), self.hardware, inst["tp_size"], inst.get("pp_size", 1),
+                    inst["local_ep"], inst["ep_total"],
+                    max_num_batched_tokens=self.max_num_batched_tokens, dtype=self.dtype,
+                    placement=self._placement, enable_block_copy=True,
+                    tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                    dp_sum_total_len=sum(counts), dp_min_total_len=min(counts),
+                    dp_token_counts=counts, dp_rank=rank,
+                )
+                rows = [r for r in trace.rows if not (len(r) == 11 and r[0] in ("kv_load", "kv_evict"))]
+                members.append((rows, trace.header_line, rank))
+        finally:
+            os.chdir(cwd)
+        self.lookups += 1
+        return self.oracle.run_group(members, self.model, self.hardware, first_member=first_rank)
 
     def _step_ns_astra(self, shape: StepShape) -> int:
         """compute (sum of layer latencies) + ASTRA-Sim's time for the rest.

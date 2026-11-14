@@ -205,7 +205,61 @@ The TTFT gap is behaviour LLMServingSim leaves out, not an error in either:
 - LLMServingSim sends KV per layer inside the prefill step (slightly longer
   prefill steps); vLLM's NIXL decode side pulls after the prefill.
 
+## M8: DP + EP MoE lockstep (2026-11-14) — done
+
+`--dp N --enable-expert-parallel`: N engines, each a real vLLM `EngineCore`
+built with `data_parallel_size=N`, its own rank and expert parallelism on
+(configs build in one process; vLLM's DP engine loop is what augur's
+coordinator reproduces):
+
+- **Lockstep**, as vLLM's DP engine loop runs it: a rank schedules its next
+  step as soon as its own forward finishes; while any rank has work, a rank
+  with nothing to schedule joins with a dummy forward (vLLM
+  `execute_dummy_batch`: 1 token, uniform decode, no logits or sampler). A
+  round starts once every rank has joined.
+- **DP padding** is vLLM's `coordinate_batch_across_dp`, using each rank's
+  own CUDA-graph dispatcher: agree on the minimum graph mode; if it keeps
+  graphs, every rank pads to the largest size and re-dispatches.
+- **Round time**: every rank's trace (with the round's token counts, as
+  LLMServingSim's DP path generates them) runs together in one ASTRA-Sim
+  run, joined by the EP all-to-alls. Each rank's outputs land at its own
+  finish time: the ranks meet at every collective but differ in the work
+  after the last one.
+- Weight estimate: routed experts split by EP (DP x TP) when expert
+  parallelism is on, as in vLLM.
+
+Against LLMServingSim's `single_node_moe_dp_ep_instance` (Qwen3-30B-A3B,
+2 ranks, TP1, EP2, KV pinned to its 56.53 GiB/rank):
+
+| Workload | Result |
+| --- | --- |
+| ShareGPT 300, `--lss-loop-compat` | **300/300 identical**; 1,753 rounds, 204 dummy forwards |
+| SWE-bench 50 sessions, `--lss-loop-compat` | means within 0.6% (TTFT 113.05 vs 113.79 ms, TPOT 26.33 vs 26.49 ms); not call-for-call |
+
+Getting ShareGPT exact needed three LLMServingSim details, two of which are
+real behaviour and one a loop artifact:
+
+1. Per-rank finish times (real; was: whole round ended at the slowest rank).
+2. Handover order: the last rank to join gets the round first; ranks free at
+   the same instant join in descending rank order, idle ranks last. Only
+   decides who waits on the shared CPU-memory device (ns).
+3. Compat only: once no arrivals remain, LLMServingSim puts an instance with
+   no requests to sleep, and its dummy joins each round on ASTRA-Sim's 1 ms
+   poll. vLLM's idle rank runs its dummy at once.
+
+SWE-bench sessions in DP mode hit more of LLMServingSim's polling: a busy
+rank's round starts 1 ms late when the other rank is idle and joins as the
+dummy (e.g. session 12907's second call). Reproducing that exactly would
+only make a comparison switch match; not pursued.
+
+Speed: each DP round is a full ASTRA-Sim run (no cache yet). ShareGPT 300:
+32 s (LLMServingSim 28 s); SWE-bench 50 sessions, 11,000 rounds: 242 s
+(LLMServingSim 157 s). Phase 3 needs a cheaper round price (e.g. split the
+round into per-segment compute maxima plus a cached comm-only ASTRA run;
+to be checked exact first).
+
 ## Next
 
-- M8: DP+EP MoE lockstep. M9: async scheduling.
+- M9: async scheduling.
+- Phase 3: speed of DP rounds; 256 GPUs.
 - PD: pull contention (ASTRA-Sim congestion-aware), multiple P/D engines.
