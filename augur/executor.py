@@ -139,8 +139,10 @@ class SimWorker:
         for rid, before, num_new in work:
             st = self.reqs[rid]
             known = st.num_prompt + st.num_output
-            # A decode step computes the one token sampled last step.
-            is_decode = num_new == 1 and before == known - 1 and st.num_output > 0
+            # Decode vs prefill by query length, as vLLM's attention backends
+            # split a batch (decode threshold 1): a one-token last prefill
+            # chunk runs as a decode.
+            is_decode = num_new == 1
             seqs.append(SeqWork(num_new=num_new, num_computed_before=before, is_decode=is_decode))
             req_ids.append(rid)
             if before + num_new >= known:

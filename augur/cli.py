@@ -32,8 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fixed-step-ms", type=float, default=25.0)
     p.add_argument("--fixed-per-token-us", type=float, default=0.0)
     p.add_argument("--hardware", default="RTXPRO6000", help="profile hardware for --cost llmservingsim")
+    p.add_argument("--cpu-mem-bw", type=float, default=256.0, help="GB/s, the fork's cpu_mem.mem_bw")
+    p.add_argument("--cpu-mem-latency-ns", type=int, default=0)
     p.add_argument("--output", default=None, help="request CSV (fork format)")
     p.add_argument("--step-log", default=None, help="per-step CSV: start, duration, batch shape")
+    p.add_argument("--lss-idle-quantum-ms", type=float, default=0.0,
+                   help="diagnostic: reproduce LLMServingSim's idle-loop quantum (1 ms); not vLLM behaviour")
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
 
@@ -61,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         from augur.lss_cost import LLMServingSimCost
         cost = LLMServingSimCost(fork_root=a.fork, hardware=a.hardware, model=a.model, tp=a.tp,
-                                 max_num_batched_tokens=a.max_num_batched_tokens or 2048)
+                                 max_num_batched_tokens=a.max_num_batched_tokens or 2048,
+                                 cpu_mem_bw_gbps=a.cpu_mem_bw, cpu_mem_latency_ns=a.cpu_mem_latency_ns)
 
     spec = EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=kv_bytes,
                       max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
@@ -72,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     if a.step_log:
         for e in engines:
             e.step_log = []
-    coord = Coordinator(engines, ROUTERS[a.router](), Workload(a.workload, max_entries=a.num_entries))
+    coord = Coordinator(engines, ROUTERS[a.router](), Workload(a.workload, max_entries=a.num_entries),
+                        lss_idle_quantum_ns=int(a.lss_idle_quantum_ms * 1e6))
     rec = coord.run()
     if a.output:
         rec.write_csv(a.output)

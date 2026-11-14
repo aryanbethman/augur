@@ -18,7 +18,7 @@ class SeqWork:
 
     num_new: int  # tokens computed this step
     num_computed_before: int  # tokens already in the KV cache (incl. prefix hits)
-    is_decode: bool  # one new token past the known tokens, not a prefill chunk
+    is_decode: bool  # query length 1 (vLLM's decode/prefill split), not a multi-token chunk
 
 
 @dataclass(frozen=True)

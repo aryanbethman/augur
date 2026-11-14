@@ -31,7 +31,12 @@ from augur.router import Router
 from augur.workload import Call, Session, Workload
 
 # Event priorities at equal times (design doc: arrivals, transfers, step completions).
-ARRIVAL, TRANSFER_DONE, STEP_DONE = 0, 1, 2
+# CAUSED_ARRIVAL is a call released by a completion at this same instant (a
+# session's next call after a zero tool wait). It cannot reach the engine
+# before the engine has started its next step at that instant: in vLLM the
+# client sees the finished output only after the step, and the engine loop
+# schedules again right away. So it is applied after steps start.
+ARRIVAL, TRANSFER_DONE, STEP_DONE, CAUSED_ARRIVAL = 0, 1, 2, 3
 
 
 @dataclass
@@ -78,6 +83,10 @@ class SimEngine:
         self.busy = False
         self.sched_cpu_s = 0.0
         self.steps = 0
+        # Only for --lss-idle-quantum (diagnostic): when this engine went idle,
+        # and the wake-up already queued.
+        self.idle_since: int | None = None
+        self.wake_at: int | None = None
         self.step_log: list[tuple] | None = None  # (start_ns, dur_ns, total, prefill_tokens, n_decode, n_prefill)
 
     def load(self) -> int:
@@ -114,8 +123,16 @@ class _Event:
 
 
 class Coordinator:
-    def __init__(self, engines: list[SimEngine], router: Router, workload: Workload):
+    def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
+                 lss_idle_quantum_ns: int = 0):
         self.engines = engines
+        # Diagnostic only, off by default. Reproduces LLMServingSim's idle
+        # loop: a fully idle cluster advances in fixed quanta (1 ms), so a
+        # session call released while the engine is idle starts at the first
+        # quantum boundary after the engine went idle (at least one quantum
+        # later). New workload entries jump the clock to their exact arrival.
+        # Real vLLM has no such delay.
+        self.lss_idle_quantum_ns = lss_idle_quantum_ns
         self.router = router
         self.workload = workload
         self.recorder = Recorder()
@@ -145,8 +162,10 @@ class Coordinator:
         self._last_entry_ns = t
         self._push(t, ARRIVAL, "entry", e)
 
-    def _release(self, call: Call) -> None:
+    def _release(self, call: Call, exact: bool = True) -> None:
         eng = self.engines[self.router.route(call, self.engines)]
+        if exact and not eng.busy:
+            eng.idle_since = None
         if len(call.prompt_ids) + call.output_toks > eng.max_model_len:
             raise ValueError(f"{call.call_id}: {len(call.prompt_ids)}+{call.output_toks} tokens exceed "
                              f"max_model_len {eng.max_model_len}")
@@ -169,7 +188,9 @@ class Coordinator:
                 self._release(p)
         elif ev.kind == "session_call":
             s = self._sessions[p]
-            self._release(self.workload.next_call(s, self.now))
+            self._release(self.workload.next_call(s, self.now), exact=False)
+        elif ev.kind == "wake":
+            p.wake_at = None
 
     def _on_step_done(self, ev: _Event) -> None:
         eng, outputs = ev.payload
@@ -180,6 +201,10 @@ class Coordinator:
                 rec.token_times.extend([self.now] * len(o.new_token_ids))
                 if o.finish_reason is not None:
                     self._finish(o.request_id, rec, eng)
+        if eng.core.scheduler.get_num_unfinished_requests() == 0 and eng.idle_since is None:
+            # Idle from the moment its last step completes, before any session
+            # call released at this same instant (matters only for the quantum).
+            eng.idle_since = self.now
 
     def _finish(self, call_id: str, rec: CallRecord, eng: SimEngine) -> None:
         rec.end_ns = self.now
@@ -192,15 +217,30 @@ class Coordinator:
             s = self._sessions[call.session_id]
             s.calls_done += 1
             if s.next_index < len(s.sub_requests):
-                self._push(self.now + call.tool_wait_ns, ARRIVAL, "session_call", s.session_id)
+                prio = CAUSED_ARRIVAL if call.tool_wait_ns == 0 else ARRIVAL
+                self._push(self.now + call.tool_wait_ns, prio, "session_call", s.session_id)
             else:
                 s.finish_ns = self.now
                 del self._sessions[s.session_id]
 
     def _start_steps(self) -> None:
+        q = self.lss_idle_quantum_ns
         for eng in self.engines:
-            if eng.busy or not eng.core.scheduler.has_requests():
+            if eng.busy:
                 continue
+            if not eng.core.scheduler.has_requests():
+                if eng.idle_since is None:
+                    eng.idle_since = self.now
+                continue
+            if q and eng.idle_since is not None:
+                k = max(1, -(-(self.now - eng.idle_since) // q))
+                start = eng.idle_since + k * q
+                if start > self.now:
+                    if eng.wake_at != start:
+                        eng.wake_at = start
+                        self._push(start, ARRIVAL, "wake", eng)
+                    continue
+            eng.idle_since = None
             outputs, executed, step_ns = eng.step()
             for rid, hit in eng.ctx.last_new_req_ids.items():
                 rec = self._records.get(rid)
@@ -228,13 +268,19 @@ class Coordinator:
         self._pull_entry()
         while self._q:
             self.now = self._q[0].t
-            while self._q and self._q[0].t == self.now:
+            while self._q and self._q[0].t == self.now and self._q[0].prio < CAUSED_ARRIVAL:
                 ev = heapq.heappop(self._q)
                 if ev.prio == ARRIVAL:
                     self._on_arrival(ev)
                 else:
                     self._on_step_done(ev)
             self._start_steps()
+            caused = False
+            while self._q and self._q[0].t == self.now and self._q[0].prio == CAUSED_ARRIVAL:
+                self._on_arrival(heapq.heappop(self._q))
+                caused = True
+            if caused:
+                self._start_steps()  # an idle engine picks the call up at once
         if self._records:
             raise RuntimeError(f"{len(self._records)} calls never finished (e.g. {next(iter(self._records))})")
         self.wall_s = time.perf_counter() - t0

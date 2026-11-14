@@ -31,7 +31,8 @@ class _Req:  # the trace generator counts batch.requests (lm_head rows) and logs
 
 class LLMServingSimCost:
     def __init__(self, fork_root: str, hardware: str, model: str, tp: int = 1, ep: int = 1,
-                 max_num_batched_tokens: int = 2048, dtype: str = "bfloat16"):
+                 max_num_batched_tokens: int = 2048, dtype: str = "bfloat16",
+                 cpu_mem_bw_gbps: float = 256.0, cpu_mem_latency_ns: int = 0):
         if tp != 1 or ep != 1:
             raise NotImplementedError("TP/EP collectives need ASTRA-Sim (Phase 2); use tp=1, ep=1")
         self.fork_root = os.path.abspath(fork_root)
@@ -57,6 +58,11 @@ class LLMServingSimCost:
         self.ep = ep
         self.max_num_batched_tokens = max_num_batched_tokens
         self.dtype = dtype
+        # Tensors placed in CPU memory ("REMOTE", e.g. the token ids the
+        # embedding reads) cost what ASTRA-Sim's analytical memory charges:
+        # latency + floor(bytes / bandwidth), bandwidth in GB/s = bytes/ns.
+        self.cpu_mem_bw = cpu_mem_bw_gbps
+        self.cpu_mem_latency_ns = cpu_mem_latency_ns
         self._cache: dict[tuple, int] = {}
         self._batch_id = 0
         self.lookups = 0
@@ -111,5 +117,8 @@ class LLMServingSimCost:
             if len(row) != 11 or row[0] in ("kv_load", "kv_evict"):
                 continue
             ns += int(row[1])
+            for loc, size in ((row[2], row[3]), (row[4], row[5]), (row[6], row[7])):
+                if loc.startswith("REMOTE"):
+                    ns += self.cpu_mem_latency_ns + int(int(size) / self.cpu_mem_bw)
         self._cache[key] = ns
         return ns

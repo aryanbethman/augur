@@ -49,28 +49,50 @@ Same workload, profiles, KV size (both 36,578 / 20,158 blocks), `max_num_seqs`
 scheduling, RTX PRO 6000 profiles. LLMServingSim at commit 696cf86 (our branch
 `feature/vllm-sim-20261114`), analytical network. `python -m augur.compare`:
 
-| Workload | TTFT mean | TPOT mean | Latency mean | Per-call latency, p50 diff | Wall: augur / LLMServingSim |
-| --- | --- | --- | --- | --- | --- |
-| ShareGPT, Llama-3.1-8B, 300 req | 6,517.35 vs 6,517.08 ms | 31.52 vs 31.52 | 0.00% | 0.00% | 3.2 s / 6.7 s |
-| SWE-bench, Qwen3-30B-A3B, 50 sessions | 119.5 vs 122.4 ms (2.4%) | 46.75 vs 46.43 (0.7%) | 0.6% | 0.9% | 7.2 s / 33 s |
-| Same, token IDs as long as `input_toks` | 96.7 vs 102.7 ms (5.8%) | 36.34 vs 36.29 (0.15%) | 0.06% | 1.0% | 6.6 s / 33 s |
+Calls with identical TTFT, TPOT, latency and end time (to the ns), and mean
+differences:
 
-A single SWE-bench session run alone gives identical decode step times (to
-the ns) and identical first-call TTFT.
+| Workload | augur default | augur `--lss-idle-quantum-ms 1` | Wall: augur / LLMServingSim |
+| --- | --- | --- | --- |
+| ShareGPT, Llama-3.1-8B, 300 req | **300/300 identical** | 300/300 identical | 3.2 s / 6.7 s |
+| SWE-bench, Qwen3-30B-A3B, 50 sessions, token IDs as long as `input_toks` | TTFT 1.1%, TPOT 0.05%, latency 0.03% | **765/765 identical** | 6.6 s / 33 s |
+| SWE-bench, bundled file (token IDs ~141 short per call) | TTFT 2.8%, TPOT 0.7%, latency 0.7% | TTFT 2.9%, TPOT 0.7% | 7.2 s / 33 s |
 
-Known differences, all in LLMServingSim's loop rather than vLLM:
+So once LLMServingSim's idle loop is reproduced, augur running real vLLM
+reproduces LLMServingSim's own scheduler exactly on both workloads. Every
+remaining difference is one of these, none of them vLLM behaviour:
 
-- **Idle pass.** When every instance is idle, LLMServingSim advances through
-  an ASTRA-Sim "pass" before releasing a session's next call, adding up to
-  1 ms of queuing. vLLM has no such delay.
-- **Unexplained, open:** on SWE-bench, 103 of 765 calls queue more than 1 ms
-  in LLMServingSim but are scheduled at once in augur. This is the remaining
-  TTFT gap. Not yet traced.
-- **Token IDs shorter than `input_toks`** (the bundled upstream SWE-bench file:
-  ids are ~141 tokens short per call). The fork hashes recorded output ids as
-  if they followed the recorded prompt ids directly; in a real token sequence
-  the prompt's unrecorded tail sits between them, so vLLM sees fewer hits
-  (88.1% vs 89.4%). With consistent ids both give 91.66%.
+- **Idle quantum (LLMServingSim).** A fully idle cluster advances in 1 ms
+  quanta in ASTRA-Sim's frontend, so a session call released while the engine
+  is idle starts at the next quantum after the engine went idle (at least 1 ms
+  later). New workload entries jump the clock exactly. vLLM has no such delay,
+  so augur's default leaves it out; `--lss-idle-quantum-ms 1` reproduces it
+  for comparison only.
+- **Prefix hashing when token IDs are shorter than `input_toks`.** The fork
+  hashes recorded output ids as if they followed the recorded prompt ids
+  directly; in a real token sequence the prompt's unrecorded tail sits between
+  them, so vLLM sees fewer hits (88.1% vs 89.4%). With consistent ids both give
+  91.66%. Newer generator output should not have this gap; check before use.
+- **`queuing_delay` column.** LLMServingSim sets it at every prefill chunk
+  until the first token, so for multi-chunk prompts it is the time to the
+  *last* chunk. augur reports the time to the first schedule, as vLLM's
+  queued-time metric does. TTFT and the other columns are unaffected.
+
+How the gap was closed (TTFT was 2.4–5.8% apart):
+
+1. **Single session:** CPU-memory reads were missing from augur's step price.
+   The embedding reads token ids from CPU memory ("REMOTE"); ASTRA-Sim charges
+   latency + floor(bytes / GB/s). Added (`--cpu-mem-bw`, default 256 as in the
+   fork's configs). With the idle quantum on, all 20 calls became identical.
+2. **Concurrency, ordering at equal times:** a call released by a completion
+   with zero tool wait arrives at the instant the step ends. augur let it join
+   the next step; it cannot in vLLM (the client sees the output only after the
+   step, and the engine schedules again at once). augur now applies such
+   caused arrivals after steps start. This is a correction to augur, not a
+   comparison switch, and it refines the design doc's tie-break rule.
+3. **Decode vs prefill:** a one-token final prefill chunk was priced as a
+   prefill. vLLM's attention backends split a batch by query length, so it is
+   a decode. Fixed; ShareGPT became exact.
 
 ## Next
 
