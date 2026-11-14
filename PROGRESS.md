@@ -120,8 +120,45 @@ Not done: the fork's LOAD routing policy (augur's least-loaded is a
 placeholder for the vLLM Router), and a head-to-head wall-time benchmark on
 the fork's matched 16/256-NPU configs (Phase 3).
 
+## M6: TP>1 with ASTRA-Sim collectives (2026-11-14) — done
+
+`augur/astra_oracle.py` drives LLMServingSim's own ASTRA-Sim binary with the
+fork's config builder, graph generator and controller protocol. A step costs
+
+    sum(compute latencies) + ASTRA-Sim(the same trace, compute rows at 1 ns) - n_rows
+
+The second term covers collectives and CPU-memory reads. It is cached on the
+collective and CPU-memory rows only (LOCAL tensor sizes do not change it,
+checked), so a 300-request run needs about 350 ASTRA-Sim calls of ~20 ms.
+The split was checked exact against full ASTRA-Sim runs of decode, mixed and
+prefill steps, dense and MoE. Two details had to match LLMServingSim: the
+batch goes to the instance's first NPU before the others (they share the CPU
+memory device), and a step runs from the first handover to the last NPU
+finishing.
+
+MoE weights under TP without EP: LLMServingSim shards expert weights only by
+EP, so at TP2/EP1 every rank holds all experts (30.95 GiB KV per rank for
+Qwen3-30B-A3B). vLLM shards experts across TP ranks in that case, which
+augur's weight estimate follows. Comparisons pin `--kv-cache-gb 30.95`.
+
+`--lss-idle-quantum-ms` became `--lss-loop-compat` (comparison only). It now
+also covers what LLMServingSim's loop does at TP>1: a call released at the
+idle instant is not delayed, and a zero-wait session call joins the step that
+starts at its release (the other ranks' reports route and schedule again).
+
+`scripts/validate.sh` reruns every comparison (about 1 minute):
+
+| Case | Identical calls (TTFT, TPOT, latency, end) |
+| --- | --- |
+| ShareGPT, Llama-3.1-8B, TP1 | 300/300 |
+| ShareGPT, 2 engines, round-robin | TPOT 300/300; 150/300 others (engine 1's 35 µs idle offset, M5) |
+| ShareGPT, Llama-3.1-8B, TP2 | 300/300 |
+| SWE-bench, Qwen3-30B-A3B, TP1 | 765/765 |
+| SWE-bench, Qwen3-30B-A3B MoE, TP2 | 765/765 |
+
+Wall time: TP2 ShareGPT 6.6 s vs LLMServingSim 13 s; TP2 SWE-bench 12.5 s vs 52 s.
+
 ## Next
 
-- M6: TP>1 steps with collective times.
 - M7: PD disaggregation via a simulated KV connector.
 - M8: DP+EP MoE lockstep. M9: async scheduling.

@@ -126,12 +126,15 @@ class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0):
         self.engines = engines
-        # Diagnostic only, off by default. Reproduces LLMServingSim's idle
-        # loop: a fully idle cluster advances in fixed quanta (1 ms), so a
-        # session call released while the engine is idle starts at the first
-        # quantum boundary after the engine went idle (at least one quantum
-        # later). New workload entries jump the clock to their exact arrival.
-        # Real vLLM has no such delay.
+        # LLMServingSim loop compatibility, for comparisons only (off by
+        # default; none of this is vLLM behaviour):
+        # - A fully idle cluster advances in fixed quanta (1 ms): a session call
+        #   released while the engine is idle starts at the first quantum
+        #   boundary after the engine went idle (at least one quantum later at
+        #   TP1; at TP>1 a call released at the idle instant is not delayed).
+        #   New workload entries jump the clock to their exact arrival.
+        # - At TP>1 a zero-wait session call joins the step starting at its
+        #   release instant.
         self.lss_idle_quantum_ns = lss_idle_quantum_ns
         self.router = router
         self.workload = workload
@@ -218,6 +221,11 @@ class Coordinator:
             s.calls_done += 1
             if s.next_index < len(s.sub_requests):
                 prio = CAUSED_ARRIVAL if call.tool_wait_ns == 0 else ARRIVAL
+                if prio == CAUSED_ARRIVAL and self.lss_idle_quantum_ns and eng.spec.tensor_parallel_size > 1:
+                    # LLMServingSim compat only: at TP>1 the other ranks' reports
+                    # at this instant route and schedule again, so the call joins
+                    # the next step. Not possible in vLLM.
+                    prio = ARRIVAL
                 self._push(self.now + call.tool_wait_ns, prio, "session_call", s.session_id)
             else:
                 s.finish_ns = self.now
@@ -233,7 +241,10 @@ class Coordinator:
                     eng.idle_since = self.now
                 continue
             if q and eng.idle_since is not None:
-                k = max(1, -(-(self.now - eng.idle_since) // q))
+                # At TP>1 the other ranks' reports at the idle instant reopen
+                # polling, so a call released right then is not delayed.
+                k_min = 1 if eng.spec.tensor_parallel_size == 1 else 0
+                k = max(k_min, -(-(self.now - eng.idle_since) // q))
                 start = eng.idle_since + k * q
                 if start > self.now:
                     if eng.wake_at != start:

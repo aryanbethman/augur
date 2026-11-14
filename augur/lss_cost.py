@@ -32,9 +32,10 @@ class _Req:  # the trace generator counts batch.requests (lm_head rows) and logs
 class LLMServingSimCost:
     def __init__(self, fork_root: str, hardware: str, model: str, tp: int = 1, ep: int = 1,
                  max_num_batched_tokens: int = 2048, dtype: str = "bfloat16",
-                 cpu_mem_bw_gbps: float = 256.0, cpu_mem_latency_ns: int = 0):
-        if tp != 1 or ep != 1:
-            raise NotImplementedError("TP/EP collectives need ASTRA-Sim (Phase 2); use tp=1, ep=1")
+                 cpu_mem_bw_gbps: float = 256.0, cpu_mem_latency_ns: int = 0,
+                 cluster_config: str | None = None):
+        if ep != 1:
+            raise NotImplementedError("EP collectives are not modeled yet; use ep=1")
         self.fork_root = os.path.abspath(fork_root)
         if self.fork_root not in sys.path:
             sys.path.insert(0, self.fork_root)
@@ -63,6 +64,14 @@ class LLMServingSimCost:
         # latency + floor(bytes / bandwidth), bandwidth in GB/s = bytes/ns.
         self.cpu_mem_bw = cpu_mem_bw_gbps
         self.cpu_mem_latency_ns = cpu_mem_latency_ns
+        # TP>1 (collectives): ASTRA-Sim prices everything that is not compute,
+        # from LLMServingSim's cluster config (link bandwidth, latency, topology).
+        self.oracle = None
+        if tp > 1:
+            if cluster_config is None:
+                raise ValueError("tp > 1 needs an LLMServingSim cluster config for ASTRA-Sim (--lss-cluster-config)")
+            from augur.astra_oracle import AstraOracle
+            self.oracle = AstraOracle(self.fork_root, cluster_config)
         self._cache: dict[tuple, int] = {}
         self._batch_id = 0
         self.lookups = 0
@@ -89,7 +98,56 @@ class LLMServingSimCost:
         b.requests = [_Req(i) for i in range(len(shape.seqs))]
         return b
 
+    def _trace(self, shape: StepShape):
+        cwd = os.getcwd()
+        os.chdir(self._run_dir)
+        try:
+            return self._tg.generate_trace(
+                self._batch(shape), self.hardware, self.tp, 1, self.ep, self.ep,
+                max_num_batched_tokens=self.max_num_batched_tokens, dtype=self.dtype,
+                placement=self._placement, enable_block_copy=True,
+            )
+        finally:
+            os.chdir(cwd)
+
+    def _step_ns_astra(self, shape: StepShape) -> int:
+        """compute (sum of layer latencies) + ASTRA-Sim's time for the rest.
+
+        Checked exact against a full ASTRA-Sim run of the same trace for
+        decode, mixed and prefill steps at TP2."""
+        self.lookups += 1
+        dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
+        pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
+        n_dec = len(dec)
+        key = (pre, n_dec, (sum(dec) // n_dec) if n_dec else 0, max(dec, default=0), min(dec, default=0),
+               shape.forward_tokens, len(shape.seqs))
+        hit = self._cache.get(key)
+        if hit is not None:
+            self.hits += 1
+            return hit
+        trace = self._trace(shape)
+        comp = sum(int(r[1]) for r in trace.rows if len(r) == 11 and r[0] not in ("kv_load", "kv_evict"))
+        rows = [r for r in trace.rows if not (len(r) == 11 and r[0] in ("kv_load", "kv_evict"))]
+        ns = comp + self.oracle.comm_ns(rows, trace.header_line, self.model, self.hardware, self.tp)
+        self._cache[key] = ns
+        return ns
+
+    def trace_rows(self, shape: StepShape) -> list:
+        cwd = os.getcwd()
+        os.chdir(self._run_dir)
+        try:
+            trace = self._tg.generate_trace(
+                self._batch(shape), self.hardware, self.tp, 1, self.ep, self.ep,
+                max_num_batched_tokens=self.max_num_batched_tokens, dtype=self.dtype,
+                placement=self._placement, enable_block_copy=True,
+            )
+        finally:
+            os.chdir(cwd)
+        return trace.rows
+
     def step_ns(self, shape: StepShape) -> int:
+        if self.oracle is not None:
+            return self._step_ns_astra(shape)
         self.lookups += 1
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
