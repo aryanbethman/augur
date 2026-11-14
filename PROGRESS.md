@@ -94,7 +94,34 @@ How the gap was closed (TTFT was 2.4–5.8% apart):
    prefill. vLLM's attention backends split a batch by query length, so it is
    a decode. Fixed; ShareGPT became exact.
 
+## M5: many engines behind a router (2026-11-14) — done
+
+No code changes were needed: the coordinator already ran N engines. Checked
+against LLMServingSim with round-robin routing (both sides), ShareGPT 300:
+
+| Engines | TPOT identical | TTFT mean diff | Note |
+| --- | --- | --- | --- |
+| 2 | 300/300 | 0.03% | engine 0 identical; engine 1 offset by a constant 35,385 ns |
+| 4 | 193/300 | 0.36% | engine 0 identical; others offset by a constant from their first request |
+
+The offsets come from LLMServingSim's loop, not vLLM: an idle instance with a
+new arrival waits for its pass deadline, and the deadline appears to be seen
+only when ASTRA-Sim next processes an event. Here that was 35 µs after the
+arrival, which was neither a step boundary nor on a 1 ms grid. Inferred from
+the code comments and data, not traced through ASTRA-Sim. augur admits at the
+arrival time, as vLLM does.
+
+Scale check: 32 engines (Llama-3.1-8B, TP1) in one process, 750 ShareGPT
+requests, 163,414 steps: 24 s wall, 1.4 GB RSS, 0.14 ms of vLLM CPU per step.
+The design doc's top risk (vLLM global state blocking many engines in one
+process) did not show up at 32.
+
+Not done: the fork's LOAD routing policy (augur's least-loaded is a
+placeholder for the vLLM Router), and a head-to-head wall-time benchmark on
+the fork's matched 16/256-NPU configs (Phase 3).
+
 ## Next
 
-- Phase 2: several engines behind a router; TP/EP collectives and PD KV
-  transfers through ASTRA-Sim; async scheduling.
+- M6: TP>1 steps with collective times.
+- M7: PD disaggregation via a simulated KV connector.
+- M8: DP+EP MoE lockstep. M9: async scheduling.
