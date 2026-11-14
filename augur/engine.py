@@ -47,6 +47,7 @@ class EngineSpec:
     enable_chunked_prefill: bool = True
     tensor_parallel_size: int = 1
     dtype: str = "bfloat16"
+    enforce_eager: bool = False  # vLLM's default: CUDA graphs on, so steps are padded
 
 
 class SimEngine:
@@ -58,7 +59,7 @@ class SimEngine:
             model=spec.model_dir,
             served_model_name=spec.model_name,
             skip_tokenizer_init=True,
-            enforce_eager=True,
+            enforce_eager=spec.enforce_eager,
             dtype=spec.dtype,
             max_model_len=spec.max_model_len,
             max_num_batched_tokens=spec.max_num_batched_tokens,
@@ -77,6 +78,7 @@ class SimEngine:
         self.busy = False
         self.sched_cpu_s = 0.0
         self.steps = 0
+        self.step_log: list[tuple] | None = None  # (start_ns, dur_ns, total, prefill_tokens, n_decode, n_prefill)
 
     def load(self) -> int:
         s = self.core.scheduler
@@ -214,6 +216,10 @@ class Coordinator:
                 # Apply any outputs now; the engine waits for the next event.
                 self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (eng, outputs)))
                 continue
+            if eng.step_log is not None and eng.ctx.last_shape is not None:
+                sh = eng.ctx.last_shape
+                eng.step_log.append((self.now, step_ns, sh.total_tokens,
+                                     sum(x.num_new for x in sh.seqs if not x.is_decode), sh.num_decode, sh.num_prefill))
             eng.busy = True
             self._push(self.now + step_ns, STEP_DONE, "step_done", (eng, outputs))
 

@@ -22,6 +22,8 @@ from typing import Any, Callable
 
 import torch
 
+from vllm.config import CUDAGraphMode
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -66,6 +68,11 @@ class SimWorker:
         self.vllm_config = vllm_config
         self.ctx = ctx
         self.reqs: dict[str, _ReqState] = {}
+        # vLLM's own CUDA-graph dispatcher decides how far each forward pass is
+        # padded, as in the GPU model runner (uniform decode: one token per request).
+        self.cudagraph = CudagraphDispatcher(vllm_config)
+        mode = vllm_config.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
+        self.cudagraph.initialize_cudagraph_keys(mode, uniform_decode_query_len=1)
 
     # ---- start-up -------------------------------------------------------
     def get_kv_cache_spec(self) -> dict[str, FullAttentionSpec]:
@@ -144,7 +151,10 @@ class SimWorker:
             else:
                 sampled.append([])
 
-        shape = StepShape(seqs=tuple(seqs))
+        num_tokens = sum(x.num_new for x in seqs)
+        uniform_decode = bool(seqs) and all(x.num_new == 1 for x in seqs)
+        _, desc = self.cudagraph.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode)
+        shape = StepShape(seqs=tuple(seqs), padded_tokens=desc.num_tokens)
         self.ctx.last_shape = shape
         self.ctx.last_step_ns = self.ctx.cost.step_ns(shape) if seqs else 0
         return ModelRunnerOutput(

@@ -27,11 +27,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-num-seqs", type=int, default=None)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
+    p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
     p.add_argument("--cost", default="fixed", choices=["fixed", "llmservingsim"])
     p.add_argument("--fixed-step-ms", type=float, default=25.0)
     p.add_argument("--fixed-per-token-us", type=float, default=0.0)
     p.add_argument("--hardware", default="RTXPRO6000", help="profile hardware for --cost llmservingsim")
     p.add_argument("--output", default=None, help="request CSV (fork format)")
+    p.add_argument("--step-log", default=None, help="per-step CSV: start, duration, batch shape")
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
 
@@ -64,12 +66,24 @@ def main(argv: list[str] | None = None) -> int:
     spec = EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=kv_bytes,
                       max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
                       max_num_seqs=a.max_num_seqs, block_size=a.block_size,
-                      enable_prefix_caching=not a.no_prefix_caching, tensor_parallel_size=a.tp)
+                      enable_prefix_caching=not a.no_prefix_caching, tensor_parallel_size=a.tp,
+                      enforce_eager=a.enforce_eager)
     engines = [SimEngine(i, spec, cost) for i in range(a.engines)]
+    if a.step_log:
+        for e in engines:
+            e.step_log = []
     coord = Coordinator(engines, ROUTERS[a.router](), Workload(a.workload, max_entries=a.num_entries))
     rec = coord.run()
     if a.output:
         rec.write_csv(a.output)
+    if a.step_log:
+        import csv as _csv
+        with open(a.step_log, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["engine", "start_ns", "dur_ns", "total_tokens", "prefill_tokens", "n_decode", "n_prefill"])
+            for e in engines:
+                for row in e.step_log:
+                    w.writerow([e.engine_id, *row])
     summary = rec.summary()
     steps = sum(e.steps for e in engines)
     cpu = sum(e.sched_cpu_s for e in engines)

@@ -24,6 +24,13 @@ class SeqWork:
 @dataclass(frozen=True)
 class StepShape:
     seqs: tuple[SeqWork, ...] = field(default_factory=tuple)
+    # Token count the forward pass runs at after vLLM's CUDA-graph padding
+    # (vLLM's own CudagraphDispatcher decides it). None: no padding.
+    padded_tokens: int | None = None
+
+    @property
+    def forward_tokens(self) -> int:
+        return max(self.total_tokens, self.padded_tokens or 0)
 
     @property
     def total_tokens(self) -> int:

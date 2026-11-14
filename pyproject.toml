@@ -9,6 +9,9 @@ description = "Run vLLM's real control plane on virtual time, with LLMServingSim
 requires-python = ">=3.11,<3.15"
 dependencies = ["vllm==0.33.0"]
 
+[project.optional-dependencies]
+llmservingsim = ["pandas", "pyyaml", "scipy"]
+
 [project.scripts]
 augur = "augur.cli:main"
 
