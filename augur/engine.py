@@ -477,6 +477,15 @@ class Coordinator:
         time, one step stale, as in vLLM."""
         progressed = False
         for _ in range(10_000):
+            starts = getattr(eng.ctx.cost, "starts", None)
+            if (starts and eng.ctx.cost.k < len(starts) and self.now < starts[eng.ctx.cost.k]
+                    and eng.core.scheduler.has_requests()):
+                # Replay: the logged engine scheduled its next batch later.
+                at = starts[eng.ctx.cost.k]
+                if eng.wake_at != at:
+                    eng.wake_at = at
+                    self._push(at, ARRIVAL, "wake", eng)
+                return
             t0 = time.perf_counter()
             outputs, executed = eng.core.step_fn()
             progressed = progressed or executed or eng.ctx.last_delivered

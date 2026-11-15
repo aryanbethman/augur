@@ -52,6 +52,7 @@ class _StepLog:
 class _LoggingMixin:
     _log: _StepLog | None = None
     _k = 0
+    _k_of: dict | None = None  # id(scheduler_output) -> step number
 
     def _logger(self) -> _StepLog | None:
         if self._log is None:
@@ -73,6 +74,11 @@ class _LoggingMixin:
         log = self._logger()
         if log:
             self._k += 1
+            if self._k_of is None:
+                self._k_of = {}
+            # Async scheduling updates batch k after scheduling k+1: tag the
+            # update with the step of the output it belongs to.
+            self._k_of[id(so)] = self._k
             log.write({
                 "ev": "sched", "t": t, "k": self._k,
                 "tok": dict(so.num_scheduled_tokens),
@@ -92,7 +98,8 @@ class _LoggingMixin:
                         out[o.request_id] = len(o.new_token_ids)
                     if o.finish_reason is not None:
                         fin.append(o.request_id)
-            log.write({"ev": "upd", "t": CLOCK("upd"), "k": self._k, "out": out, "fin": sorted(fin),
+            k = (self._k_of or {}).pop(id(scheduler_output), self._k)
+            log.write({"ev": "upd", "t": CLOCK("upd"), "k": k, "out": out, "fin": sorted(fin),
                        "left": self.get_num_unfinished_requests()})
             if fin:
                 log.flush()

@@ -27,6 +27,19 @@ def read_log(path: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def is_async(events: list[dict]) -> bool:
+    """True if a step was scheduled before the previous step's update."""
+    pending = 0
+    for e in events:
+        if e["ev"] == "sched":
+            pending += 1
+            if pending > 1:
+                return True
+        elif e["ev"] == "upd":
+            pending = max(pending - 1, 0)
+    return False
+
+
 def steps(events: list[dict]) -> list[tuple[dict, dict | None]]:
     """(sched, upd) pairs for steps that ran tokens, in order."""
     out, pending = [], {}
@@ -57,6 +70,16 @@ class ReplayCost:
         ev = read_log(path)
         t0 = min(e["t"] for e in ev)
         st = steps(ev)
+        if is_async(ev):
+            # The GPU runs batches back to back: batch k starts when it was
+            # scheduled or when batch k-1 finished, whichever is later, and
+            # finishes when its update is applied.
+            d, prev_finish = [], None
+            for s, u in st:
+                start = s["t"] if prev_finish is None else max(s["t"], prev_finish)
+                d.append(u["t"] - start)
+                prev_finish = u["t"]
+            return cls(d, [s["t"] - t0 for s, _ in st])
         d = []
         for i, (s, u) in enumerate(st):
             if u["left"] > 0 and i + 1 < len(st):

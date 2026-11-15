@@ -399,6 +399,7 @@ server's step log with `--num-gpu-blocks` from the server log,
 | ShareGPT, 20 requests | 1,143 / 1,143 |
 | ShareGPT, 300 requests at 10 req/s (overloaded; preemptions) | 3,402 / 3,402 |
 | SWE-bench, 50 sessions / 765 calls, 24k context | 11,030 / 11,030 |
+| ShareGPT, 300 requests, **async scheduling** (vLLM's default) | 3,250 / 3,250 |
 
 What it took:
 
@@ -410,6 +411,10 @@ What it took:
 - Replay starts each step at its logged start (real vLLM's loop wakes ~50 µs
   after an arrival), and takes the KV block count from each run's server log
   (it varies run to run: 5,294 / 5,334 / 5,480 blocks).
+- Async: the step logger tags each update with the step of the scheduler
+  output it belongs to (updates trail schedules by one), and replay gives a
+  batch the GPU time from when it could start (its schedule, or the previous
+  batch finishing) to its update.
 - Unrecorded prompt tokens (the bundled SWE-bench file's ids are short) get
   in-vocabulary ids seeded by call id (`--filler-vocab`); augur's default
   out-of-vocabulary fillers made real vLLM reject every call.
