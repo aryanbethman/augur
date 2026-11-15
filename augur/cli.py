@@ -13,7 +13,7 @@ def _scheduler_cls(a) -> str | None:
     if not a.step_log_vllm:
         return None
     os.environ["AUGUR_STEP_LOG"] = a.step_log_vllm
-    return ("augur.vllm_hooks.LoggingAsyncScheduler" if a.async_scheduling and a.dp == 1
+    return ("augur.vllm_hooks.LoggingAsyncScheduler" if a.async_scheduling
             and not a.num_speculative_tokens else "augur.vllm_hooks.LoggingScheduler")
 
 
@@ -128,16 +128,13 @@ def main(argv: list[str] | None = None) -> int:
                       enable_prefix_caching=not a.no_prefix_caching,
                       enable_chunked_prefill=not a.no_chunked_prefill, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager,
-                      async_scheduling=a.async_scheduling and a.dp == 1 and not a.num_speculative_tokens,
+                      async_scheduling=a.async_scheduling and not a.num_speculative_tokens,
                       speculative=({"method": "ngram", "num_speculative_tokens": a.num_speculative_tokens,
                                     "prompt_lookup_max": 4, "prompt_lookup_min": 2}
                                    if a.num_speculative_tokens else None),
                       spec_accept_rate=a.spec_accept_rate,
                       scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks)
     notes = []
-    if a.async_scheduling and a.dp > 1:
-        notes.append("async scheduling is not modeled with DP yet; this run is synchronous")
-        print("augur: " + notes[-1], file=sys.stderr)
     if a.async_scheduling and a.num_speculative_tokens:
         notes.append("speculative decoding is modeled with synchronous scheduling only; this run is synchronous")
         print("augur: " + notes[-1], file=sys.stderr)

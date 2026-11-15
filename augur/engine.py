@@ -165,8 +165,12 @@ class SimEngine:
         self.busy = False
         self.async_sched = self.core.batch_queue is not None
         self.ctx.async_cpu = self.async_sched
-        if self.async_sched and spec.data_parallel_size > 1:
-            raise NotImplementedError("async scheduling with DP is not modeled yet")
+        # DP + async: rounds this rank's queued batches belong to (FIFO, as
+        # vLLM's batch queue), popped outputs held until that round ends here.
+        self.dp_fifo: "deque[int]" = deque()
+        self.dp_held: dict[int, dict] = {}
+        self.dp_blocked_on: int | None = None
+        self.dp_next_round = 0
         self.gpu_free_at = 0  # async: when the GPU stream finishes its queued batches
         self.batch_finish: "deque[int]" = deque()  # async: finish time per queued batch, FIFO
         self.sched_cpu_s = 0.0
@@ -257,6 +261,13 @@ class Coordinator:
         self.dp_dummy_forwards = 0
         self._dp_pending: dict[int, tuple] = {}  # engine_id -> (outputs, shape or None)
         self._dp_ready_at: int | None = None  # --lss-loop-compat only
+        # DP + async scheduling
+        self._dpa = bool(self.dp_group) and self.dp_group[0].async_sched
+        self._dpa_shapes: dict[int, dict] = {}  # round -> engine_id -> shape (None: empty)
+        self._dpa_next_form = 0
+        self._dpa_running: int | None = None  # round on the GPU
+        self._dpa_left: set = set()  # ranks still running that round
+        self._dpa_finished: dict[int, set] = {}  # round -> ranks done with it
         self._entries_done = False
         self._xfers_started: set[str] = set()
         self._links: dict[int, SharedLink] = {}
@@ -574,9 +585,102 @@ class Coordinator:
             return
         raise RuntimeError("async engine loop did not settle")
 
+    # ---- DP + async scheduling -------------------------------------------------
+    def _dpa_run_rank(self, e: SimEngine) -> None:
+        """Run a rank's vLLM async loop (step_with_batch_queue) until it pops
+        a batch (then it waits for that batch's round) or has nothing to do."""
+        for _ in range(1000):
+            if e.dp_blocked_on is not None:
+                return
+            if not e.core.scheduler.has_requests() and not e.dp_fifo:
+                return
+            t0 = time.perf_counter()
+            outputs, executed = e.core.step_fn()
+            e.sched_cpu_s += time.perf_counter() - t0
+            e.steps += 1
+            launched = bool(e.ctx.launches)
+            for shape in e.ctx.launch_shapes:
+                r = max(e.dp_next_round, self._dpa_next_form)
+                e.dp_next_round = r + 1
+                self._dpa_shapes.setdefault(r, {})[e.engine_id] = shape
+                e.dp_fifo.append(r)
+            e.ctx.launches.clear()
+            e.ctx.launch_shapes.clear()
+            self._after_step(e)
+            if outputs is None:
+                if launched:
+                    continue
+                return
+            r = e.dp_fifo.popleft()
+            if e.engine_id in self._dpa_finished.get(r, ()):
+                self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, outputs)))
+                continue
+            e.dp_held[r] = outputs
+            e.dp_blocked_on = r
+            return
+        raise RuntimeError("DP async rank loop did not settle")
+
+    def _dpa_try_form(self) -> bool:
+        """Start the next GPU round once the previous one is done on every rank.
+        Returns True if it settled a round with no GPU work (all batches
+        empty), so ranks waiting on it can go on."""
+        if self._dpa_running is not None:
+            return False
+        x = self._dpa_next_form
+        shapes = self._dpa_shapes.get(x, {})
+        if not shapes:
+            return False
+        if all(s is None for s in shapes.values()):
+            del self._dpa_shapes[x]
+            self._dpa_next_form = x + 1
+            for e in self.dp_group:
+                self._dpa_finished.setdefault(x, set()).add(e.engine_id)
+                if e.dp_blocked_on == x:
+                    e.dp_blocked_on = None
+                    self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, e.dp_held.pop(x))))
+            return True
+        g = self.dp_group
+        from augur.cost import SeqWork, StepShape
+        sh = [shapes.get(e.engine_id) for e in g]
+        wants = [(s.total_tokens, all(w.num_new == 1 for w in s.seqs)) if s else (1, True) for s in sh]
+        padded = self._dp_padded_tokens(wants)
+        final = []
+        for s, p in zip(sh, padded):
+            if s is None:
+                self.dp_dummy_forwards += 1
+                final.append(StepShape(seqs=(SeqWork(1, 1, True),), padded_tokens=p, dummy=True))
+            else:
+                final.append(StepShape(seqs=s.seqs, padded_tokens=p))
+        per_rank = g[0].ctx.cost.round_ns(final)
+        self.dp_rounds += 1
+        self._dpa_running = x
+        self._dpa_left = {e.engine_id for e in g}
+        self._dpa_next_form = x + 1
+        del self._dpa_shapes[x]
+        for e, ns in zip(g, per_rank):
+            self._push(self.now + ns, STEP_DONE, "dpa_done", (e, x))
+        return False
+
+    def _dpa_done(self, ev: _Event) -> None:
+        e, x = ev.payload
+        self._dpa_finished.setdefault(x, set()).add(e.engine_id)
+        self._dpa_left.discard(e.engine_id)
+        if e.dp_blocked_on == x:
+            e.dp_blocked_on = None
+            self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, e.dp_held.pop(x))))
+        if not self._dpa_left:
+            self._dpa_running = None
+            self._dpa_finished.pop(x - 2, None)
+
     def _start_steps(self) -> None:
         q = self.lss_idle_quantum_ns
-        if self.dp_group:
+        if self._dpa:
+            for _ in range(1000):
+                for e in self.dp_group:
+                    self._dpa_run_rank(e)
+                if not self._dpa_try_form():
+                    break
+        elif self.dp_group:
             self._start_dp_round()
         for eng in self.engines:
             if eng.busy or eng.spec.data_parallel_size > 1:
@@ -700,6 +804,8 @@ class Coordinator:
                 ev = heapq.heappop(self._q)
                 if ev.prio == ARRIVAL:
                     self._on_arrival(ev)
+                elif ev.kind == "dpa_done":
+                    self._dpa_done(ev)
                 elif ev.prio == TRANSFER_DONE:
                     if ev.kind in ("kv_join", "kv_link"):
                         self._on_link_event(ev)

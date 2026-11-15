@@ -75,6 +75,7 @@ class SimContext:
     # Async scheduling: every execute_model call is a launch onto the GPU
     # stream; the coordinator drains these durations (0 for an empty batch).
     launches: list = field(default_factory=list)
+    launch_shapes: list = field(default_factory=list)  # DP async: each launch's shape (None if empty)
     # vLLM's per-step CPU work (schedule, input preparation, sampling,
     # output processing), which GPU profiles do not include: a fixed part
     # plus a part per scheduled request. Synchronous: added to the step.
@@ -311,6 +312,9 @@ def make_sim_executor(ctx: SimContext) -> type[Executor]:
         def execute_model(self, scheduler_output, non_block=False):
             out = self.worker.execute_model(scheduler_output)
             self._ctx.launches.append(self._ctx.last_step_ns)
+            if self._ctx.defer_cost:
+                self._ctx.launch_shapes.append(
+                    self._ctx.last_shape if scheduler_output.total_num_scheduled_tokens > 0 else None)
             if scheduler_output.total_num_scheduled_tokens > 0:
                 # As vLLM's GPU runner: the forward returns None and the
                 # output comes from sample_tokens.
