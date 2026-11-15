@@ -35,6 +35,8 @@ class LLMServingSimCost:
                  cpu_mem_bw_gbps: float = 256.0, cpu_mem_latency_ns: int = 0,
                  cluster_config: str | None = None, dp: int = 1):
         self.fork_root = os.path.abspath(fork_root)
+        from augur.profiles import check
+        check(self.fork_root, hardware, model, tp)
         if self.fork_root not in sys.path:
             sys.path.insert(0, self.fork_root)
         self._run_dir = os.path.join(self.fork_root, "serving")

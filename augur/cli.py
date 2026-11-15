@@ -8,18 +8,20 @@ import logging
 import os
 import sys
 
+from augur.profiles import default_fork
+
 
 def _scheduler_cls(a) -> str | None:
     if not a.step_log_vllm:
         return None
     os.environ["AUGUR_STEP_LOG"] = a.step_log_vllm
     return ("augur.vllm_hooks.LoggingAsyncScheduler" if a.async_scheduling
-            and not a.num_speculative_tokens else "augur.vllm_hooks.LoggingScheduler")
+            else "augur.vllm_hooks.LoggingScheduler")
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="augur")
-    p.add_argument("--fork", default=os.environ.get("AUGUR_FORK", os.path.expanduser("~/llmss-vllm-sim-20261114")),
+    p.add_argument("--fork", default=default_fork(),
                    help="LLMServingSim fork checkout (model configs, profiles)")
     p.add_argument("--model", required=True, help="e.g. meta-llama/Llama-3.1-8B")
     p.add_argument("--model-config", default=None,
@@ -32,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=True,
                    help="vLLM async scheduling, on by default as in vLLM 0.33: schedule step k+1 while step k runs")
     p.add_argument("--num-speculative-tokens", type=int, default=0,
-                   help="speculative decoding (ngram method, synchronous scheduling): draft tokens per step")
+                   help="speculative decoding (ngram method): draft tokens per step")
     p.add_argument("--spec-accept-rate", type=float, default=0.7,
                    help="probability each draft token is accepted (content decides this on a GPU)")
     p.add_argument("--dp", type=int, default=1, help="DP ranks in one lockstep group (vLLM data_parallel_size)")
@@ -98,7 +100,14 @@ def main(argv: list[str] | None = None) -> int:
     from augur.workload import Workload
 
     cache_root = os.path.expanduser("~/.cache/augur/models")
-    mdir = model_dir(a.fork, a.model, cache_root, a.model_config)
+    try:
+        mdir = model_dir(a.fork, a.model, cache_root, a.model_config)
+        if a.cost == "llmservingsim" and not a.replay_durations:
+            from augur.profiles import check
+            check(a.fork, a.hardware, a.model, a.tp)
+    except FileNotFoundError as e:
+        print(f"augur: {e}", file=sys.stderr)
+        return 2
     if a.kv_cache_gb is not None:
         kv_bytes = int(a.kv_cache_gb * 2**30)
     else:

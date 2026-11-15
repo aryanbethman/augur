@@ -22,6 +22,7 @@ import sys
 import numpy as np
 
 from augur.cost import SeqWork, StepShape
+from augur.profiles import default_fork
 from augur.replay import is_async, read_log, steps
 
 
@@ -54,7 +55,7 @@ def classify(shape: StepShape) -> str:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="augur.stepcheck")
     p.add_argument("log")
-    p.add_argument("--fork", default=os.environ.get("AUGUR_FORK", os.path.expanduser("~/llmss-vllm-sim-20261114")))
+    p.add_argument("--fork", default=default_fork())
     p.add_argument("--model", required=True)
     p.add_argument("--hardware", required=True)
     p.add_argument("--max-num-seqs", type=int, default=128)
