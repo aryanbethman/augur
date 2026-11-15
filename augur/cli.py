@@ -128,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
                       enable_prefix_caching=not a.no_prefix_caching,
                       enable_chunked_prefill=not a.no_chunked_prefill, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager,
-                      async_scheduling=a.async_scheduling and not a.num_speculative_tokens,
+                      async_scheduling=a.async_scheduling,
                       speculative=({"method": "ngram", "num_speculative_tokens": a.num_speculative_tokens,
                                     "prompt_lookup_max": 4, "prompt_lookup_min": 2}
                                    if a.num_speculative_tokens else None),

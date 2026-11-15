@@ -153,9 +153,6 @@ class SimEngine:
         )
         self.ctx.defer_cost = spec.data_parallel_size > 1
         if spec.speculative:
-            if spec.async_scheduling:
-                raise NotImplementedError("speculative decoding with async scheduling is not modeled yet "
-                                          "(use --no-async-scheduling)")
             self.ctx.spec_k = int(spec.speculative["num_speculative_tokens"])
             self.ctx.spec_accept_rate = spec.spec_accept_rate
         self.vllm_config = args.create_engine_config()
