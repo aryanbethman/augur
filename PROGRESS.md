@@ -468,6 +468,18 @@ so async scheduling; `max_num_seqs` 128, 2,048-token budget). augur uses the
   queueing turns into the TTFT error at the knee. The profile's skew sweep
   (attention with uneven KV lengths) is the open item.
 
+**Synchronous runs**, augur (profile + `--step-cpu-us 3000`) vs the real
+synchronous runs' client-side results, run normally (not replayed):
+ShareGPT 300: mean TTFT +0.4%, TPOT +0.1%, latency +0.2% (per-request median
+errors under 0.7%; without the CPU term all were ~−4.9%). SWE-bench sessions:
+means within 1.6–2.9% (from 5.9–7.8%), per-call medians 7–9% (sessions
+compound small timing differences).
+
+**PD contention** (`--pd-contention decode`, new): concurrent KV pulls into a
+decode engine share its link (processor sharing; each pays the link latency
+first). 2 prefill + 1 decode at 2 GB/s: mean TTFT 231 → 284 ms. PD also runs
+with M x N engines (2+2, 1+3 checked: all calls complete, all blocks freed).
+
 **Hardware note:** GPU 1 on anjuna3 runs at a locked 510 MHz (max 3,105) with
 no throttle reason: 8.6 vs 44.0 TFLOP/s on the same GEMM. A first profile
 made there priced steps at 2.9–3.6x. Only GPU 0 is usable for timing.

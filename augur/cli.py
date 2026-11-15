@@ -35,6 +35,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--enable-expert-parallel", action="store_true", help="MoE experts split across DP x TP ranks")
     p.add_argument("--pd-link-bw", type=float, default=16.0, help="PD KV pull bandwidth, GB/s")
     p.add_argument("--pd-link-latency-ns", type=int, default=20_000)
+    p.add_argument("--pd-contention", choices=["none", "decode"], default="none",
+                   help="decode: concurrent KV pulls into a decode engine share its link bandwidth")
     p.add_argument("--router", default="least-loaded")
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--hbm-gb", type=float, default=80.0, help="simulated GPU memory")
@@ -152,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     coord = Coordinator(engines, ROUTERS[a.router](), workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
                         decode_router=ROUTERS[a.router](),
-                        pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns),
+                        pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
                         frontend_latency_ns=int(a.frontend_latency_ms * 1e6))
     if a.step_log_vllm:
         from augur.engine import install_step_log_clock

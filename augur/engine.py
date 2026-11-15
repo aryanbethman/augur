@@ -89,9 +89,37 @@ class PDLink:
 
     bw_gbps: float = 16.0
     latency_ns: int = 20_000
+    contention: str = "none"  # "decode": pulls into one decode engine share its link fairly
 
     def transfer_ns(self, nbytes: int) -> int:
         return self.latency_ns + int(nbytes / self.bw_gbps)
+
+
+class SharedLink:
+    """Processor sharing: n active transfers each get bandwidth / n.
+
+    Remaining bytes are advanced whenever the set changes; the next completion
+    is (re)scheduled as an event tagged with a version, so stale ones are
+    ignored."""
+
+    def __init__(self, bw_gbps: float):
+        self.bw = bw_gbps  # bytes per ns
+        self.active: dict = {}  # key -> [remaining bytes, payload]
+        self.last = 0
+        self.version = 0
+
+    def advance(self, now: int) -> None:
+        if self.active and now > self.last:
+            share = (now - self.last) * self.bw / len(self.active)
+            for v in self.active.values():
+                v[0] -= share
+        self.last = now
+
+    def next_finish(self, now: int) -> int | None:
+        if not self.active:
+            return None
+        least = min(v[0] for v in self.active.values())
+        return now + max(0, int(-(-least * len(self.active) // self.bw)))
 
 class SimEngine:
     def __init__(self, engine_id: int, spec: EngineSpec, cost: CostModel):
@@ -221,6 +249,7 @@ class Coordinator:
         self._dp_ready_at: int | None = None  # --lss-loop-compat only
         self._entries_done = False
         self._xfers_started: set[str] = set()
+        self._links: dict[int, SharedLink] = {}
         # LLMServingSim loop compatibility, for comparisons only (off by
         # default; none of this is vLLM behaviour):
         # - A fully idle cluster advances in fixed quanta (1 ms): a session call
@@ -612,9 +641,45 @@ class Coordinator:
             if rid in self._xfers_started:
                 continue
             self._xfers_started.add(rid)
-            ns = self.pd_link.transfer_ns(blocks * eng.ctx.kv_block_bytes)
-            self._push(self.now + ns, TRANSFER_DONE, "kv_pull",
-                       (eng, rid, self._by_vllm_id.get(remote_engine), remote_rid))
+            payload = (eng, rid, self._by_vllm_id.get(remote_engine), remote_rid)
+            nbytes = blocks * eng.ctx.kv_block_bytes
+            if self.pd_link.contention == "decode":
+                # Pay the link latency, then join the decode engine's shared link.
+                self._push(self.now + self.pd_link.latency_ns, TRANSFER_DONE, "kv_join", (nbytes, payload))
+            else:
+                ns = self.pd_link.transfer_ns(nbytes)
+                self._push(self.now + ns, TRANSFER_DONE, "kv_pull", payload)
+
+    def _link_of(self, eng: SimEngine) -> SharedLink:
+        link = self._links.get(eng.engine_id)
+        if link is None:
+            link = self._links[eng.engine_id] = SharedLink(self.pd_link.bw_gbps)
+        return link
+
+    def _reschedule(self, eng: SimEngine, link: SharedLink) -> None:
+        link.version += 1
+        t = link.next_finish(self.now)
+        if t is not None:
+            self._push(t, TRANSFER_DONE, "kv_link", (eng, link.version))
+
+    def _on_link_event(self, ev: _Event) -> None:
+        if ev.kind == "kv_join":
+            nbytes, payload = ev.payload
+            eng = payload[0]
+            link = self._link_of(eng)
+            link.advance(self.now)
+            link.active[payload[1]] = [float(nbytes), payload]
+            self._reschedule(eng, link)
+            return
+        eng, version = ev.payload
+        link = self._link_of(eng)
+        if version != link.version:
+            return  # superseded by a later change to this link
+        link.advance(self.now)
+        for key in [k for k, v in link.active.items() if v[0] <= 0.5]:
+            _, payload = link.active.pop(key)
+            self._on_transfer_done(_Event(self.now, TRANSFER_DONE, 0, "kv_pull", payload))
+        self._reschedule(eng, link)
 
     def run(self) -> Recorder:
         t0 = time.perf_counter()
@@ -626,7 +691,10 @@ class Coordinator:
                 if ev.prio == ARRIVAL:
                     self._on_arrival(ev)
                 elif ev.prio == TRANSFER_DONE:
-                    self._on_transfer_done(ev)
+                    if ev.kind in ("kv_join", "kv_link"):
+                        self._on_link_event(ev)
+                    else:
+                        self._on_transfer_done(ev)
                 else:
                     self._on_step_done(ev)
             self._start_steps()
