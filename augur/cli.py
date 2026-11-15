@@ -9,6 +9,14 @@ import os
 import sys
 
 
+def _scheduler_cls(a) -> str | None:
+    if not a.step_log_vllm:
+        return None
+    os.environ["AUGUR_STEP_LOG"] = a.step_log_vllm
+    return ("augur.vllm_hooks.LoggingAsyncScheduler" if a.async_scheduling and a.dp == 1
+            else "augur.vllm_hooks.LoggingScheduler")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="augur")
     p.add_argument("--fork", default=os.environ.get("AUGUR_FORK", os.path.expanduser("~/llmss-vllm-sim-20261114")),
@@ -36,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
+    p.add_argument("--no-recorded-outputs", action="store_true",
+                   help="emit unique output ids instead of the trace's recorded outputs (as a real model does)")
+    p.add_argument("--step-log-vllm", default=None,
+                   help="write vLLM-scheduler step events (augur.vllm_hooks format) to <path>.<pid>.jsonl")
+    p.add_argument("--replay-durations", default=None,
+                   help="price step k with the duration recorded in this vLLM step log (see augur.replay)")
     p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
     p.add_argument("--cost", default="fixed", choices=["fixed", "llmservingsim"])
     p.add_argument("--fixed-step-ms", type=float, default=25.0)
@@ -73,7 +87,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"model weights ({weights / 2**30:.1f} GiB/GPU) do not fit in {a.hbm_gb} GB", file=sys.stderr)
             return 2
 
-    if a.cost == "fixed":
+    if a.replay_durations:
+        from augur.replay import ReplayCost
+        cost = ReplayCost.from_log(a.replay_durations)
+    elif a.cost == "fixed":
         cost = FixedCost(base_ns=int(a.fixed_step_ms * 1e6), per_token_ns=int(a.fixed_per_token_us * 1e3))
     else:
         from augur.lss_cost import LLMServingSimCost
@@ -89,7 +106,8 @@ def main(argv: list[str] | None = None) -> int:
                       enable_prefix_caching=not a.no_prefix_caching,
                       enable_chunked_prefill=not a.no_chunked_prefill, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager,
-                      async_scheduling=a.async_scheduling and a.dp == 1)
+                      async_scheduling=a.async_scheduling and a.dp == 1,
+                      scheduler_cls=_scheduler_cls(a))
     notes = []
     if a.async_scheduling and a.dp > 1:
         notes.append("async scheduling is not modeled with DP yet; this run is synchronous")
@@ -108,10 +126,19 @@ def main(argv: list[str] | None = None) -> int:
         for e in engines:
             e.step_log = []
     from augur.engine import PDLink
-    coord = Coordinator(engines, ROUTERS[a.router](), Workload(a.workload, max_entries=a.num_entries),
+    if a.replay_durations:
+        from augur.replay import ReplayWorkload
+        workload = ReplayWorkload(a.workload, max_entries=a.num_entries, log_path=a.replay_durations,
+                                  recorded_outputs=not a.no_recorded_outputs)
+    else:
+        workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs)
+    coord = Coordinator(engines, ROUTERS[a.router](), workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
                         decode_router=ROUTERS[a.router](),
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns))
+    if a.step_log_vllm:
+        from augur.engine import install_step_log_clock
+        install_step_log_clock(coord)
     rec = coord.run()
     if a.output:
         rec.write_csv(a.output)

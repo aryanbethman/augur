@@ -36,3 +36,13 @@ run sharegpt_dp2_ep       out/lss/qwen_sharegpt300_dpep.csv  --model Qwen/Qwen3-
 # mode frees a finishing request's slot one step earlier than vLLM (see M9).
 COMMON="--cost llmservingsim --hardware RTXPRO6000 --max-num-seqs 128 --max-num-batched-tokens 2048"
 run sharegpt_tp1_async      out/lss/sharegpt300_async.csv     $LLAMA --async-scheduling
+
+# Replay self-test: augur's own step log, replayed with its arrival times and
+# step durations, must reproduce every scheduling decision (augur.replay).
+rm -f out/validate/replay_orig.* out/validate/replay_rep.*
+R="--cost llmservingsim --hardware RTXPRO6000 --hbm-gb 96 --max-model-len 131072 --max-num-seqs 128 --max-num-batched-tokens 2048 --model Qwen/Qwen3-30B-A3B-Instruct-2507 --no-async-scheduling --quiet --workload out/lss/swe50_fullids.jsonl"
+.venv/bin/augur $R --step-log-vllm out/validate/replay_orig --output out/validate/replay_orig.csv > /dev/null 2>&1
+LOG=$(ls out/validate/replay_orig.*.jsonl)
+.venv/bin/augur $R --replay-durations "$LOG" --step-log-vllm out/validate/replay_rep --output out/validate/replay_rep.csv > /dev/null 2>&1
+printf '%-28s ' replay_selftest_swebench
+$PY -m augur.replay compare "$LOG" out/validate/replay_rep.*.jsonl | $PY -c "import json,sys; r=json.loads(''.join(l for l in sys.stdin if not l.startswith(('first','  A','  B')))); print(f\"steps={r['identical_steps']}/{r['steps_a']}\")"

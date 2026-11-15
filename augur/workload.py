@@ -39,6 +39,7 @@ class Call:
     output_toks: int
     output_ids: list[int]
     tool_wait_ns: int  # wait after this call before the session's next one
+    after_step_start: bool = False  # replay only: reached the engine just after a step began
 
 
 @dataclass
@@ -66,6 +67,10 @@ class Workload:
 
     path: str
     max_entries: int | None = None
+    # False: the simulated model emits ids unique to the request instead of the
+    # recorded outputs, as when a real model generates its own text (a later
+    # turn then hits the prefix cache on the earlier prompt only).
+    recorded_outputs: bool = True
     _filler: _Filler = field(default_factory=_Filler)
 
     def entries(self) -> Iterator[Call | Session]:
@@ -95,7 +100,7 @@ class Workload:
         rec_in = list(d.get("input_tok_ids") or ())[:n_in]
         if len(rec_in) < n_in:
             rec_in += self._filler.ids(n_in - len(rec_in))
-        rec_out = list(d.get("output_tok_ids") or ())[:n_out]
+        rec_out = list(d.get("output_tok_ids") or ())[:n_out] if self.recorded_outputs else []
         if len(rec_out) < n_out:
             rec_out += self._filler.ids(n_out - len(rec_out))
         return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,

@@ -31,6 +31,23 @@ from augur.metrics import CallRecord, Recorder
 from augur.router import Router
 from augur.workload import Call, Session, Workload
 
+# The engine inside a synchronous step (for the step log's clock).
+_stepping: list = [None]
+
+
+def install_step_log_clock(coord: "Coordinator") -> None:
+    """Point augur.vllm_hooks' clock at the virtual clock: a step's outputs are
+    applied at its start in augur, but land at its end."""
+    from augur import vllm_hooks
+
+    def clock(phase: str) -> int:
+        if phase == "upd" and _stepping[0] is not None:
+            return coord.now + _stepping[0].ctx.last_step_ns
+        return coord.now
+
+    vllm_hooks.CLOCK = clock
+
+
 # Event priorities at equal times (design doc: arrivals, transfers, step completions).
 # CAUSED_ARRIVAL is a call released by a completion at this same instant (a
 # session's next call after a zero tool wait). It cannot reach the engine
@@ -54,6 +71,7 @@ class EngineSpec:
     tensor_parallel_size: int = 1
     dtype: str = "bfloat16"
     enforce_eager: bool = False  # vLLM's default: CUDA graphs on, so steps are padded
+    scheduler_cls: str | None = None  # e.g. augur.vllm_hooks.LoggingScheduler
     kv_role: str | None = None  # "kv_producer" (prefill) / "kv_consumer" (decode) for PD
     data_parallel_size: int = 1  # >1: this engine is one rank of a DP group (lockstep rounds)
     data_parallel_rank: int = 0
@@ -92,6 +110,7 @@ class SimEngine:
             enable_prefix_caching=spec.enable_prefix_caching,
             enable_chunked_prefill=spec.enable_chunked_prefill,
             async_scheduling=spec.async_scheduling,
+            scheduler_cls=spec.scheduler_cls,
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
             kv_transfer_config=self._kv_transfer_config(engine_id, spec),
@@ -153,6 +172,7 @@ class SimEngine:
         self.core.add_request(r, wave)
 
     def step(self):
+        _stepping[0] = self
         t0 = time.perf_counter()
         outputs, executed = self.core.step()
         self.ctx.launches.clear()
@@ -235,7 +255,8 @@ class Coordinator:
         if t < self._last_entry_ns:
             raise ValueError(f"workload not sorted by arrival: {t} after {self._last_entry_ns}")
         self._last_entry_ns = t
-        self._push(t, ARRIVAL, "entry", e)
+        prio = CAUSED_ARRIVAL if getattr(e, "after_step_start", False) else ARRIVAL
+        self._push(t, prio, "entry", e)
 
     @staticmethod
     def _cid(request_id: str) -> str:

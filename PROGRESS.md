@@ -330,6 +330,66 @@ simulated second, ~0.7 s of wall per simulated second at the same cost per
 step: still within the design doc's target (1 simulated hour in at most 1
 wall hour).
 
+### Why augur is faster than LLMServingSim
+
+Same inputs and the same numbers, priced differently:
+
+- LLMServingSim runs every batch through ASTRA-Sim: an event-driven
+  simulation of the whole step graph (80 layers of compute nodes and
+  collectives on every NPU), 173,261 times at 256 GPUs. In its September
+  256-GPU run that was 2,349 s of 2,541 s of CPU (92%), even with shared
+  templates removing most graph conversion.
+- augur prices a step as the sum of its layer latencies (the same profile
+  lookups LLMServingSim feeds ASTRA-Sim; compute rows run serially, so the
+  sum is what ASTRA-Sim would compute) plus ASTRA-Sim's time for the step's
+  collectives and CPU-memory reads, cached on that pattern. Checked exact
+  against full ASTRA-Sim runs (M6). At 256 GPUs: 33,036 distinct step
+  shapes among 173,261 steps priced in Python, and 213 ASTRA-Sim runs.
+- vLLM's scheduler itself costs ~0.1 ms per step.
+
+Under cProfile (inflates 44 s to 127 s): fork trace generation 33.6 s, the
+ASTRA cache key 19.6 s, vLLM scheduler 12.9 s, ASTRA-Sim runs 7.3 s. The
+cache key walks every row of every step; keying on the step's collective
+sizes directly would remove most of that.
+
+### LLMServingSim's 256-GPU crash on the current branch, fixed
+
+`template binding refers to unknown template` (ASTRA-Sim abort), after 3
+minutes. ASTRA-Sim parses only the asking NPU's bindings of a
+shared-template bundle, then evicts unreferenced templates and reports
+`TEMPLATE_RELEASE`. LLMServingSim re-sends the same stored batch graph when
+the instance's other polled NPU asks, so a template evicted in between was
+referenced without its definition. At 16 GPUs the 128-entry cache rarely
+evicts; at 256 it evicts constantly. Fix (fork commit 7da69d6): the
+controller keeps every template definition it sent and re-attaches any a
+bundle references that ASTRA-Sim no longer holds. `baseline_scale_16` with
+an 8-entry cache now finishes and is byte-identical to the 128-entry run.
+
+## Verification tooling: does augur run vLLM properly? (2026-11-16)
+
+- `augur.vllm_hooks.LoggingScheduler` / `LoggingAsyncScheduler`: subclasses of
+  vLLM's own schedulers that only log (plug in with `scheduler_cls`; set
+  `AUGUR_STEP_LOG`). Same log format from real `vllm serve` and from augur
+  (`--step-log-vllm`): request adds, each step's decisions (tokens per
+  request, prefix hits, preemptions), each update's outputs.
+- `augur.replay`: rerun a logged run through augur with the logged arrival
+  times and step durations (`--replay-durations`), then
+  `python -m augur.replay compare A B` checks the decisions step for step.
+  With timing fixed from the log, any mismatch is a bug in what augur wraps
+  around vLLM, not in the timing model.
+- `augur.client`: replays a trace against `vllm serve` with the same token-id
+  prompts, exact output lengths and request ids `augur.<call_id>.`; records
+  per-call times and the generated token ids. `--no-recorded-outputs` makes
+  augur emit unique output ids, as a real model generating its own text does.
+
+Self-test (augur's own log replayed through augur), now in
+`scripts/validate.sh`: ShareGPT 2,406/2,406 steps identical, SWE-bench
+sessions 8,924/8,924, ShareGPT with 228 preemptions 28,652/28,652. Needed:
+an add logged after a step that started at the same instant must not join
+that step (exact ties only occur in augur's virtual time).
+
+Next: the same replay against a real vLLM run on GPU.
+
 ## Next
 
 - Phase 3: a loaded 256-GPU run to confirm the speed target; DP rounds
