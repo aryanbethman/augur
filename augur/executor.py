@@ -66,6 +66,14 @@ class SimContext:
     # Async scheduling: every execute_model call is a launch onto the GPU
     # stream; the coordinator drains these durations (0 for an empty batch).
     launches: list = field(default_factory=list)
+    # vLLM's per-step CPU work (schedule, input preparation, sampling,
+    # output processing), which GPU profiles do not include: a fixed part
+    # plus a part per scheduled request. Synchronous: added to the step.
+    # Async: delays the batch's launch (overlaps the previous GPU batch).
+    async_cpu: bool = False  # set for async engines: CPU time goes into the launch time
+    cpu_fixed_ns: int = 0
+    cpu_per_request_ns: int = 0
+    last_cpu_ns: int = 0
 
 
 @dataclass
@@ -199,7 +207,10 @@ class SimWorker:
             _, desc = self.cudagraph.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode)
             shape = StepShape(seqs=tuple(seqs), padded_tokens=desc.num_tokens)
             self.ctx.last_shape = shape
-            self.ctx.last_step_ns = self.ctx.cost.step_ns(shape) if seqs else 0
+            gpu = self.ctx.cost.step_ns(shape) if seqs else 0
+            cpu = (self.ctx.cpu_fixed_ns + self.ctx.cpu_per_request_ns * len(seqs)) if seqs else 0
+            self.ctx.last_cpu_ns = cpu
+            self.ctx.last_step_ns = gpu + cpu if not self.ctx.async_cpu else gpu
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={r: i for i, r in enumerate(req_ids)},

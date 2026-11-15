@@ -419,8 +419,58 @@ What it took:
   in-vocabulary ids seeded by call id (`--filler-vocab`); augur's default
   out-of-vocabulary fillers made real vLLM reject every call.
 
-This shows augur makes vLLM's decisions when step times are right. Whether
-augur predicts the step times is the next check (profile on the 4060 Ti).
+This shows augur makes vLLM's decisions when step times are right.
+
+## Step-time accuracy against real vLLM (2026-11-16)
+
+Profile: Qwen3-1.7B TP1 on the RTX 4060 Ti, fork profiler with vLLM 0.33
+(fork commit 4e1e890; the profiler needed a fix: 0.33 passes attention
+metadata to `build()` positionally). No skew sweep yet. `augur.stepcheck`
+rebuilds every real step's shape from the step log, pads it with vLLM's
+CUDA-graph dispatcher, prices it, and compares with the measured step
+(schedule start to update end, synchronous runs):
+
+| Real run | Steps | Predicted / measured total | Median step error: decode / mixed / prefill |
+| --- | --- | --- | --- |
+| ShareGPT 300 | 3,402 | 0.951 | −4.6% / −4.1% / −11.8% |
+| SWE-bench sessions | 11,030 | 0.950 | −7.0% / −1.9% / −11.1% |
+
+augur is a little fast: the profile prices GPU work, and the measured step
+also holds vLLM's CPU work. ShareGPT's gap is ~1.5–3 ms per step at any
+batch size (CPU work); SWE-bench's grows with batch size and long, uneven KV
+lengths (likely the attention skew correction the sweep would add).
+`--step-cpu-us` / `--step-cpu-per-request-us` model the CPU part (sync: added
+to the step; async: delays the batch's launch, hiding it behind the previous
+GPU batch); not calibrated by default.
+
+## End to end: `augur bench` vs real `vllm bench serve` (2026-11-16)
+
+Same arguments on both sides (vLLM random dataset, 1,024-token prompts,
+128-token outputs, 300 requests, seed 0, `--ignore-eos`; vLLM 0.33 defaults,
+so async scheduling; `max_num_seqs` 128, 2,048-token budget). augur uses the
+4060 Ti profile and each real server's KV block count. Error of augur:
+
+| Rate | Throughput | Mean TTFT | Median TTFT | Mean TPOT | augur wall / real |
+| --- | --- | --- | --- | --- | --- |
+| 2 req/s | +0.1% | −11.5% → **−0.6%** | −11.8% → **+0.2%** | −1.8% | 3.6 s / 152 s |
+| 6 req/s (knee) | +0.6% | −10.9% → −10.1% | −26.6% → −25.5% | −1.0% | 1.1 s / 58 s |
+| 12 req/s (overloaded) | +1.9% | −3.3% | −2.6% | −2.0% | 1.1 s / 55 s |
+
+(→ with `--frontend-latency-ms 15`.) Calibration over a grid:
+
+- `--frontend-latency-ms` (new): API-server time before the engine sees a
+  request (HTTP, tokenizing a 1,024-token text prompt, hand-off). 15 ms
+  closes the light-load TTFT gap on this host.
+- `--step-cpu-us` barely matters under async scheduling (0–3 ms per step
+  moves no metric by more than ~1%): vLLM hides its CPU work behind the
+  GPU. It matters for synchronous runs (the 1.5–3 ms per step above).
+- Left: augur's GPU time is ~2% low (throughput +1.9% when saturated), which
+  queueing turns into the TTFT error at the knee. The profile's skew sweep
+  (attention with uneven KV lengths) is the open item.
+
+**Hardware note:** GPU 1 on anjuna3 runs at a locked 510 MHz (max 3,105) with
+no throttle reason: 8.6 vs 44.0 TFLOP/s on the same GEMM. A first profile
+made there priced steps at 2.9–3.6x. Only GPU 0 is usable for timing.
 
 ## Next
 

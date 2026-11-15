@@ -127,6 +127,7 @@ class SimEngine:
         self.max_model_len = self.vllm_config.model_config.max_model_len
         self.busy = False
         self.async_sched = self.core.batch_queue is not None
+        self.ctx.async_cpu = self.async_sched
         if self.async_sched and spec.data_parallel_size > 1:
             raise NotImplementedError("async scheduling with DP is not modeled yet")
         self.gpu_free_at = 0  # async: when the GPU stream finishes its queued batches
@@ -195,8 +196,9 @@ class _Event:
 class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
-                 pd_link: PDLink | None = None):
+                 pd_link: PDLink | None = None, frontend_latency_ns: int = 0):
         self.engines = engines
+        self.frontend_latency_ns = frontend_latency_ns
         # PD disaggregation: the coordinator plays vLLM's PD proxy. A call goes
         # to a prefill engine with max_tokens=1 and do_remote_decode; the
         # kv_transfer_params that engine's NIXL scheduler returns go with the
@@ -281,6 +283,15 @@ class Coordinator:
         self._records[call.call_id] = rec
         self._calls[call.call_id] = call
         self._call_engine[call.call_id] = eng
+        if self.frontend_latency_ns:
+            # The API server's work before the engine sees the request (HTTP,
+            # tokenization, hand-off); the call's times stay measured from
+            # when the client sent it.
+            self._push(self.now + self.frontend_latency_ns, ARRIVAL, "admit", (eng, call))
+        else:
+            self._admit(eng, call)
+
+    def _admit(self, eng: SimEngine, call: Call) -> None:
         if self.pd:
             eng.add(call, self.now, request_id=call.call_id + "@p", max_tokens=1,
                     kv_transfer_params={"do_remote_decode": True})
@@ -301,6 +312,8 @@ class Coordinator:
             self._release(self.workload.next_call(s, self.now), exact=False)
         elif ev.kind == "wake":
             p.wake_at = None
+        elif ev.kind == "admit":
+            self._admit(*p)
         elif ev.kind == "decode_dispatch":
             cid, params = p
             call = self._calls[cid]
@@ -492,7 +505,8 @@ class Coordinator:
             eng.sched_cpu_s += time.perf_counter() - t0
             eng.steps += 1
             for ns in eng.ctx.launches:
-                start = max(self.now, eng.gpu_free_at)
+                # The batch reaches the GPU once the CPU has prepared it.
+                start = max(self.now + (eng.ctx.last_cpu_ns if ns else 0), eng.gpu_free_at)
                 eng.gpu_free_at = start + ns
                 eng.batch_finish.append(eng.gpu_free_at)
                 if ns and eng.step_log is not None and eng.ctx.last_shape is not None:

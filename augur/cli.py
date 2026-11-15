@@ -48,6 +48,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
+    p.add_argument("--frontend-latency-ms", type=float, default=0.0,
+                   help="API-server time before a request reaches the engine (HTTP, tokenization); "
+                        "counted in TTFT and latency")
+    p.add_argument("--step-cpu-us", type=float, default=0.0,
+                   help="vLLM's fixed per-step CPU time not in GPU profiles (sync: added; async: delays launch)")
+    p.add_argument("--step-cpu-per-request-us", type=float, default=0.0,
+                   help="vLLM's per-step CPU time per scheduled request")
     p.add_argument("--filler-vocab", type=int, default=None,
                    help="fill unrecorded prompt tokens with in-vocabulary ids below this (match augur.client runs)")
     p.add_argument("--no-recorded-outputs", action="store_true",
@@ -128,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
         engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), cost) for i, r in enumerate(roles)]
     else:
         engines = [SimEngine(i, spec, cost) for i in range(a.engines)]
+    for e in engines:
+        e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
+        e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
     if a.step_log:
         for e in engines:
             e.step_log = []
@@ -142,7 +152,8 @@ def main(argv: list[str] | None = None) -> int:
     coord = Coordinator(engines, ROUTERS[a.router](), workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
                         decode_router=ROUTERS[a.router](),
-                        pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns))
+                        pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns),
+                        frontend_latency_ns=int(a.frontend_latency_ms * 1e6))
     if a.step_log_vllm:
         from augur.engine import install_step_log_clock
         install_step_log_clock(coord)
