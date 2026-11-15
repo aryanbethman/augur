@@ -297,7 +297,41 @@ engine has already scheduled its next step when they arrive. Runs remain
 deterministic (checked). `scripts/validate.sh` pins synchronous mode for the
 exact cases and adds the async case.
 
+## Phase 3, first results: 256 GPUs (2026-11-16)
+
+**Oracle hang fixed.** ASTRA-Sim polls only an instance's first and last NPU
+(`--start/--end-npu-ids`); the NPUs between never report. The oracle waited
+on all NPUs, so at TP4 it blocked forever while ASTRA-Sim spun. It now hands
+the workload to and waits on those two NPUs, as LLMServingSim's loop does.
+TP2 worked before only because both its NPUs are first and last.
+
+Also: the ASTRA-Sim start-up graph is built once per oracle;
+`--no-chunked-prefill` added.
+
+**Matched scale runs** (`baseline_scale_16/256`: Llama-3.1-70B, TP4, H100,
+900 GB/s links; ShareGPT 750 requests at 10 req/s; no prefix caching, no
+chunked prefill, round-robin, synchronous). The H100 profile is converted
+from v0, not measured (fork commit 82506e5). One single-instance TP4 cluster
+config prices every engine (they are identical).
+
+| GPUs | augur wall | LLMServingSim wall | Simulated | Agreement |
+| --- | --- | --- | --- | --- |
+| 16 (4 x TP4) | 27 s (415 ASTRA calls) | 8 min 06 s (same branch, shared-template) | 89.7 s | means 0.00%; TPOT 721/750 identical; engine 0 identical (others: the M5 idle-instance offset) |
+| 256 (64 x TP4) | 44 s (213 ASTRA calls, 1.5 GB) | 42–49 min (Sept. run, older branch) | 89.2 s | TPOT 0.4%, latency 0.24%, TTFT 11.6% (different code version) |
+
+augur runs 256 GPUs faster than real time on this workload: 0.22 ms of wall
+per engine step, all-in. LLMServingSim's 256-GPU run on the current branch
+fails ("ASTRA closed stdout before a READY record", after 3 min); not
+investigated.
+
+The load here is light (~30 steps/s per engine). At full load (~50
+steps/s per engine at 20 ms steps) 256 GPUs would be ~3,200 steps per
+simulated second, ~0.7 s of wall per simulated second at the same cost per
+step: still within the design doc's target (1 simulated hour in at most 1
+wall hour).
+
 ## Next
 
-- Phase 3: speed of DP rounds; 256 GPUs; async with DP.
+- Phase 3: a loaded 256-GPU run to confirm the speed target; DP rounds
+  (one full ASTRA-Sim run each) are the slow path; async with DP.
 - PD: pull contention (ASTRA-Sim congestion-aware), multiple P/D engines.

@@ -57,6 +57,7 @@ class AstraOracle:
         self._ids = itertools.count(1)
         self.cache: dict[tuple, int] = {}
         self.runs = 0
+        self._event_wl = None
 
     @staticmethod
     def comm_key(rows) -> tuple:
@@ -109,9 +110,11 @@ class AstraOracle:
 
     def _run(self, members, model, hardware, first_member=0):
         inputs = self.workdir
-        ev = self._generate_event(1, inputs_root=inputs)
-        self._generate_graph(None, None, self.total_npu, event=True, inputs_root=inputs, trace=ev)
-        event_wl = self._get_workload(None, None, event=True, inputs_root=inputs)
+        if self._event_wl is None:  # the start-up graph never changes: build it once
+            ev = self._generate_event(1, inputs_root=inputs)
+            self._generate_graph(None, None, self.total_npu, event=True, inputs_root=inputs, trace=ev)
+            self._event_wl = self._get_workload(None, None, event=True, inputs_root=inputs)
+        event_wl = self._event_wl
 
         class _B:  # what generate_graph / get_workload read from a batch
             pass
@@ -136,9 +139,14 @@ class AstraOracle:
             self._generate_graph(b, hardware, n, node_of[inst_id], inst_id, off, workload_name=shared,
                                  inputs_root=inputs, trace=trace)
             wl = self._get_workload(b, hardware, inst_id, workload_name=shared, inputs_root=inputs)
-            for npu in range(off, off + n):
+            # ASTRA-Sim polls only an instance's first and last NPU (the
+            # --start/--end-npu-ids it is given); the NPUs between them never
+            # report. Hand the workload to and wait on those two only, as
+            # LLMServingSim's loop does. (Waiting on all NPUs hung at TP4.)
+            reporting = sorted({off, off + n - 1})
+            for npu in reporting:
                 wl_of_npu[npu] = wl
-            npus_of_member.append(range(off, off + n))
+            npus_of_member.append(reporting)
             if len(npus_of_member) - 1 == first_member:
                 first_npu = off
         num_npus = len(wl_of_npu)

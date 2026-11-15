@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-num-seqs", type=int, default=None)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
+    p.add_argument("--no-chunked-prefill", action="store_true")
     p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
     p.add_argument("--cost", default="fixed", choices=["fixed", "llmservingsim"])
     p.add_argument("--fixed-step-ms", type=float, default=25.0)
@@ -85,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     spec = EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=kv_bytes,
                       max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
                       max_num_seqs=a.max_num_seqs, block_size=a.block_size,
-                      enable_prefix_caching=not a.no_prefix_caching, tensor_parallel_size=a.tp,
+                      enable_prefix_caching=not a.no_prefix_caching,
+                      enable_chunked_prefill=not a.no_chunked_prefill, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager,
                       async_scheduling=a.async_scheduling and a.dp == 1)
     notes = []
