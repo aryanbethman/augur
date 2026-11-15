@@ -92,8 +92,11 @@ class LLMServingSimCost:
         self._batch_id += 1
         # Dense/MoE layers run at the padded token count; attention keeps the
         # real query/KV lists (the fork's _pad_batch_to_max does the same).
+        # Speculative decoding verifies 1 + k tokens per decode sequence; the
+        # kernel is launched for the whole batch, so it follows the widest.
+        dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1)
         b = self._Batch(self._batch_id, self.model, shape.forward_tokens, kv_len, q_list, k_list,
-                        len(prefill_q), len(decode_k), prefill_q, prefill_k, decode_k, 0, 0)
+                        len(prefill_q), len(decode_k), prefill_q, prefill_k, decode_k, 0, 0, decode_q_len=dq)
         # A DP dummy forward has no requests: no logits, no sampler.
         b.requests = [] if shape.dummy else [_Req(i) for i in range(len(shape.seqs))]
         return b
@@ -149,7 +152,8 @@ class LLMServingSimCost:
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         n_dec = len(dec)
-        key = (pre, n_dec, (sum(dec) // n_dec) if n_dec else 0, max(dec, default=0), min(dec, default=0),
+        dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1)
+        key = (pre, n_dec, dq, (sum(dec) // n_dec) if n_dec else 0, max(dec, default=0), min(dec, default=0),
                shape.forward_tokens, len(shape.seqs))
         hit = self._cache.get(key)
         if hit is not None:
@@ -182,7 +186,8 @@ class LLMServingSimCost:
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         n_dec = len(dec)
-        key = (pre, n_dec, (sum(dec) // n_dec) if n_dec else 0, max(dec, default=0), min(dec, default=0),
+        dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1)
+        key = (pre, n_dec, dq, (sum(dec) // n_dec) if n_dec else 0, max(dec, default=0), min(dec, default=0),
                shape.forward_tokens, len(shape.seqs))
         hit = self._cache.get(key)
         if hit is not None:

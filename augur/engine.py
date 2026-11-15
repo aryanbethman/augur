@@ -78,6 +78,8 @@ class EngineSpec:
     data_parallel_rank: int = 0
     enable_expert_parallel: bool = False
     async_scheduling: bool = False  # vLLM 0.33's default is True
+    speculative: dict | None = None  # vLLM speculative_config, e.g. {"method": "ngram", "num_speculative_tokens": 3}
+    spec_accept_rate: float = 0.0
 
 
 @dataclass
@@ -141,6 +143,7 @@ class SimEngine:
             async_scheduling=spec.async_scheduling,
             scheduler_cls=spec.scheduler_cls,
             num_gpu_blocks_override=spec.num_gpu_blocks,
+            speculative_config=spec.speculative,
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
             kv_transfer_config=self._kv_transfer_config(engine_id, spec),
@@ -149,6 +152,12 @@ class SimEngine:
             enable_expert_parallel=spec.enable_expert_parallel,
         )
         self.ctx.defer_cost = spec.data_parallel_size > 1
+        if spec.speculative:
+            if spec.async_scheduling:
+                raise NotImplementedError("speculative decoding with async scheduling is not modeled yet "
+                                          "(use --no-async-scheduling)")
+            self.ctx.spec_k = int(spec.speculative["num_speculative_tokens"])
+            self.ctx.spec_accept_rate = spec.spec_accept_rate
         self.vllm_config = args.create_engine_config()
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
                                log_stats=False)
@@ -206,6 +215,7 @@ class SimEngine:
         _stepping[0] = self
         t0 = time.perf_counter()
         outputs, executed = self.core.step()
+        self.core.post_step(executed)  # as vLLM's busy loop: hands draft tokens to the scheduler
         self.ctx.launches.clear()
         self.sched_cpu_s += time.perf_counter() - t0
         self.steps += 1

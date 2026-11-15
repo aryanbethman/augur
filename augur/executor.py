@@ -20,13 +20,16 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import random
+import zlib
+
 import torch
 
 from vllm.config import CUDAGraphMode
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 
 from augur.cost import CostModel, SeqWork, StepShape
 
@@ -63,6 +66,11 @@ class SimContext:
     # DP ranks: the coordinator prices the whole round (all ranks together,
     # padded per vLLM's DP rule), so the executor only reports its shape.
     defer_cost: bool = False
+    # Speculative decoding (sync): k draft tokens per request, accepted with
+    # this rate each; drafts handed to vLLM's scheduler via take_draft_token_ids.
+    spec_k: int = 0
+    spec_accept_rate: float = 0.0
+    pending_drafts: object = None
     # Async scheduling: every execute_model call is a launch onto the GPU
     # stream; the coordinator drains these durations (0 for an empty batch).
     launches: list = field(default_factory=list)
@@ -93,7 +101,8 @@ class SimWorker:
         # padded, as in the GPU model runner (uniform decode: one token per request).
         self.cudagraph = CudagraphDispatcher(vllm_config)
         mode = vllm_config.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
-        self.cudagraph.initialize_cudagraph_keys(mode, uniform_decode_query_len=1)
+        self.cudagraph.initialize_cudagraph_keys(mode, uniform_decode_query_len=1 + ctx.spec_k)
+        self._step = 0
 
     # ---- start-up -------------------------------------------------------
     def get_kv_cache_spec(self) -> dict[str, FullAttentionSpec]:
@@ -128,6 +137,10 @@ class SimWorker:
 
     def get_kv_connector_handshake_metadata(self):
         return None
+
+    def take_draft_token_ids(self):
+        out, self.ctx.pending_drafts = self.ctx.pending_drafts, None
+        return out
 
     # ---- steps -----------------------------------------------------------
     def execute_model(self, so) -> ModelRunnerOutput:
@@ -181,29 +194,57 @@ class SimWorker:
         req_ids: list[str] = []
         sampled: list[list[int]] = []
         seqs: list[SeqWork] = []
+        drafts_next: dict[str, list[int]] = {}
+        spec = so.scheduled_spec_decode_tokens or {}
+        self._step += 1
         for rid, before, num_new in work:
             st = self.reqs[rid]
             known = st.num_prompt + st.num_output
+            n_draft = len(spec.get(rid, ()))
             # Decode vs prefill by query length, as vLLM's attention backends
-            # split a batch (decode threshold 1): a one-token last prefill
-            # chunk runs as a decode.
-            is_decode = num_new == 1
+            # split a batch: one token is a decode (a one-token last prefill
+            # chunk runs as one), and so is 1 + k under speculative decoding,
+            # where k draft tokens are verified alongside the real one.
+            is_decode = num_new == 1 or (n_draft > 0 and num_new == 1 + n_draft)
             seqs.append(SeqWork(num_new=num_new, num_computed_before=before, is_decode=is_decode))
             req_ids.append(rid)
-            if before + num_new >= known:
+            if before + num_new >= known + n_draft:
                 rec = self.ctx.output_ids.get(rid)
-                tok = rec[st.num_output] if rec and st.num_output < len(rec) else SYNTHETIC_TOKEN
-                st.num_output += 1
-                sampled.append([tok])
+                # Speculative decoding: each draft is accepted with the given
+                # rate until the first rejection, then one more token is
+                # sampled. Content decides acceptance on a GPU; augur cannot
+                # see content, so the rate is a parameter.
+                accepted = 0
+                if n_draft:
+                    rng = random.Random(zlib.crc32(f"{rid}/{self._step}".encode()))
+                    while accepted < n_draft and rng.random() < self.ctx.spec_accept_rate:
+                        accepted += 1
+                n_emit = accepted + 1
+                if rec:
+                    n_emit = min(n_emit, max(len(rec) - st.num_output, 1))
+                toks = [rec[st.num_output + i] if rec and st.num_output + i < len(rec) else SYNTHETIC_TOKEN
+                        for i in range(n_emit)]
+                st.num_output += n_emit
+                sampled.append(toks)
+                if self.ctx.spec_k and rec:
+                    # The drafter proposes the request's next recorded tokens,
+                    # so accepted drafts are the right tokens.
+                    nxt = rec[st.num_output:st.num_output + self.ctx.spec_k]
+                    if nxt:
+                        drafts_next[rid] = list(nxt)
             else:
                 sampled.append([])
+        if self.ctx.spec_k:
+            self.ctx.pending_drafts = DraftTokenIds(req_ids=list(drafts_next),
+                                                    draft_token_ids=list(drafts_next.values()))
 
         if self.ctx.defer_cost:
             self.ctx.last_shape = StepShape(seqs=tuple(seqs))
             self.ctx.last_step_ns = 0
         else:
             num_tokens = sum(x.num_new for x in seqs)
-            uniform_decode = bool(seqs) and all(x.num_new == 1 for x in seqs)
+            q = 1 + self.ctx.spec_k
+            uniform_decode = bool(seqs) and all(x.num_new == q for x in seqs)
             _, desc = self.cudagraph.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode)
             shape = StepShape(seqs=tuple(seqs), padded_tokens=desc.num_tokens)
             self.ctx.last_shape = shape

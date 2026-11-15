@@ -14,7 +14,7 @@ def _scheduler_cls(a) -> str | None:
         return None
     os.environ["AUGUR_STEP_LOG"] = a.step_log_vllm
     return ("augur.vllm_hooks.LoggingAsyncScheduler" if a.async_scheduling and a.dp == 1
-            else "augur.vllm_hooks.LoggingScheduler")
+            and not a.num_speculative_tokens else "augur.vllm_hooks.LoggingScheduler")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,6 +31,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--decode-engines", type=int, default=0, help="PD: decode engines (NIXL kv_consumer)")
     p.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=True,
                    help="vLLM async scheduling, on by default as in vLLM 0.33: schedule step k+1 while step k runs")
+    p.add_argument("--num-speculative-tokens", type=int, default=0,
+                   help="speculative decoding (ngram method, synchronous scheduling): draft tokens per step")
+    p.add_argument("--spec-accept-rate", type=float, default=0.7,
+                   help="probability each draft token is accepted (content decides this on a GPU)")
     p.add_argument("--dp", type=int, default=1, help="DP ranks in one lockstep group (vLLM data_parallel_size)")
     p.add_argument("--enable-expert-parallel", action="store_true", help="MoE experts split across DP x TP ranks")
     p.add_argument("--pd-link-bw", type=float, default=16.0, help="PD KV pull bandwidth, GB/s")
@@ -40,7 +44,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--router", default="least-loaded")
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--hbm-gb", type=float, default=80.0, help="simulated GPU memory")
-    p.add_argument("--mem-util", type=float, default=0.9)
+    p.add_argument("--mem-util", type=float, default=0.9, help="vLLM's --gpu-memory-utilization")
+    p.add_argument("--kv-reserve-gib", type=float, default=0.0,
+                   help="memory vLLM keeps besides weights (peak activations, non-torch, CUDA-graph pool); "
+                        "~0.9 GiB for Qwen3-1.7B on an RTX 4060 Ti. KV = hbm*mem_util - weights - this")
     p.add_argument("--kv-cache-gb", type=float, default=None, help="override the KV-cache size per GPU")
     p.add_argument("--num-gpu-blocks", type=int, default=None,
                    help="exact KV-cache block count (vLLM num_gpu_blocks_override), e.g. from a real run's log")
@@ -97,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ep = a.dp * a.tp if a.enable_expert_parallel else 1
         weights = estimate_weight_bytes(os.path.join(mdir, "config.json"), tp=a.tp, ep=ep)
-        kv_bytes = int(a.hbm_gb * 2**30 * a.mem_util) - weights
+        kv_bytes = int(a.hbm_gb * 2**30 * a.mem_util) - weights - int(a.kv_reserve_gib * 2**30)
         if kv_bytes <= 0:
             print(f"model weights ({weights / 2**30:.1f} GiB/GPU) do not fit in {a.hbm_gb} GB", file=sys.stderr)
             return 2
@@ -121,11 +128,18 @@ def main(argv: list[str] | None = None) -> int:
                       enable_prefix_caching=not a.no_prefix_caching,
                       enable_chunked_prefill=not a.no_chunked_prefill, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager,
-                      async_scheduling=a.async_scheduling and a.dp == 1,
+                      async_scheduling=a.async_scheduling and a.dp == 1 and not a.num_speculative_tokens,
+                      speculative=({"method": "ngram", "num_speculative_tokens": a.num_speculative_tokens,
+                                    "prompt_lookup_max": 4, "prompt_lookup_min": 2}
+                                   if a.num_speculative_tokens else None),
+                      spec_accept_rate=a.spec_accept_rate,
                       scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks)
     notes = []
     if a.async_scheduling and a.dp > 1:
         notes.append("async scheduling is not modeled with DP yet; this run is synchronous")
+        print("augur: " + notes[-1], file=sys.stderr)
+    if a.async_scheduling and a.num_speculative_tokens:
+        notes.append("speculative decoding is modeled with synchronous scheduling only; this run is synchronous")
         print("augur: " + notes[-1], file=sys.stderr)
     import dataclasses
     if a.dp > 1:
