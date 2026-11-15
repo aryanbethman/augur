@@ -480,6 +480,33 @@ decode engine share its link (processor sharing; each pays the link latency
 first). 2 prefill + 1 decode at 2 GB/s: mean TTFT 231 → 284 ms. PD also runs
 with M x N engines (2+2, 1+3 checked: all calls complete, all blocks freed).
 
+**Speculative decoding** (`--num-speculative-tokens k`, ngram method,
+synchronous): vLLM's own scheduler schedules and verifies drafts; augur's
+executor accepts each draft with `--spec-accept-rate` until the first
+rejection and proposes the request's next recorded tokens as drafts
+(`take_draft_token_ids`, called through `EngineCore.post_step` as vLLM's busy
+loop does). Llama-3.1-8B ShareGPT, k=3: TPOT 31.5 ms without; 41.4 / 19.0 /
+10.8 ms at 0 / 70 / 90% acceptance; output lengths exact. In replay,
+acceptance and draft counts come from the log (self-test 1,040/1,040), so a
+real speculative run can be checked step for step. Speculation also runs
+under async scheduling (k=3 at 70%: TPOT 18.99 ms as in sync, TTFT 956 vs
+882 ms). Not yet: EAGLE/MTP drafter cost.
+
+**DP + EP under async scheduling** (vLLM's default): each rank runs vLLM's
+`step_with_batch_queue`; rounds stay lockstep across ranks (an idle rank joins
+with a dummy batch) and are priced jointly. Qwen3-30B-A3B ShareGPT, DP2/EP2:
+TTFT 1,458 vs 1,412 ms sync, TPOT 50.06 vs 50.23 ms, same 1,753 rounds.
+
+**KV size without a real server:** `--kv-reserve-gib` subtracts what vLLM keeps
+besides weights (activations, non-torch, CUDA-graph pool; ~0.9 GiB for
+Qwen3-1.7B on the 4060 Ti) and lands within 2.5% of real vLLM's KV size.
+
+**256 GPUs, same branch** (LLMServingSim with the template fix): augur and
+LLMServingSim agree (TPOT 750/750 identical; mean TTFT and latency equal),
+augur 44 s vs LLMServingSim 2 h 11 min. That LLMServingSim run peaked at
+51.6 GB RSS (Sept: 560 MiB); the fix's template store is now an LRU (fork),
+re-measurement pending.
+
 **Hardware note:** GPU 1 on anjuna3 runs at a locked 510 MHz (max 3,105) with
 no throttle reason: 8.6 vs 44.0 TFLOP/s on the same GEMM. A first profile
 made there priced steps at 2.9–3.6x. Only GPU 0 is usable for timing.
