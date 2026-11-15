@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 
 from augur.cost import CostModel, SeqWork, StepShape
+from augur.vllm_hooks import call_id
 
 SYNTHETIC_TOKEN = 0  # emitted when the workload recorded no output IDs
 
@@ -138,6 +139,15 @@ class SimWorker:
     def get_kv_connector_handshake_metadata(self):
         return None
 
+    def _replay_step(self):
+        """(emitted per call id this step, scheduled per call id next step) when replaying."""
+        cost = self.ctx.cost
+        outs = getattr(cost, "outs", None)
+        if not outs or cost.k >= len(outs):
+            return None
+        nxt = cost.toks[cost.k + 1] if cost.k + 1 < len(cost.toks) else {}
+        return outs[cost.k], nxt
+
     def take_draft_token_ids(self):
         out, self.ctx.pending_drafts = self.ctx.pending_drafts, None
         return out
@@ -215,7 +225,11 @@ class SimWorker:
                 # sampled. Content decides acceptance on a GPU; augur cannot
                 # see content, so the rate is a parameter.
                 accepted = 0
-                if n_draft:
+                replay = self._replay_step()
+                if replay is not None:
+                    # Replay: the logged run's acceptance (content-dependent).
+                    accepted = max(replay[0].get(call_id(rid), 1) - 1, 0)
+                elif n_draft:
                     rng = random.Random(zlib.crc32(f"{rid}/{self._step}".encode()))
                     while accepted < n_draft and rng.random() < self.ctx.spec_accept_rate:
                         accepted += 1
@@ -228,8 +242,13 @@ class SimWorker:
                 sampled.append(toks)
                 if self.ctx.spec_k and rec:
                     # The drafter proposes the request's next recorded tokens,
-                    # so accepted drafts are the right tokens.
-                    nxt = rec[st.num_output:st.num_output + self.ctx.spec_k]
+                    # so accepted drafts are the right tokens. Replay: as many
+                    # drafts as the logged run scheduled next step (an ngram
+                    # drafter proposes none when the prompt has no match).
+                    n_next = self.ctx.spec_k
+                    if replay is not None:
+                        n_next = max(replay[1].get(call_id(rid), 1) - 1, 0)
+                    nxt = rec[st.num_output:st.num_output + n_next]
                     if nxt:
                         drafts_next[rid] = list(nxt)
             else:
