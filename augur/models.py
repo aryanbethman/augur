@@ -12,11 +12,14 @@ import os
 import shutil
 
 
-def model_dir(fork_root: str, model: str, cache_root: str) -> str:
-    """Return a directory with ``config.json`` for ``model`` (e.g. 'meta-llama/Llama-3.1-8B')."""
-    src = os.path.join(fork_root, "configs", "model", f"{model}.json")
+def model_dir(fork_root: str, model: str, cache_root: str, config_path: str | None = None) -> str:
+    """Return a directory with ``config.json`` for ``model`` (e.g. 'meta-llama/Llama-3.1-8B').
+
+    The config comes from ``config_path`` if given (any HF ``config.json``),
+    else from the LLMServingSim fork's ``configs/model/<model>.json``."""
+    src = config_path or os.path.join(fork_root, "configs", "model", f"{model}.json")
     if not os.path.exists(src):
-        raise FileNotFoundError(f"No model config for {model!r} in the fork: {src}")
+        raise FileNotFoundError(f"No model config for {model!r}: {src} (pass --model-config <config.json>)")
     dst_dir = os.path.join(cache_root, model)
     dst = os.path.join(dst_dir, "config.json")
     os.makedirs(dst_dir, exist_ok=True)

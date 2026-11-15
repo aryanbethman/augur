@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fork", default=os.environ.get("AUGUR_FORK", os.path.expanduser("~/llmss-vllm-sim-20261114")),
                    help="LLMServingSim fork checkout (model configs, profiles)")
     p.add_argument("--model", required=True, help="e.g. meta-llama/Llama-3.1-8B")
+    p.add_argument("--model-config", default=None,
+                   help="the model's HF config.json (default: the fork's configs/model/<model>.json)")
     p.add_argument("--workload", required=True, help="JSONL in the fork's format (flat and/or agentic)")
     p.add_argument("--num-entries", type=int, default=None, help="first N requests/sessions only")
     p.add_argument("--engines", type=int, default=1, help="colocated engines (ignored with --prefill-engines)")
@@ -80,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     from augur.workload import Workload
 
     cache_root = os.path.expanduser("~/.cache/augur/models")
-    mdir = model_dir(a.fork, a.model, cache_root)
+    mdir = model_dir(a.fork, a.model, cache_root, a.model_config)
     if a.kv_cache_gb is not None:
         kv_bytes = int(a.kv_cache_gb * 2**30)
     else:

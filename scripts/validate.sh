@@ -45,4 +45,4 @@ R="--cost llmservingsim --hardware RTXPRO6000 --hbm-gb 96 --max-model-len 131072
 LOG=$(ls out/validate/replay_orig.*.jsonl)
 .venv/bin/augur $R --replay-durations "$LOG" --step-log-vllm out/validate/replay_rep --output out/validate/replay_rep.csv > /dev/null 2>&1
 printf '%-28s ' replay_selftest_swebench
-$PY -m augur.replay compare "$LOG" out/validate/replay_rep.*.jsonl | $PY -c "import json,sys; r=json.loads(''.join(l for l in sys.stdin if not l.startswith(('first','  A','  B')))); print(f\"steps={r['identical_steps']}/{r['steps_a']}\")"
+$PY -m augur.replay compare "$LOG" out/validate/replay_rep.*.jsonl 2>/dev/null | $PY -c "import json,sys; r=json.loads(''.join(l for l in sys.stdin if not l.startswith(('first','  A','  B')))); print(f\"steps={r['identical_steps']}/{r['steps_a']}\")"
