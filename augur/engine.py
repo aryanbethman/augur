@@ -72,6 +72,7 @@ class EngineSpec:
     dtype: str = "bfloat16"
     enforce_eager: bool = False  # vLLM's default: CUDA graphs on, so steps are padded
     scheduler_cls: str | None = None  # e.g. augur.vllm_hooks.LoggingScheduler
+    num_gpu_blocks: int | None = None  # vLLM's num_gpu_blocks_override (match a real run's KV cache)
     kv_role: str | None = None  # "kv_producer" (prefill) / "kv_consumer" (decode) for PD
     data_parallel_size: int = 1  # >1: this engine is one rank of a DP group (lockstep rounds)
     data_parallel_rank: int = 0
@@ -111,6 +112,7 @@ class SimEngine:
             enable_chunked_prefill=spec.enable_chunked_prefill,
             async_scheduling=spec.async_scheduling,
             scheduler_cls=spec.scheduler_cls,
+            num_gpu_blocks_override=spec.num_gpu_blocks,
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
             kv_transfer_config=self._kv_transfer_config(engine_id, spec),
@@ -538,6 +540,16 @@ class Coordinator:
                         self._push(start, ARRIVAL, "wake", eng)
                     continue
             eng.idle_since = None
+            starts = getattr(eng.ctx.cost, "starts", None)
+            if starts and eng.ctx.cost.k < len(starts) and self.now < starts[eng.ctx.cost.k]:
+                # Replay: the logged engine started this step later than the
+                # earliest moment it could (its loop's wake-up); start it at
+                # the logged time so the same arrivals are in view.
+                at = starts[eng.ctx.cost.k]
+                if eng.wake_at != at:
+                    eng.wake_at = at
+                    self._push(at, ARRIVAL, "wake", eng)
+                continue
             for _ in range(4):
                 outputs, executed, step_ns = eng.step()
                 self._start_transfers(eng)

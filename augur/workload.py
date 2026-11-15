@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import itertools
 import json
+import random
+import zlib
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -53,10 +55,22 @@ class Session:
 
 
 class _Filler:
-    def __init__(self) -> None:
-        self._n = itertools.count()
+    """Token ids for the parts of a prompt/output the trace did not record.
 
-    def ids(self, count: int) -> list[int]:
+    Default: ids far above any vocabulary, each request in its own range
+    (never equal to anything, so never a false prefix-cache hit). With
+    ``vocab``: pseudo-random ids inside the vocabulary, seeded by the call id
+    and part, which a real vLLM server accepts; augur and a real run then
+    build identical prompts whatever order calls are released in."""
+
+    def __init__(self, vocab: int | None = None) -> None:
+        self._n = itertools.count()
+        self.vocab = vocab
+
+    def ids(self, count: int, key: str = "") -> list[int]:
+        if self.vocab:
+            rng = random.Random(zlib.crc32(key.encode()))
+            return [rng.randrange(1000, self.vocab) for _ in range(count)]
         base = _FILLER_BASE + next(self._n) * _FILLER_STRIDE
         return list(range(base, base + count))
 
@@ -71,7 +85,13 @@ class Workload:
     # recorded outputs, as when a real model generates its own text (a later
     # turn then hits the prefix cache on the earlier prompt only).
     recorded_outputs: bool = True
+    # Set to (at most) the model's regular vocabulary to keep filler ids valid
+    # for a real server, e.g. 150000 for Qwen3 (its special tokens start at 151643).
+    filler_vocab: int | None = None
     _filler: _Filler = field(default_factory=_Filler)
+
+    def __post_init__(self):
+        self._filler = _Filler(self.filler_vocab)
 
     def entries(self) -> Iterator[Call | Session]:
         with open(self.path) as f:
@@ -99,10 +119,10 @@ class Workload:
         n_out = int(d["output_toks"])
         rec_in = list(d.get("input_tok_ids") or ())[:n_in]
         if len(rec_in) < n_in:
-            rec_in += self._filler.ids(n_in - len(rec_in))
+            rec_in += self._filler.ids(n_in - len(rec_in), call_id + "/in")
         rec_out = list(d.get("output_tok_ids") or ())[:n_out] if self.recorded_outputs else []
         if len(rec_out) < n_out:
-            rec_out += self._filler.ids(n_out - len(rec_out))
+            rec_out += self._filler.ids(n_out - len(rec_out), call_id + "/out")
         return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,
                     prompt_ids=rec_in, output_toks=n_out, output_ids=rec_out,
                     tool_wait_ns=int(d.get("tool_duration_ns", 0) or 0))

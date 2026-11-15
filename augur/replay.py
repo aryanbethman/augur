@@ -49,18 +49,21 @@ class ReplayCost:
     loop overhead included). Otherwise it runs to step k's own update."""
 
     durations: list[int]
+    starts: list[int] = field(default_factory=list)  # each step's logged start, log time 0 = first event
     k: int = 0
 
     @classmethod
     def from_log(cls, path: str) -> "ReplayCost":
-        st = steps(read_log(path))
+        ev = read_log(path)
+        t0 = min(e["t"] for e in ev)
+        st = steps(ev)
         d = []
         for i, (s, u) in enumerate(st):
             if u["left"] > 0 and i + 1 < len(st):
                 d.append(st[i + 1][0]["t"] - s["t"])
             else:
                 d.append(u["t"] - s["t"])
-        return cls(d)
+        return cls(d, [s["t"] - t0 for s, _ in st])
 
     def step_ns(self, shape: StepShape) -> int:
         if self.k >= len(self.durations):
@@ -81,6 +84,7 @@ class ReplayWorkload(Workload):
     _after_sched: set = field(default_factory=set)
 
     def __post_init__(self):
+        super().__post_init__()
         ev = read_log(self.log_path)
         t0 = min(e["t"] for e in ev)
         last_sched_t = None

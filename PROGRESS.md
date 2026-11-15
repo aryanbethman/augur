@@ -388,7 +388,34 @@ sessions 8,924/8,924, ShareGPT with 228 preemptions 28,652/28,652. Needed:
 an add logged after a step that started at the same instant must not join
 that step (exact ties only occur in augur's virtual time).
 
-Next: the same replay against a real vLLM run on GPU.
+**Against real vLLM on a GPU** (vLLM 0.33 `vllm serve`, Qwen3-1.7B, one RTX
+4060 Ti, synchronous scheduling, `max_num_seqs` 128, 2,048-token budget,
+prefix caching on; `augur.client` replaying the trace; augur replaying the
+server's step log with `--num-gpu-blocks` from the server log,
+`--no-recorded-outputs` and `--filler-vocab 150000`):
+
+| Workload | Steps with identical decisions |
+| --- | --- |
+| ShareGPT, 20 requests | 1,143 / 1,143 |
+| ShareGPT, 300 requests at 10 req/s (overloaded; preemptions) | 3,402 / 3,402 |
+| SWE-bench, 50 sessions / 765 calls, 24k context | 11,030 / 11,030 |
+
+What it took:
+
+- **Real bug found:** with vLLM 0.33's default v2 model runner, a preempted
+  request returns as a *new* request whose `prefill_token_ids` hold its
+  prompt plus the outputs it already generated. augur counted only the
+  prompt and sampled one step early after every resume. augur's own
+  self-tests could not see this (both sides shared the bug).
+- Replay starts each step at its logged start (real vLLM's loop wakes ~50 µs
+  after an arrival), and takes the KV block count from each run's server log
+  (it varies run to run: 5,294 / 5,334 / 5,480 blocks).
+- Unrecorded prompt tokens (the bundled SWE-bench file's ids are short) get
+  in-vocabulary ids seeded by call id (`--filler-vocab`); augur's default
+  out-of-vocabulary fillers made real vLLM reject every call.
+
+This shows augur makes vLLM's decisions when step times are right. Whether
+augur predicts the step times is the next check (profile on the 4060 Ti).
 
 ## Next
 

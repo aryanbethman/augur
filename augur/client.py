@@ -36,6 +36,7 @@ class Client:
         self.model = model
         self.workload = workload
         self.recorder = Recorder()
+        self.failed: list[tuple[str, str]] = []
         self._ids = 0
         self._t0 = 0
         self._tok_f = open(tokens_out, "w") if tokens_out else None
@@ -54,7 +55,8 @@ class Client:
         generated: list[int] = []
         async with http.post(self.url, json=body) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"{call.call_id}: HTTP {resp.status}: {await resp.text()}")
+                self.failed.append((call.call_id, f"HTTP {resp.status}: {(await resp.text())[:200]}"))
+                return
             async for raw in resp.content:
                 line = raw.decode().strip()
                 if not line.startswith("data: ") or line == "data: [DONE]":
@@ -67,6 +69,9 @@ class Client:
                         rec.token_times.extend([self._now()] * n)
                         generated.extend(ids)
         rec.end_ns = self._now()
+        if len(rec.token_times) != call.output_toks:
+            self.failed.append((call.call_id, f"{len(rec.token_times)} of {call.output_toks} tokens"))
+            return
         self.recorder.done.append(rec)
         if self._tok_f:
             self._tok_f.write(json.dumps({"call_id": call.call_id, "output_tok_ids": generated}) + "\n")
@@ -103,11 +108,19 @@ def main(argv=None) -> int:
     p.add_argument("--num-entries", type=int, default=None)
     p.add_argument("--output", required=True, help="per-call CSV (augur / fork format)")
     p.add_argument("--tokens-out", default=None, help="generated token ids per call (JSONL)")
+    p.add_argument("--filler-vocab", type=int, default=150000,
+                   help="unrecorded prompt tokens get in-vocabulary ids below this (default suits Qwen3)")
     a = p.parse_args(argv)
-    rec = asyncio.run(Client(a.url, a.model, Workload(a.workload, max_entries=a.num_entries), a.tokens_out).run())
+    client = Client(a.url, a.model, Workload(a.workload, max_entries=a.num_entries, filler_vocab=a.filler_vocab),
+                    a.tokens_out)
+    rec = asyncio.run(client.run())
     rec.write_csv(a.output)
-    print(json.dumps(rec.summary(), indent=2, default=float))
-    return 0
+    summary = rec.summary()
+    summary["failed"] = len(client.failed)
+    print(json.dumps(summary, indent=2, default=float))
+    for cid, why in client.failed[:5]:
+        print("failed:", cid, why, file=sys.stderr)
+    return 1 if client.failed else 0
 
 
 if __name__ == "__main__":

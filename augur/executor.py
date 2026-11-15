@@ -151,7 +151,13 @@ class SimWorker:
         self.ctx.last_new_req_ids = {nr.req_id: nr.num_computed_tokens for nr in so.scheduled_new_reqs}
         self.ctx.last_preempted_req_ids = list(so.preempted_req_ids or ())
         for nr in so.scheduled_new_reqs:
-            self.reqs[nr.req_id] = _ReqState(num_prompt=len(nr.prompt_token_ids or ()))
+            # With vLLM's v2 model runner (0.33's default) a preempted request
+            # comes back as a new request whose prefill_token_ids hold its
+            # prompt plus the outputs it already generated; it samples again
+            # only once all of those are recomputed.
+            n_prompt = len(nr.prompt_token_ids or ())
+            n_known = len(nr.prefill_token_ids) if nr.prefill_token_ids else n_prompt
+            self.reqs[nr.req_id] = _ReqState(num_prompt=n_prompt, num_output=n_known - n_prompt)
             work.append((nr.req_id, nr.num_computed_tokens, so.num_scheduled_tokens[nr.req_id]))
         cr = so.scheduled_cached_reqs
         for i, rid in enumerate(cr.req_ids):

@@ -38,12 +38,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--hbm-gb", type=float, default=80.0, help="simulated GPU memory")
     p.add_argument("--mem-util", type=float, default=0.9)
     p.add_argument("--kv-cache-gb", type=float, default=None, help="override the KV-cache size per GPU")
+    p.add_argument("--num-gpu-blocks", type=int, default=None,
+                   help="exact KV-cache block count (vLLM num_gpu_blocks_override), e.g. from a real run's log")
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--max-num-batched-tokens", type=int, default=None)
     p.add_argument("--max-num-seqs", type=int, default=None)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
+    p.add_argument("--filler-vocab", type=int, default=None,
+                   help="fill unrecorded prompt tokens with in-vocabulary ids below this (match augur.client runs)")
     p.add_argument("--no-recorded-outputs", action="store_true",
                    help="emit unique output ids instead of the trace's recorded outputs (as a real model does)")
     p.add_argument("--step-log-vllm", default=None,
@@ -107,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
                       enable_chunked_prefill=not a.no_chunked_prefill, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager,
                       async_scheduling=a.async_scheduling and a.dp == 1,
-                      scheduler_cls=_scheduler_cls(a))
+                      scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks)
     notes = []
     if a.async_scheduling and a.dp > 1:
         notes.append("async scheduling is not modeled with DP yet; this run is synchronous")
@@ -129,9 +133,10 @@ def main(argv: list[str] | None = None) -> int:
     if a.replay_durations:
         from augur.replay import ReplayWorkload
         workload = ReplayWorkload(a.workload, max_entries=a.num_entries, log_path=a.replay_durations,
-                                  recorded_outputs=not a.no_recorded_outputs)
+                                  recorded_outputs=not a.no_recorded_outputs, filler_vocab=a.filler_vocab)
     else:
-        workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs)
+        workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs,
+                            filler_vocab=a.filler_vocab)
     coord = Coordinator(engines, ROUTERS[a.router](), workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
                         decode_router=ROUTERS[a.router](),

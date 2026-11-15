@@ -41,6 +41,9 @@ class _StepLog:
 
     def write(self, rec: dict) -> None:
         self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self._n = getattr(self, "_n", 0) + 1
+        if self._n % 2000 == 0:  # a killed server keeps (almost) all of its log
+            self._f.flush()
 
     def flush(self) -> None:
         self._f.flush()
