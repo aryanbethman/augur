@@ -489,6 +489,24 @@ identical real runs differed by 8% in median TTFT (1,186 vs 1,289 ms).
 Knee TTFT therefore needs sub-1% step pricing; throughput, TPOT and TTFT
 away from the knee do not.
 
+**LLMServingSim against the same real runs** (same RTX 4060 Ti profile, KV
+size matched to each real server; error vs real vLLM):
+
+| Run | Metric | LLMServingSim | augur |
+| --- | --- | --- | --- |
+| ShareGPT 300, sync | mean TTFT / TPOT / latency | −3.3 / −3.4 / −3.4% | −3.3 / −3.4 / −3.3% |
+| ShareGPT 300, async | mean TTFT / TPOT / latency | +1.4 / +0.9 / +1.2% | +1.7 / +1.1 / +1.4% |
+| random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −11.8 / −1.9% (−1.0% TTFT with 15 ms front end) |
+| random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −10.8 / −26.7%, −1.1% |
+| random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.6%, −2.1%, +2.0% |
+
+On aggregates the two are equally close, LLMServingSim slightly closer at
+6–12 req/s: its async runs come out ~1% slower than augur's, which offsets
+the profile's ~1% low bias. Its scheduling is its own (async: 128/300 TTFTs
+match augur/vLLM, see M9), so that agreement is not step-for-step; augur's
+decisions are verified identical to vLLM's, and its remaining error is the
+profile's. Why LLMServingSim's async steps run ~1% longer is not yet known.
+
 **Synchronous runs**, augur (profile + `--step-cpu-us 3000`) vs the real
 synchronous runs' client-side results, run normally (not replayed):
 ShareGPT 300: mean TTFT +0.4%, TPOT +0.1%, latency +0.2% (per-request median
