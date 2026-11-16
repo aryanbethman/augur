@@ -43,7 +43,7 @@ many engines (`--engines`, `--router`), prefill/decode
 | `augur.verify.client` | Replays a trace against `vllm serve` with the same token-id prompts and exact output lengths |
 | `augur ... --replay-durations <log>` + `python -m augur.verify.replay compare` | Reruns a logged run with its arrival times and step durations; scheduling decisions must match step for step |
 | `augur.verify.stepcheck` | Prices every step of a real run and compares with its measured time |
-| `scripts/validate.sh` | All comparisons against stored LLMServingSim outputs, plus a replay self-test |
+| `pytest` | Replay self-tests, and the scheduler against LLMServingSim's stored outputs (`tests/test_vs_llmservingsim.py`) |
 
 How close it gets, and how that was measured: [docs/accuracy.md](docs/accuracy.md).
 
@@ -65,8 +65,8 @@ augur/
     profiles.py        which GPU profiles exist
   trace/               workloads in (fork JSONL), per-call results out (fork CSV)
   verify/              checking against real vLLM (table above)
-tests/                 pytest; the replay self-tests need the fork
-scripts/validate.sh    scheduler comparison against stored LLMServingSim outputs
+tests/                 pytest; replay self-tests and LLMServingSim comparison need the fork
+  data/llmservingsim/  LLMServingSim reference outputs for the comparison
 docs/accuracy.md       current accuracy against real vLLM and LLMServingSim
 ```
 

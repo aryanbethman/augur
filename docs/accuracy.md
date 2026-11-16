@@ -107,7 +107,7 @@ On aggregates the two are equally close. LLMServingSim's async runs come out
 req/s (cause not yet known). Its scheduler is its own reimplementation;
 augur's decisions are vLLM's (section 1).
 
-**Same simulated hardware, scheduler only** (`scripts/validate.sh`, RTX PRO
+**Same simulated hardware, scheduler only** (`tests/test_vs_llmservingsim.py`, RTX PRO
 6000 profiles; `--lss-loop-compat` reproduces LLMServingSim's loop timing,
 which is not vLLM behaviour). Calls with identical TTFT, TPOT, latency and end
 time, to the ns:
