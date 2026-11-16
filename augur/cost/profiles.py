@@ -34,6 +34,19 @@ def available(fork_root: str) -> list[tuple[str, str, str, int]]:
     return sorted(out)
 
 
+def shipped() -> list[tuple[str, str, str, int]]:
+    """(hardware, model, dtype, tp) for every profile shipped inside augur."""
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "profiles")
+    out = []
+    for hw in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        for model in sorted(os.listdir(os.path.join(root, hw))):
+            for name in sorted(os.listdir(os.path.join(root, hw, model))):
+                if name.endswith(".json.gz"):
+                    dtype, tp = name[:-len(".json.gz")].rsplit("-tp", 1)
+                    out.append((hw, model.replace("--", "/"), dtype, int(tp)))
+    return out
+
+
 def check(fork_root: str, hardware: str, model: str, tp: int) -> None:
     """Raise a clear error if no profile covers this hardware/model/TP."""
     have = available(fork_root)
@@ -52,14 +65,15 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m augur.cost.profiles", description=__doc__.splitlines()[0])
     p.add_argument("--fork", default=default_fork())
     a = p.parse_args(argv)
-    rows = available(a.fork)
+    rows = [(*r, "augur (--cost tables)") for r in shipped()]
+    rows += [(*r, "fork (--cost llmservingsim)") for r in available(a.fork)]
     if not rows:
-        print(f"no profiles under {a.fork}/profiler/perf")
+        print(f"no profiles shipped with augur or under {a.fork}/profiler/perf")
         return 1
-    w = max(len(m) for _, m, _, _ in rows)
-    print(f"{'hardware':<12} {'model':<{w}} {'dtype':<6} tp")
-    for h, m, d, t in rows:
-        print(f"{h:<12} {m:<{w}} {d:<6} {t}")
+    w = max(len(r[1]) for r in rows)
+    print(f"{'hardware':<12} {'model':<{w}} {'dtype':<6} tp  source")
+    for h, m, d, t, src in rows:
+        print(f"{h:<12} {m:<{w}} {d:<6} {t:<3} {src}")
     return 0
 
 

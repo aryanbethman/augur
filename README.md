@@ -30,7 +30,7 @@ For the LLMServingSim fork's traces (ShareGPT, SWE-bench agent sessions,
 scaled sessions), run augur directly:
 
 ```bash
-augur --cost llmservingsim --hardware RTXPRO6000 --hbm-gb 96 \
+augur --cost tables --hardware RTXPRO6000 --hbm-gb 96 \
   --model meta-llama/Llama-3.1-8B --workload trace.jsonl --output out/run.csv
 ```
 
@@ -64,13 +64,17 @@ augur/
     nixl.py            vLLM's NIXL connector with its network handshake off
     models.py          model configs without weights
   cost/                step pricing (interface in __init__.py)
-    llmservingsim.py   step prices from LLMServingSim profiles
+    tables.py          from profiles shipped with augur: dense models, TP=1, no fork needed
+    convert.py         builds such a profile from an LLMServingSim profile
+    llmservingsim.py   through the LLMServingSim fork: MoE, TP>1, DP
     astra.py           collectives and DP rounds through ASTRA-Sim
     profiles.py        which GPU profiles exist
+  profiles/            shipped profiles: <hardware>/<org>--<model>/<dtype>-tp1.json.gz
   trace/               workloads in (fork JSONL), per-call results out (fork CSV)
   verify/              checking against real vLLM (table above)
 tests/                 pytest; replay self-tests and LLMServingSim comparison need the fork
   data/llmservingsim/  LLMServingSim reference outputs for the comparison
+scripts/               rebuild test data from the fork
 docs/accuracy.md       current accuracy against real vLLM and LLMServingSim
 ```
 
@@ -82,7 +86,14 @@ uv pip install --python .venv/bin/python -e ".[llmservingsim]"
 .venv/bin/python -m pytest      # tests
 ```
 
-Profiles, model configs and ASTRA-Sim come from the LLMServingSim fork
-checkout (`--fork` or `AUGUR_FORK`; default `~/llmss-vllm-sim-20261114`).
-`python -m augur.cost.profiles` lists the GPU / model / TP profiles it holds.
-`--model-config` takes any HF `config.json` instead of the fork's.
+`python -m augur.cost.profiles` lists the GPU / model profiles. For the ones
+shipped with augur nothing else is needed: `augur bench` picks them up, and
+`--cost tables` uses them for traces. Their prices are identical to the
+LLMServingSim fork's, to the nanosecond (method and profile data: LLMServingSim,
+MIT licence, CASYS Lab at KAIST).
+
+MoE models, TP > 1, DP and other profiles go through the fork checkout
+(`--cost llmservingsim`; `--fork` or `AUGUR_FORK`, default
+`~/llmss-vllm-sim-20261114`): its profiles, model configs and ASTRA-Sim.
+`python -m augur.cost.convert` turns one of its dense TP=1 profiles into a
+shipped one. `--model-config` takes any HF `config.json`.

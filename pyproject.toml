@@ -19,5 +19,8 @@ augur = "augur.cli:main"
 [tool.setuptools.packages.find]
 include = ["augur*"]
 
+[tool.setuptools.package-data]
+augur = ["profiles/*/*/*.json.gz"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

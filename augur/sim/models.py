@@ -9,22 +9,32 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 
 
-def model_dir(fork_root: str, model: str, cache_root: str, config_path: str | None = None) -> str:
+def model_dir(fork_root: str, model: str, cache_root: str, config_path: str | None = None,
+              profile_path=None) -> str:
     """Return a directory with ``config.json`` for ``model`` (e.g. 'meta-llama/Llama-3.1-8B').
 
     The config comes from ``config_path`` if given (any HF ``config.json``),
-    else from the LLMServingSim fork's ``configs/model/<model>.json``."""
-    src = config_path or os.path.join(fork_root, "configs", "model", f"{model}.json")
-    if not os.path.exists(src):
-        raise FileNotFoundError(f"No model config for {model!r}: {src} (pass --model-config <config.json>)")
+    else from the augur profile at ``profile_path`` (which carries the model's
+    config), else from the LLMServingSim fork's ``configs/model/<model>.json``."""
     dst_dir = os.path.join(cache_root, model)
     dst = os.path.join(dst_dir, "config.json")
+    if config_path is None and profile_path is not None:
+        import gzip
+        with gzip.open(profile_path, "rt", encoding="utf-8") as f:
+            text = json.dumps(json.load(f)["model_config"], indent=2, sort_keys=True) + "\n"
+    else:
+        src = config_path or os.path.join(fork_root, "configs", "model", f"{model}.json")
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"No model config for {model!r}: {src} (pass --model-config <config.json>)")
+        text = open(src).read()
     os.makedirs(dst_dir, exist_ok=True)
-    if not os.path.exists(dst) or open(dst).read() != open(src).read():
-        shutil.copyfile(src, dst)
+    if not os.path.exists(dst) or open(dst).read() != text:
+        tmp = f"{dst}.{os.getpid()}"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, dst)  # atomic: other augur runs may be reading it
     return dst_dir
 
 

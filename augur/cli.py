@@ -90,10 +90,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="requests reach the engine when this vLLM step log says, steps priced by --cost "
                         "(separates arrival timing from step pricing)")
     p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
-    p.add_argument("--cost", default="fixed", choices=["fixed", "llmservingsim"])
+    p.add_argument("--cost", default="fixed", choices=["fixed", "tables", "llmservingsim", "auto"],
+                   help="step prices. tables: a profile shipped with augur (dense models, TP=1; no fork needed). "
+                        "llmservingsim: the fork's profiles and ASTRA-Sim (MoE, TP>1, DP). "
+                        "auto: tables when augur ships a profile for this hardware and model, else llmservingsim")
+    p.add_argument("--profile", default=None, help="profile file for --cost tables (default: the one shipped "
+                                                   "for --hardware and --model; python -m augur.cost.profiles lists them)")
     p.add_argument("--fixed-step-ms", type=float, default=25.0)
     p.add_argument("--fixed-per-token-us", type=float, default=0.0)
-    p.add_argument("--hardware", default="RTXPRO6000", help="profile hardware for --cost llmservingsim")
+    p.add_argument("--hardware", default="RTXPRO6000", help="profile hardware for --cost tables / llmservingsim")
     p.add_argument("--lss-cluster-config", default=None,
                    help="LLMServingSim cluster config for ASTRA-Sim (needed for --tp > 1)")
     p.add_argument("--cpu-mem-bw", type=float, default=256.0, help="GB/s, the fork's cpu_mem.mem_bw")
@@ -117,7 +122,19 @@ def main(argv: list[str] | None = None) -> int:
 
     cache_root = os.path.expanduser("~/.cache/augur/models")
     try:
-        mdir = model_dir(a.fork, a.model, cache_root, a.model_config)
+        profile = None
+        if a.cost in ("tables", "auto"):
+            from augur.cost.tables import bundled_profile
+            plain = a.tp == 1 and a.dp == 1 and not a.enable_expert_parallel
+            if a.cost == "tables" or a.profile:
+                profile = a.profile or bundled_profile(a.hardware, a.model)
+            elif plain:
+                try:
+                    profile = bundled_profile(a.hardware, a.model)
+                except FileNotFoundError:
+                    pass
+            a.cost = "tables" if profile else "llmservingsim"
+        mdir = model_dir(a.fork, a.model, cache_root, a.model_config, profile)
         if a.cost == "llmservingsim" and not a.replay_durations:
             from augur.cost.profiles import check
             check(a.fork, a.hardware, a.model, a.tp)
@@ -139,6 +156,16 @@ def main(argv: list[str] | None = None) -> int:
         cost = ReplayCost.from_log(a.replay_durations)
     elif a.cost == "fixed":
         cost = FixedCost(base_ns=int(a.fixed_step_ms * 1e6), per_token_ns=int(a.fixed_per_token_us * 1e3))
+    elif a.cost == "tables":
+        from augur.cost.tables import TableCost
+        try:
+            cost = TableCost(profile, cpu_mem_bw=a.cpu_mem_bw, cpu_mem_latency_ns=a.cpu_mem_latency_ns)
+        except NotImplementedError as e:
+            print(f"augur: {e} (use --cost llmservingsim)", file=sys.stderr)
+            return 2
+        if a.tp != 1 or a.dp != 1 or a.enable_expert_parallel:
+            print("augur: --cost tables prices TP=1 without DP/EP only (use --cost llmservingsim)", file=sys.stderr)
+            return 2
     else:
         from augur.cost.llmservingsim import LLMServingSimCost
         cost = LLMServingSimCost(fork_root=a.fork, hardware=a.hardware, model=a.model, tp=a.tp,

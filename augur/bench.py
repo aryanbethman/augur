@@ -147,7 +147,7 @@ def main(argv=None) -> int:
                                 "arrival_time_ns": int(t * 1e9), "input_tok_ids": ids}) + "\n")
 
     if "--cost" not in augur_args:
-        augur_args = ["--cost", "llmservingsim"] + augur_args
+        augur_args = ["--cost", "auto"] + augur_args
     base = args.step_time_scale
     f = args.sensitivity / 100
     scales = [base * (1 - f), base, base * (1 + f)] if f > 0 else [base]
