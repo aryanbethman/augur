@@ -205,10 +205,17 @@ requests at 10 req/s, 89 s simulated):
 | 16 (4 × TP4) | 27 s | 8 min 06 s |
 | 256 (64 × TP4) | 44 s | 2 h 11 min |
 
-Both agree on this run (TPOT 750/750 identical at 256). augur prices a step as
-the sum of profiled layer latencies plus ASTRA-Sim's time for the step's
-collectives, cached on that pattern (checked exact against full ASTRA-Sim
-runs); LLMServingSim runs every step through ASTRA-Sim. On the 4060 Ti
+Both agree on this run (TPOT 750/750 identical at 256). Those augur times are
+with ASTRA-Sim pricing each new pattern of collectives; LLMServingSim runs
+every step through ASTRA-Sim. augur now prices the collectives of a dense
+model on one node itself (a closed form of ASTRA-Sim's ring all-reduce and
+all-gather, identical to the binary to the ns on every tested configuration),
+so those runs need no ASTRA-Sim: Llama-3.1-70B TP4 with 300 ShareGPT requests
+takes 11 s against 26 s, 4 engines 9 s against 27 s, with byte-identical
+results.
+
+Multi-GPU timing has not been compared with real hardware: the collective
+model is ASTRA-Sim's (ring over point-to-point links), not a measurement. On the 4060 Ti
 benchmarks above augur takes 1–4 s per run against 55–152 s for the real one.
 
 ## Not modeled yet

@@ -34,6 +34,21 @@ The layer order, ``L`` and the table values are read from the profile file.
   longest KV and ``alpha`` comes from a calibrated bucket table (decode count,
   prefill chunk and relative gap ``(t_max - t_mean) / t_mean``).
 
+Tensor parallelism (TP = N > 1, one node, dense models; ASTRA-Sim FullyConnected topology, ring
+collectives).  Compute is priced exactly as above, on the profile's tpN tables.  The fork prices the
+rest by running ASTRA-Sim; for a dense step it has this closed form (``_comm_ns``, with the ASTRA-Sim
+source of each term in the comments there)::
+
+    comm_ns = N * max(A, B) + min(A, B)  +  (2L+1) * AR(2*hidden*T)  +  AG(2*V*R)      (AG only if R > 0)
+    A = cpu_lat + floor(4*T / int(cpu_bw)),   B = cpu_lat + floor(4*R / int(cpu_bw))
+
+Guard: the formula is not exact when a CPU-memory access is long next to a ring step (the N NPUs queue
+on one CPU-memory device and their staggered starts stop hiding behind the ring).  Measured against the
+ASTRA-Sim binary (N = 2, 3, 4, 8): inexact once 2A > S_ar (N >= 3; A > S_ar at N = 2) or 2B > S_last, where
+S_ar = floor(link_lat + ((2*hidden*T) // N) / bw) is one all-reduce ring step and S_last is one step of
+the last collective (all-gather if R > 0, else all-reduce).  ``step_ns`` therefore prices a step only
+if 2A <= S_ar and 2B <= S_last, and raises ``OutsideRegime`` otherwise (use --cost llmservingsim).
+
 Every operation, including float evaluation order, rounding (Python ``round``,
 half to even) and truncation, follows the fork's ``serving/core/trace_generator.py``
 so that results are identical to the nanosecond.
@@ -177,24 +192,42 @@ class _Attention:
         return max(1, int(v0 + t_pc * (v1 - v0)))
 
 
+class OutsideRegime(ValueError):
+    """A TP>1 step whose communication time the closed form does not reproduce exactly."""
+
+
 class TableCost:
-    """``step_ns(shape)`` for a dense model at TP=1, priced from a profile file.
+    """``step_ns(shape)`` for a dense model at TP=N, priced from a profile file.
 
     ``cpu_mem_bw`` (GB/s = bytes/ns) and ``cpu_mem_latency_ns`` price the two
-    tensors that live in CPU memory, as in ``LLMServingSimCost``.
+    tensors that live in CPU memory, as in ``LLMServingSimCost``.  At TP>1 the
+    collectives are priced from ``link_bw`` (GB/s), ``link_latency_ns`` and
+    ``npu_mem_bw`` (GB/s; default: the profile's ``hardware`` entry).
     """
 
-    def __init__(self, profile_path, cpu_mem_bw: float = 256.0, cpu_mem_latency_ns: int = 0):
+    def __init__(self, profile_path, cpu_mem_bw: float = 256.0, cpu_mem_latency_ns: int = 0,
+                 link_bw: float = 16.0, link_latency_ns: int = 20_000, npu_mem_bw: float | None = None):
         with gzip.open(profile_path, "rt", encoding="utf-8") as f:
             p = json.load(f)
         if p.get("format_version") != FORMAT_VERSION:
             raise ValueError(f"{profile_path}: profile format {p.get('format_version')!r}, expected {FORMAT_VERSION}")
         ident = p["identity"]
-        if ident["tp"] != 1:
-            raise NotImplementedError(f"TableCost prices TP=1 only; profile is tp={ident['tp']}")
         if ident.get("kind") != "dense":
             raise NotImplementedError(f"TableCost prices dense models only; profile kind is {ident.get('kind')!r}")
         self.identity = ident
+        self.tp = ident["tp"]
+        if self.tp > 1:
+            coll = p.get("collectives")
+            if not coll or any(not isinstance(coll.get(k), int) for k in
+                               ("all_reduce_count", "all_reduce_bytes_per_token", "all_gather_bytes_per_seq")):
+                raise NotImplementedError(f"tp={self.tp} profile has no collective coefficients")
+            npu = npu_mem_bw if npu_mem_bw is not None else (p.get("hardware") or {}).get("npu_mem_bw_gbps")
+            if npu is None:
+                raise ValueError("TP>1 needs npu_mem_bw (GB/s): the profile has no default for this hardware")
+            if int(npu) < 1 or int(cpu_mem_bw) < 1 or link_bw <= 0 or link_latency_ns < 0:
+                raise ValueError("TP>1 needs npu_mem_bw >= 1, cpu_mem_bw >= 1, link_bw > 0, link_latency_ns >= 0")
+            self._coll = coll
+            self.link_bw, self.link_latency_ns, self.npu_mem_bw = link_bw, link_latency_ns, npu
         self.cpu_mem_bw = cpu_mem_bw
         self.cpu_mem_latency_ns = cpu_mem_latency_ns
         self._dense = {n: (t["keys"], t["ns"]) for n, t in p["dense"].items()}
@@ -213,6 +246,8 @@ class TableCost:
         self._cache: dict[tuple, int] = {}
         self.lookups = 0
         self.hits = 0
+        if self.tp > 1:
+            self._comm_ns(1, 1)  # a setting outside the exact regime fails here, before a run starts
 
     # --- attention -------------------------------------------------------
 
@@ -253,6 +288,33 @@ class TableCost:
             return max(1, int(round(t_mean)))
         return max(1, int(round(t_mean + alpha * (t_max - t_mean))))
 
+    # --- TP>1 communication ----------------------------------------------
+
+    def _comm_ns(self, tokens: int, rows: int) -> int:
+        n, lat, c = self.tp, self.link_latency_ns, self._coll
+        bw = self.link_bw * (1 << 30) / 1000000000          # NetworkFunction.cpp: bw * (1<<30) / 1e9 bytes/ns
+        cpu_bw = int(self.cpu_mem_bw)                       # AnalyticalMemory: uint64 mem_bw
+        local = int(self.npu_mem_bw) * 1000000000           # Sys.cc: local-mem-bw (json, int) * 1e9
+        a = self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / cpu_bw)  # token ids in (CPU memory)
+        b = self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / cpu_bw)     # sampled ids out
+        msg = (c["all_reduce_bytes_per_token"] * tokens) // n   # Ring.cc: chunk = data_size / N
+        hop = int(lat + msg / bw)                           # BasicTopology.cpp: one FullyConnected hop
+        ag_hop = int(lat + c["all_gather_bytes_per_seq"] * rows / bw) if rows else hop
+        if 2 * a > hop or 2 * b > ag_hop:
+            raise OutsideRegime(
+                f"TP={n} step (T={tokens}, R={rows}): a CPU-memory access (A={a} ns for the token ids, B={b} ns "
+                f"for the sampled ids; cpu latency {self.cpu_mem_latency_ns} ns, bandwidth {self.cpu_mem_bw} GB/s) "
+                f"is more than half a ring step (all-reduce {hop} ns, last collective {ag_hop} ns; link latency "
+                f"{lat} ns, bandwidth {self.link_bw} GB/s); the closed form is not exact there. "
+                f"Use --cost llmservingsim")
+        # Ring.cc: 2(N-1) steps; reduce half is processed by the memory bus, 3 x size/local_bw (PacketBundle.cc);
+        # MemBus + endpoint delay (10 ns, system.json) once per step and once for the first packet
+        ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
+        total = n * max(a, b) + min(a, b) + c["all_reduce_count"] * ar   # CPU memory: one FIFO queue per node
+        if rows:  # all-gather of the per-rank logits chunk, N-1 steps (Ring.cc)
+            total += (n - 1) * ag_hop + 10 * n
+        return total
+
     # --- step ------------------------------------------------------------
 
     def round_ns(self, shapes, first_rank: int = 0):
@@ -274,6 +336,7 @@ class TableCost:
             self.hits += 1
             return hit
 
+        comm = self._comm_ns(tokens, rows) if self.tp > 1 else None
         t = max(int(tokens), 1)
         r = max(int(rows), 1)
 
@@ -292,8 +355,10 @@ class TableCost:
         ns = sum(price(n) for n in self._prologue)
         ns += self._repeat * sum(count * price(n) for n, count in self._block.items())
         ns += sum(price(n) for n in self._head if rows > 0 or n not in self._per_seq)
-        # token ids in, sampled ids out: both in CPU memory ("REMOTE")
-        ns += self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / self.cpu_mem_bw)
-        ns += self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / self.cpu_mem_bw)
+        if comm is not None:
+            ns += comm
+        else:  # token ids in, sampled ids out: both in CPU memory ("REMOTE")
+            ns += self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / self.cpu_mem_bw)
+            ns += self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / self.cpu_mem_bw)
         self._cache[key] = ns
         return ns

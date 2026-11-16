@@ -18,6 +18,47 @@ def _scheduler_cls(a) -> str | None:
             else "augur.verify.hooks.LoggingScheduler")
 
 
+def _tp_params(a, cpu_bw, cpu_lat) -> dict:
+    """TableCost keyword arguments for TP>1: flags, or the cluster config file (then a flag that contradicts it is an error)."""
+    flags = {"link_bw": a.tp_link_bw, "link_latency_ns": a.tp_link_latency_ns, "npu_mem_bw": a.npu_mem_bw,
+             "cpu_mem_bw": cpu_bw, "cpu_mem_latency_ns": cpu_lat}
+    if a.lss_cluster_config:
+        with open(a.lss_cluster_config, encoding="utf-8") as f:
+            c = json.load(f)
+        nodes = c.get("nodes") or []
+        insts = nodes[0].get("instances") or [] if len(nodes) == 1 else []
+        inst = insts[0] if len(insts) == 1 else {}
+        bad = []
+        if len(nodes) != 1 or len(insts) != 1:
+            bad.append("not one node with one instance")
+        if inst.get("num_npus") != a.tp or inst.get("tp_size") != a.tp:
+            bad.append(f"num_npus/tp_size are not {a.tp}")
+        if inst.get("pd_type") or inst.get("dp_group") or (inst.get("pp_size") or 1) != 1:
+            bad.append("PD, DP or PP instance")
+        if "collective_links" in c or "cxl_mem" in c:
+            bad.append("collective_links / cxl_mem")
+        for k in ("link_bw", "link_latency"):
+            if not isinstance(c.get(k), (int, float)):
+                bad.append(f"{k} missing or not a number (the fork would take it from hardware.yaml)")
+        if bad:
+            raise ValueError(f"--lss-cluster-config {a.lss_cluster_config}: {'; '.join(bad)}: "
+                             "the closed-form TP pricer does not cover it (use --cost llmservingsim)")
+        cpu = nodes[0].get("cpu_mem") or {}
+        fromfile = {"link_bw": c["link_bw"], "link_latency_ns": c["link_latency"],
+                    "npu_mem_bw": (inst.get("npu_mem") or {}).get("mem_bw"),
+                    "cpu_mem_bw": cpu.get("mem_bw"), "cpu_mem_latency_ns": cpu.get("mem_latency")}
+        names = {"link_bw": "--tp-link-bw", "link_latency_ns": "--tp-link-latency-ns", "npu_mem_bw": "--npu-mem-bw",
+                 "cpu_mem_bw": "--cpu-mem-bw", "cpu_mem_latency_ns": "--cpu-mem-latency-ns"}
+        for k, v in fromfile.items():
+            if v is None:
+                continue
+            if flags[k] is not None and float(flags[k]) != float(v):
+                raise ValueError(f"{names[k]} {flags[k]} contradicts {a.lss_cluster_config} ({v})")
+            flags[k] = v
+    defaults = {"link_bw": 16.0, "link_latency_ns": 20_000, "cpu_mem_bw": 256.0, "cpu_mem_latency_ns": 0}
+    return {k: defaults.get(k) if v is None else v for k, v in flags.items()}
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="augur")
     p.add_argument("--fork", default=default_fork(),
@@ -46,6 +87,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="decode: concurrent KV pulls into a decode engine share its link bandwidth")
     p.add_argument("--router", default="least-loaded")
     p.add_argument("--tp", type=int, default=1)
+    p.add_argument("--tp-link-bw", type=float, default=None,
+                   help="--cost tables at TP>1: GPU-to-GPU link bandwidth for the collectives, GB/s (default 16; "
+                        "with --lss-cluster-config: the file's link_bw)")
+    p.add_argument("--tp-link-latency-ns", type=int, default=None,
+                   help="--cost tables at TP>1: link latency per hop (default 20000; or the file's link_latency)")
+    p.add_argument("--npu-mem-bw", type=float, default=None,
+                   help="--cost tables at TP>1: GPU memory bandwidth, GB/s (default: the profile's, if the fork "
+                        "defines one for the hardware; or the file's npu_mem.mem_bw)")
     p.add_argument("--hbm-gb", type=float, default=80.0, help="simulated GPU memory")
     p.add_argument("--mem-util", type=float, default=0.9, help="vLLM's --gpu-memory-utilization")
     p.add_argument("--kv-reserve-gib", type=float, default=0.0,
@@ -93,9 +142,11 @@ def main(argv: list[str] | None = None) -> int:
                         "(separates arrival timing from step pricing)")
     p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
     p.add_argument("--cost", default="auto", choices=["fixed", "tables", "llmservingsim", "auto"],
-                   help="step prices. auto (default): tables when augur ships a profile for --hardware and "
-                        "--model (TP=1, no DP/EP), else llmservingsim. "
-                        "tables: a profile shipped with augur (dense models, TP=1; no fork needed). "
+                   help="step prices. auto (default): tables when augur ships a profile for --hardware, "
+                        "--model and --tp (no DP/EP), else llmservingsim. "
+                        "tables: a profile shipped with augur (dense models, any TP it ships, one node, no DP/EP; "
+                        "no fork needed). At TP>1 a step whose CPU-memory accesses are long next to a ring step "
+                        "(see augur/cost/tables.py) is refused. "
                         "llmservingsim: the fork's profiles and ASTRA-Sim (MoE, TP>1, DP). "
                         "fixed: one constant step time (--fixed-step-ms, --fixed-per-token-us), no profile")
     p.add_argument("--profile", default=None, help="profile file for --cost tables (default: the one shipped "
@@ -105,9 +156,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="--cost fixed only: added per batched token (default 0)")
     p.add_argument("--hardware", default="RTXPRO6000", help="profile hardware for --cost tables / llmservingsim")
     p.add_argument("--lss-cluster-config", default=None,
-                   help="LLMServingSim cluster config for ASTRA-Sim (needed for --tp > 1)")
-    p.add_argument("--cpu-mem-bw", type=float, default=256.0, help="GB/s, the fork's cpu_mem.mem_bw")
-    p.add_argument("--cpu-mem-latency-ns", type=int, default=0)
+                   help="LLMServingSim cluster config for ASTRA-Sim (needed for --cost llmservingsim at --tp > 1). With "
+                        "--cost tables at --tp > 1 its link_bw, link_latency, npu_mem.mem_bw and cpu_mem values "
+                        "are used (so one file drives either pricer); a contradicting flag is an error")
+    p.add_argument("--cpu-mem-bw", type=float, default=None, help="GB/s, the fork's cpu_mem.mem_bw (default 256)")
+    p.add_argument("--cpu-mem-latency-ns", type=int, default=None, help="default 0")
     p.add_argument("--output", default=None, help="request CSV (fork format)")
     p.add_argument("--step-log", default=None, help="per-step CSV: start, duration, batch shape")
     p.add_argument("--lss-loop-compat", action="store_true",
@@ -116,6 +169,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
 
+    cpu_flags = (a.cpu_mem_bw, a.cpu_mem_latency_ns)
+    a.cpu_mem_bw = 256.0 if a.cpu_mem_bw is None else a.cpu_mem_bw
+    a.cpu_mem_latency_ns = 0 if a.cpu_mem_latency_ns is None else a.cpu_mem_latency_ns
     if a.cost != "fixed" and (a.fixed_step_ms is not None or a.fixed_per_token_us is not None):
         print(f"augur: --fixed-step-ms and --fixed-per-token-us only apply with --cost fixed (this run: --cost {a.cost})",
               file=sys.stderr)
@@ -135,14 +191,18 @@ def main(argv: list[str] | None = None) -> int:
         profile = None
         if a.cost in ("tables", "auto"):
             from augur.cost.tables import bundled_profile
-            plain = a.tp == 1 and a.dp == 1 and not a.enable_expert_parallel
+            plain = a.dp == 1 and not a.enable_expert_parallel
             if a.cost == "tables" or a.profile:
-                profile = a.profile or bundled_profile(a.hardware, a.model)
+                profile = a.profile or bundled_profile(a.hardware, a.model, a.tp)
             elif plain:
                 try:
-                    profile = bundled_profile(a.hardware, a.model)
+                    profile = bundled_profile(a.hardware, a.model, a.tp)
+                    if a.tp > 1:
+                        _tp_params(a, *cpu_flags)  # a config the closed form does not cover: use the fork
                 except FileNotFoundError:
                     pass
+                except ValueError:
+                    profile = None
             a.cost = "tables" if profile else "llmservingsim"
         if a.cost == "llmservingsim" and not a.replay_durations:
             from augur.cost.profiles import check, shipped
@@ -180,13 +240,18 @@ def main(argv: list[str] | None = None) -> int:
         cost = FixedCost(base_ns=int(step_ms * 1e6), per_token_ns=int((a.fixed_per_token_us or 0.0) * 1e3))
     elif a.cost == "tables":
         from augur.cost.tables import TableCost
-        try:
-            cost = TableCost(profile, cpu_mem_bw=a.cpu_mem_bw, cpu_mem_latency_ns=a.cpu_mem_latency_ns)
-        except NotImplementedError as e:
-            print(f"augur: {e} (use --cost llmservingsim)", file=sys.stderr)
+        if a.dp != 1 or a.enable_expert_parallel:
+            print("augur: --cost tables prices TP without DP/EP only (use --cost llmservingsim)", file=sys.stderr)
             return 2
-        if a.tp != 1 or a.dp != 1 or a.enable_expert_parallel:
-            print("augur: --cost tables prices TP=1 without DP/EP only (use --cost llmservingsim)", file=sys.stderr)
+        try:
+            kw = _tp_params(a, *cpu_flags) if a.tp > 1 else dict(cpu_mem_bw=a.cpu_mem_bw,
+                                                                   cpu_mem_latency_ns=a.cpu_mem_latency_ns)
+            cost = TableCost(profile, **kw)
+            if cost.tp != a.tp:
+                raise ValueError(f"profile {profile} is tp={cost.tp}, --tp is {a.tp}")
+        except (NotImplementedError, ValueError) as e:
+            hint = "" if "--cost llmservingsim" in str(e) else " (use --cost llmservingsim)"
+            print(f"augur: {e}{hint}", file=sys.stderr)
             return 2
     else:
         from augur.cost.llmservingsim import LLMServingSimCost
@@ -249,7 +314,12 @@ def main(argv: list[str] | None = None) -> int:
     if a.step_log_vllm:
         from augur.sim.coordinator import install_step_log_clock
         install_step_log_clock(coord)
-    rec = coord.run()
+    from augur.cost.tables import OutsideRegime
+    try:
+        rec = coord.run()
+    except OutsideRegime as e:
+        print(f"augur: {e}", file=sys.stderr)
+        return 2
     if a.output:
         rec.write_csv(a.output)
     if a.step_log:

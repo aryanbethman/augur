@@ -34,8 +34,9 @@ augur --hardware RTXPRO6000 --hbm-gb 96 --model meta-llama/Llama-3.1-8B \
   --workload trace.jsonl --output out/run.csv
 ```
 
-Multi-GPU engines (`--tp`, with `--lss-cluster-config` for ASTRA-Sim),
-many engines (`--engines`, `--router`), prefill/decode
+Multi-GPU engines (`--tp`; link and memory settings from `--tp-link-bw`,
+`--tp-link-latency-ns`, `--npu-mem-bw` or an LLMServingSim cluster config,
+`--lss-cluster-config`), many engines (`--engines`, `--router`), prefill/decode
 (`--prefill-engines/--decode-engines`), DP+EP MoE (`--dp`,
 `--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33).
 
@@ -64,12 +65,12 @@ augur/
     nixl.py            vLLM's NIXL connector with its network handshake off
     models.py          model configs without weights
   cost/                step pricing (interface in __init__.py)
-    tables.py          from profiles shipped with augur: dense models, TP=1, no fork needed
+    tables.py          from profiles shipped with augur: dense models on one node, no fork needed
     convert.py         builds such a profile from an LLMServingSim profile
-    llmservingsim.py   through the LLMServingSim fork: MoE, TP>1, DP
+    llmservingsim.py   through the LLMServingSim fork: MoE, DP/EP
     astra.py           collectives and DP rounds through ASTRA-Sim
     profiles.py        which GPU profiles exist
-  profiles/            shipped profiles: <hardware>/<org>--<model>/<dtype>-tp1.json.gz
+  profiles/            shipped profiles: <hardware>/<org>--<model>/<dtype>-tp<N>.json.gz
   trace/               workloads in (fork JSONL), per-call results out (fork CSV)
   verify/              checking against real vLLM (table above)
 tests/                 pytest; replay self-tests and LLMServingSim comparison need the fork
@@ -94,9 +95,14 @@ Their step prices are identical to the LLMServingSim fork's, to the nanosecond
 `augur bench` also needs the model's tokenizer, which vLLM fetches from
 Hugging Face as usual.
 
-MoE models, TP > 1, DP and other profiles go through a checkout of the fork
+With TP > 1 the shipped profiles price the step's collectives with a closed
+form of ASTRA-Sim's ring all-reduce and all-gather on one node, also identical
+to the fork; a setting outside the range where that form is exact (CPU-memory
+access longer than half a ring step) is refused, not approximated.
+
+MoE models, DP/EP and other profiles go through a checkout of the fork
 (`--fork` or `AUGUR_FORK`, default `~/llmss-vllm-sim-20261114`; install the
 `llmservingsim` extra): its profiles, model configs and ASTRA-Sim.
-`python -m augur.cost.convert` turns one of its dense TP=1 profiles into a
-shipped one. `--model-config` takes any Hugging Face `config.json`, and
+`python -m augur.cost.convert` turns one of its dense profiles into a shipped
+one. `--model-config` takes any Hugging Face `config.json`, and
 `--cost fixed` runs any model with a constant step time.

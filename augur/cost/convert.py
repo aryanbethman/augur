@@ -1,12 +1,17 @@
 """Build a TableCost profile from an LLMServingSimCost profile directory.
 
-    python -m augur.cost.convert --fork DIR --hardware H --model M [--tp 1] --out FILE
+    python -m augur.cost.convert --fork DIR --hardware H --model M [--tp N --cluster-config FILE] --out FILE
 
 The only module allowed to import the LLMServingSim fork.  Table values are
 taken from the fork's own loaded tables (so the stored integers are exactly what
 the fork computes with), written as deterministic gzip JSON, reloaded and
 compared value by value, and spot-checked against ``LLMServingSimCost`` on random
-shapes.  MoE profiles and tp > 1 are refused.
+shapes.  MoE profiles are refused.
+
+At TP = N > 1 the profile holds the tables the fork uses at that TP (``tp_stable`` layers resolved as the
+fork does), the collective coefficients (derived from the fork's traces at several (T, R), which must be
+exactly linear) and, when the fork defines one, the NPU memory bandwidth default.  The cluster config is
+needed for the self-check, which prices random shapes with ASTRA-Sim (one binary run per distinct (T, R)).
 
 Also holds the random step-shape generator and the shape codec shared with the
 tests (stdlib only at import time).
@@ -243,34 +248,82 @@ def _skew_spec(db, tp):
             "lev_labels": ax["lev_labels"], "kernels": kernels}
 
 
-def load_fork(fork, hardware, model, tp):
+def _resolved(tg, db, tp, tables):
+    """The dense / per-sequence tables the fork reads at ``tp``: ``tp_stable`` layers come from tp1 when it exists."""
+    out = {"dense": {}, "per_sequence": {}, "attention_by_layer": tables["attention_by_layer"]}
+    for cat in ("dense", "per_sequence"):
+        names = set(tables[cat])
+        if tp > 1 and 1 in db["available_tps"]:
+            names |= {n for n in tg._tp_tables(db, 1)[cat] if tg._tp_stable(db, cat, n)}
+        for n in sorted(names):
+            out[cat][n] = tg._tp_tables(db, tg._effective_tp(db, cat, n, tp))[cat][n]
+    return out
+
+
+def load_fork(fork, hardware, model, tp, cluster_config=None):
     """(LLMServingSimCost, perf_db, config) for the profile, refusing out-of-scope ones."""
-    if tp != 1:
-        raise Refused(f"tp={tp}: TableCost prices TP=1 only")
     from augur.cost.llmservingsim import LLMServingSimCost
-    cost = LLMServingSimCost(fork, hardware, model, tp=1)
-    cost.step_ns(StepShape(seqs=(SeqWork(1, 10, True),)))  # loads the profile into the fork's cache
+    if tp > 1 and not cluster_config:
+        raise Refused(f"tp={tp} needs --cluster-config (the fork's cost model is built with it)")
+    cost = LLMServingSimCost(fork, hardware, model, tp=tp, cluster_config=cluster_config)
+    cost.trace_rows(StepShape(seqs=(SeqWork(1, 10, True),)))  # loads the profile into the fork's cache (no ASTRA run)
     tg = cost._tg
     config = tg.get_config(model)
     if tg.utils_num_experts(config):
         raise Refused(f"{model} is a MoE model: TableCost prices dense models only")
     db = tg._perf_db_cache[(hardware, model, tg.resolve_variant(config))]
-    tables = tg._tp_tables(db, 1)
+    tables = tg._tp_tables(db, tp)
     extra = set(tables) - {"dense", "per_sequence", "attention_by_layer"}
     if extra:
         raise Refused(f"profile has tables TableCost does not price: {sorted(extra)}")
-    if db["architecture"].get("component_layouts") or db["component_sizes"].get(1) or "TPU" in hardware:
+    if db["architecture"].get("component_layouts") or db["component_sizes"].get(tp) or "TPU" in hardware:
         raise Refused("profile uses component layouts / contextual sizes / TPU rules")
-    if db["key_saturation_by_tp"][1] is not None:
+    if db["key_saturation_by_tp"][tp] is not None:
         raise Refused("sparse (key-saturating) attention is not supported")
     if len(set(db["layer_stack"])) > 1:
         raise Refused("heterogeneous layer stack")
-    return cost, db, config, tables, tg
+    return cost, db, config, _resolved(tg, db, tp, tables), tg
 
 
-def build_profile(fork, hardware, model, tp=1) -> dict:
+def _collectives(cost, layers):
+    """(all-reduce count, bytes per forward token, all-gather bytes per sequence) read from the fork's traces;
+    every sample must agree exactly (linear in T and R, no all-gather without sequences)."""
+    mixed = lambda t, r: [SeqWork(1, 50 + i, True) for i in range(r - 1)] + [SeqWork(t - (r - 1), 10, False)]
+    seen = set()
+    for t, r in ((1, 1), (37, 3), (300, 17), (2048, 128), (5000, 2), (64, 64), (4096, 1), (9, 9)):
+        rows = _probe(cost, 0, mixed(t, r))
+        kinds = [(x[8], int(x[9])) for x in rows if x[8] != "NONE"]
+        if any(k not in ("ALLREDUCE", "ALLGATHER") for k, _ in kinds):
+            raise Refused(f"collectives other than plain ALLREDUCE / ALLGATHER: {sorted({k for k, _ in kinds})}")
+        ar = [b for k, b in kinds if k == "ALLREDUCE"]
+        ag = [b for k, b in kinds if k == "ALLGATHER"]
+        if len(set(ar)) != 1 or len(ag) != 1 or ar[0] % t or ag[0] % r:
+            raise Refused(f"collective sizes at T={t}, R={r} are not one size per kind, proportional to T / R")
+        seen.add((len(ar), ar[0] // t, ag[0] // r))
+    idle = _probe(cost, 64, [], dummy=True)
+    ar = [int(x[9]) for x in idle if x[8] == "ALLREDUCE"]
+    if len({c for c, _, _ in seen}) != 1 or len(seen) != 1 or [x for x in idle if x[8] == "ALLGATHER"] or \
+            ar != [64 * next(iter(seen))[1]] * next(iter(seen))[0]:
+        raise Refused(f"collectives are not linear in (T, R): {sorted(seen)}")
+    n, per_token, per_seq = next(iter(seen))
+    return {"all_reduce_count": n, "all_reduce_bytes_per_token": per_token, "all_gather_bytes_per_seq": per_seq}
+
+
+def _npu_mem_bw_default(fork, hardware):
+    """The NPU memory bandwidth the fork fills into a cluster config that omits it (None: no default)."""
+    cwd = os.getcwd()
+    os.chdir(os.path.join(fork, "serving"))
+    try:
+        from serving.core.hardware_defaults import _defaults_for
+        entry = ((_defaults_for(hardware).get("npu_mem") or {}).get("mem_bw"))
+    finally:
+        os.chdir(cwd)
+    return entry["value"] if isinstance(entry, dict) and "value" in entry else None
+
+
+def build_profile(fork, hardware, model, tp=1, cluster_config=None) -> dict:
     fork = os.path.abspath(fork)
-    cost, db, config, tables, tg = load_fork(fork, hardware, model, tp)
+    cost, db, config, tables, tg = load_fork(fork, hardware, model, tp, cluster_config)
     variant = db["variant"]
     seq = _layers_and_remote(cost, config)
     used = set(seq["prologue"] + seq["block"] + seq["head"])
@@ -295,7 +348,16 @@ def build_profile(fork, hardware, model, tp=1) -> dict:
     for key in ("vllm_version", "profiled_at", "gpu", "profiler_version"):
         if meta.get(key):
             prov[key] = meta[key]
-    return {
+    extra = {}
+    if tp > 1:
+        stable = sorted(n for cat in ("dense", "per_sequence") for n in tables[cat]
+                        if 1 in db["available_tps"] and tg._effective_tp(db, cat, n, tp) == 1)
+        prov["tables_from_tp1"] = stable
+        extra["collectives"] = _collectives(cost, seq)
+        bw = _npu_mem_bw_default(fork, hardware)
+        if bw is not None:
+            extra["hardware"] = {"npu_mem_bw_gbps": bw}
+    return {**extra, **{
         "format_version": 1,
         "identity": {"hardware": hardware, "model": model, "variant": variant, "tp": tp, "kind": "dense",
                      "architecture": meta.get("architecture")},
@@ -307,7 +369,7 @@ def build_profile(fork, hardware, model, tp=1) -> dict:
         "skew": _skew_spec(db, tp),
         "remote": {"input_bytes_per_token": 4, "output_bytes_per_seq": 4},
         "model_config": model_config,
-    }
+    }}
 
 
 def write_profile(profile, out):
@@ -348,11 +410,12 @@ def compare_tables(path, db, tables, cost_tg) -> list[str]:
     with gzip.open(path, "rt", encoding="utf-8") as f:
         p = json.load(f)
     bad = []
+    tp = p["identity"]["tp"]
     for cat, key in (("dense", "dense"), ("per_sequence", "per_sequence")):
         got = {n: {"keys": t["keys"], "values": t["ns"]} for n, t in p[cat].items()}
         want = {n: t for n, t in tables[key].items() if n in got}
         bad += _same(dict(sorted(got.items())), dict(sorted(want.items())), cat)
-        if set(got) != set(tables[key]):
+        if not set(got) <= set(tables[key]) or (tp == 1 and set(got) != set(tables[key])):
             bad.append(f"{cat}: names {sorted(got)} != fork {sorted(tables[key])}")
     for layer, by_q in p["attention"].items():
         fork_q = tables["attention_by_layer"][layer]
@@ -367,7 +430,8 @@ def compare_tables(path, db, tables, cost_tg) -> list[str]:
     want_skew = _skew_spec(db, p["identity"]["tp"])
     bad += _same(p["skew"], want_skew, "skew")
     fit = (db["meta"].get("skew_fit") or {}).get("per_tp") or {}
-    entry = fit.get(1) or fit.get("1")
+    tp = p["identity"]["tp"]
+    entry = fit.get(tp) or fit.get(str(tp))
     if p["skew"]:
         cal = entry["calibration"]
         cells = sum(len(k["cells"]) for by_q in p["skew"]["kernels"].values() for k in by_q.values())
@@ -386,6 +450,48 @@ def compare_tables(path, db, tables, cost_tg) -> list[str]:
         for k in ("pc_bins", "pc_labels", "lev_bins", "lev_labels"):
             bad += _same(p["skew"][k], ax[k], f"skew/{k}")
     return bad
+
+
+TEMPLATE_SYSTEM = {"scheduling-policy": "LIFO", "endpoint-delay": 10, "active-chunks-per-dimension": 1,
+                   "preferred-dataset-splits": 1, "all-reduce-implementation": ["ring"],
+                   "all-gather-implementation": ["ring"], "reduce-scatter-implementation": ["ring"],
+                   "all-to-all-implementation": ["ring"], "collective-optimization": "localBWAware",
+                   "boost-mode": 0}
+
+
+def cluster_params(path, default_npu_bw=None):
+    """TableCost keyword arguments that mirror a fork cluster config (single node, one instance)."""
+    with open(path, encoding="utf-8") as f:
+        c = json.load(f)
+    node = c["nodes"][0]
+    inst = node["instances"][0]
+    return dict(link_bw=c["link_bw"], link_latency_ns=c["link_latency"],
+                npu_mem_bw=(inst.get("npu_mem") or {}).get("mem_bw", default_npu_bw),
+                cpu_mem_bw=node["cpu_mem"]["mem_bw"], cpu_mem_latency_ns=node["cpu_mem"]["mem_latency"])
+
+
+def spot_check_tp(path, fork, hardware, model, tp, cluster_config, n, seed):
+    """Random shapes: TableCost against LLMServingSimCost (ASTRA-Sim) with the same cluster config.
+    Returns (mismatches, refused by the guard, distinct ASTRA runs)."""
+    from augur.cost.llmservingsim import LLMServingSimCost
+    from augur.cost.tables import OutsideRegime, TableCost
+    ref = LLMServingSimCost(fork, hardware, model, tp=tp, cluster_config=cluster_config)
+    with open(ref.oracle.cluster["system_config_path"], encoding="utf-8") as f:
+        system = json.load(f)
+    if {k: v for k, v in system.items() if k != "local-mem-bw"} != TEMPLATE_SYSTEM:
+        raise Refused(f"ASTRA-Sim system config differs from the one the closed form was verified for: {system}")
+    mine = TableCost(path, **cluster_params(cluster_config))
+    bad, refused = [], 0
+    for s in random_shapes(random.Random(seed), n):
+        try:
+            got = mine.step_ns(s)
+        except OutsideRegime:
+            refused += 1
+            continue
+        want = ref.step_ns(s)
+        if want != got:
+            bad.append((s, want, got))
+    return bad, refused, ref.oracle.runs
 
 
 def spot_check(path, fork, hardware, model, n, seed, **cpu):
@@ -411,24 +517,43 @@ def main(argv=None) -> int:
     ap.add_argument("--model", required=True, help="e.g. meta-llama/Llama-3.1-8B")
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--spot-checks", type=int, default=2000)
+    ap.add_argument("--cluster-config", default=None,
+                    help="fork cluster config JSON (needed for --tp > 1: link, NPU and CPU memory parameters of the self-check)")
+    ap.add_argument("--spot-checks", type=int, default=None,
+                    help="random shapes priced against the fork (default 2000 at TP=1; 200 at TP>1, where each "
+                         "distinct (tokens, sequences) pair costs one ASTRA-Sim binary run)")
     ap.add_argument("--seed", type=int, default=12345)
     a = ap.parse_args(argv)
     fork = os.path.abspath(a.fork)
+    if a.spot_checks is None:
+        a.spot_checks = 2000 if a.tp == 1 else 200
     try:
-        profile = build_profile(fork, a.hardware, a.model, a.tp)
+        profile = build_profile(fork, a.hardware, a.model, a.tp, a.cluster_config)
     except Refused as e:
         print(f"convert: refused: {e}", file=sys.stderr)
         return 2
     raw, packed = write_profile(profile, a.out)
     print(f"wrote {a.out}: {raw} bytes JSON, {packed} bytes gzip")
 
-    cost, db, config, tables, tg = load_fork(fork, a.hardware, a.model, a.tp)
+    cost, db, config, tables, tg = load_fork(fork, a.hardware, a.model, a.tp, a.cluster_config)
     bad = compare_tables(a.out, db, tables, tg)
     print(f"table comparison: {'OK' if not bad else 'MISMATCH'}")
     for m in bad[:10]:
         print("  ", m)
     failures = len(bad)
+    if a.tp > 1:
+        try:
+            mism, refused, runs = spot_check_tp(a.out, fork, a.hardware, a.model, a.tp, a.cluster_config,
+                                                a.spot_checks, a.seed)
+        except Refused as e:
+            print(f"convert: refused: {e}", file=sys.stderr)
+            return 2
+        print(f"spot check (cluster config): {a.spot_checks} shapes, {len(mism)} mismatches, "
+              f"{refused} outside the guard's regime, {runs} ASTRA-Sim runs")
+        for s, w, g in mism[:3]:
+            print("  ", shape_to_row(s), "fork", w, "table", g)
+        print("collectives:", json.dumps(profile["collectives"]), "hardware:", json.dumps(profile.get("hardware")))
+        return 1 if failures + len(mism) else 0
     for label, cpu in (("default CPU memory", {}), ("bw=3.7 latency=123", {"bw": 3.7, "lat": 123})):
         n = a.spot_checks if not cpu else max(500, a.spot_checks // 4)
         mism, t_ref, t_mine = spot_check(a.out, fork, a.hardware, a.model, n, a.seed, **cpu)

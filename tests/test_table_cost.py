@@ -6,6 +6,9 @@ workloads (sync and async), 3,000 random shapes per profile, and a few hundred p
 different CPU-memory bandwidth/latency (scripts/build_table_regression.py).  They run without
 the fork.  With the fork present, fresh random shapes are compared live, and a whole run with
 each cost model must write the same bytes.
+
+TP>1 files (one per shipped tpN profile) hold 1,000 workload and 1,000 random shapes priced by the
+fork with ASTRA-Sim, and the link, NPU and CPU-memory parameters used.
 """
 
 import gzip
@@ -21,10 +24,13 @@ import pytest
 from augur.cost import SeqWork, StepShape
 from augur.cost.convert import random_shapes, shape_from_row
 from augur.cost.profiles import default_fork
-from augur.cost.tables import TableCost, bundled_profile
+from augur.cost.tables import OutsideRegime, TableCost, bundled_profile
 
 DATA = os.path.join(os.path.dirname(__file__), "data", "table_cost")
 FILES = sorted(f for f in os.listdir(DATA) if f.endswith(".json.gz"))
+TP1_FILES = [f for f in FILES if "-tp" not in f]
+TP_FILES = [f for f in FILES if "-tp" in f]
+TP2_CONFIG = os.path.join(os.path.dirname(__file__), "data", "llmservingsim", "llama_tp2.json")
 FORK = default_fork()
 needs_fork = pytest.mark.skipif(not os.path.isdir(os.path.join(FORK, "workloads")),
                                 reason="LLMServingSim fork not found (AUGUR_FORK)")
@@ -42,9 +48,19 @@ def mismatches(cost, rows):
 @pytest.mark.parametrize("name", FILES)
 def test_regression_exact(name):
     d = load(name)
-    path = bundled_profile(d["hardware"], d["model"])
+    tp = d.get("tp", 1)
+    path = bundled_profile(d["hardware"], d["model"], tp)
     assert hashlib.sha256(gzip.decompress(path.read_bytes())).hexdigest() == d["profile_sha256"], \
         "profile changed since the regression data was priced: rebuild it (scripts/build_table_regression.py)"
+    if tp > 1:
+        prm = d["params"]
+        assert len(d["workload"]) == 1000 and len(d["random"]) == 1000
+        cost = TableCost(path, **{k: prm[k] for k in ("link_bw", "link_latency_ns", "npu_mem_bw", "cpu_mem_bw",
+                                                      "cpu_mem_latency_ns")})
+        assert cost.tp == tp
+        assert mismatches(cost, d["workload"]) == []
+        assert mismatches(cost, d["random"]) == []
+        return
     assert len(d["workload"]) > 1000 and len(d["random"]) >= 3000
     cost = TableCost(path)
     assert mismatches(cost, d["workload"]) == []
@@ -55,7 +71,7 @@ def test_regression_exact(name):
 
 
 @needs_fork
-@pytest.mark.parametrize("name", FILES)
+@pytest.mark.parametrize("name", TP1_FILES)
 def test_live_against_fork(name):
     from augur.cost.llmservingsim import LLMServingSimCost
     d = load(name)
@@ -65,6 +81,34 @@ def test_live_against_fork(name):
     bad = [(s, ref.step_ns(s), cost.step_ns(s)) for s in shapes]
     bad = [b for b in bad if b[1] != b[2]]
     assert bad == []
+
+
+@needs_fork
+def test_live_against_fork_tp2():
+    """150 fresh random shapes at TP2: TableCost against the fork with ASTRA-Sim (about 140 binary runs)."""
+    from augur.cost.llmservingsim import LLMServingSimCost
+    ref = LLMServingSimCost(FORK, "RTXPRO6000", "meta-llama/Llama-3.1-8B", tp=2, cluster_config=TP2_CONFIG)
+    cost = TableCost(bundled_profile("RTXPRO6000", "meta-llama/Llama-3.1-8B", 2), link_bw=16, link_latency_ns=20000,
+                     npu_mem_bw=1597, cpu_mem_bw=256, cpu_mem_latency_ns=0)
+    shapes = list(random_shapes(random.Random(424242), 150))
+    bad = [(s, ref.step_ns(s), cost.step_ns(s)) for s in shapes]
+    assert [b for b in bad if b[1] != b[2]] == []
+
+
+@needs_fork
+def test_whole_run_is_identical_tp2(tmp_path):
+    """augur --tp 2 end to end: same bytes out with the shipped tp2 profile as with the fork and ASTRA-Sim."""
+    out = {}
+    for cost in ("tables", "llmservingsim"):
+        out[cost] = tmp_path / f"{cost}.csv"
+        subprocess.run([sys.executable, "-m", "augur.cli", "--cost", cost, "--hardware", "RTXPRO6000",
+                        "--model", "meta-llama/Llama-3.1-8B", "--tp", "2", "--hbm-gb", "96",
+                        "--lss-cluster-config", TP2_CONFIG, "--max-num-seqs", "128", "--max-num-batched-tokens", "2048",
+                        "--workload", os.path.join(FORK, "workloads", "sharegpt-llama-3.1-8b-300-sps10.jsonl"),
+                        "--num-entries", "80", "--quiet", "--output", str(out[cost])],
+                       check=True, env=dict(os.environ, VLLM_LOGGING_LEVEL="WARNING"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert out["tables"].read_bytes() == out["llmservingsim"].read_bytes()
 
 
 @needs_fork
@@ -105,10 +149,46 @@ def test_idle_and_empty_steps():
     assert cost.step_ns(StepShape(seqs=shape.seqs, padded_tokens=512)) == 24601278
 
 
+TP2 = bundled_profile("RTXPRO6000", "meta-llama/Llama-3.1-8B", 2)
+
+
+def test_guard_refuses_long_cpu_memory_access():
+    """A CPU-memory access longer than half a ring step is outside the verified regime: refused, with the values."""
+    shape = StepShape(seqs=(SeqWork(1, 100, True),))
+    ok = TableCost(TP2, cpu_mem_latency_ns=10_000)  # A = 10000 <= half of 20238
+    assert ok.step_ns(shape) > 0
+    # refused when the pricer is built, before a run starts
+    with pytest.raises(OutsideRegime, match=r"A=11000 .*all-reduce 20238 ns.*--cost llmservingsim"):
+        TableCost(TP2, cpu_mem_latency_ns=11_000)
+    # the last collective (all-gather, 1 sequence) bounds the sampled-ids access too
+    with pytest.raises(OutsideRegime):
+        TableCost(TP2, link_bw=1000, link_latency_ns=0, cpu_mem_latency_ns=40)
+
+
+def test_tp_profile_needs_its_parameters(tmp_path):
+    with pytest.raises(ValueError, match="npu_mem_bw"):
+        TableCost(bundled_profile("H100", "meta-llama/Llama-3.1-70B", 4))
+    TableCost(bundled_profile("H100", "meta-llama/Llama-3.1-70B", 4), npu_mem_bw=3350)
+    p = json.loads(gzip.decompress(TP2.read_bytes()))
+    del p["collectives"]
+    f = tmp_path / "nocoll.json.gz"
+    f.write_bytes(gzip.compress(json.dumps(p).encode()))
+    with pytest.raises(NotImplementedError):
+        TableCost(f)
+
+
+def test_tp1_remote_term_unchanged():
+    """TP=1 still adds latency + int(4 * tokens / bw) twice (float bandwidth, no TP communication)."""
+    cost = TableCost(bundled_profile("RTXPRO6000", "meta-llama/Llama-3.1-8B"), cpu_mem_bw=3.7, cpu_mem_latency_ns=123)
+    base = TableCost(bundled_profile("RTXPRO6000", "meta-llama/Llama-3.1-8B"), cpu_mem_bw=1e30)
+    shape = StepShape(seqs=(SeqWork(1, 100, True), SeqWork(256, 0, False)))
+    assert cost.step_ns(shape) - base.step_ns(shape) == 2 * 123 + int(4 * 257 / 3.7) + int(4 * 2 / 3.7)
+
+
 def test_out_of_scope_is_refused(tmp_path):
     src = bundled_profile("RTXPRO6000", "meta-llama/Llama-3.1-8B")
     p = json.loads(gzip.decompress(src.read_bytes()))
-    for edit, exc in (({"tp": 2}, NotImplementedError), ({"kind": "moe"}, NotImplementedError)):
+    for edit, exc in (({"tp": 2}, NotImplementedError), ({"kind": "moe"}, NotImplementedError)):  # tp2: no collectives
         q = dict(p, identity=dict(p["identity"], **edit))
         f = tmp_path / "x.json.gz"
         f.write_bytes(gzip.compress(json.dumps(q).encode()))
