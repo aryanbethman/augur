@@ -1,4 +1,4 @@
-"""Workload loader for the LLMServingSim fork's JSONL format.
+"""Workload loader: JSONL traces in LLMServingSim's format.
 
 Every line is either a flat request or an agentic session (it has
 ``sub_requests``); a file may mix them. Semantics follow the fork's router:

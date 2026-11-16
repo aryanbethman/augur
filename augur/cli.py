@@ -21,10 +21,12 @@ def _scheduler_cls(a) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="augur")
     p.add_argument("--fork", default=default_fork(),
-                   help="LLMServingSim fork checkout (model configs, profiles)")
+                   help="LLMServingSim fork checkout (model configs, profiles); "
+                        "not needed for the models and GPUs augur ships profiles for")
     p.add_argument("--model", required=True, help="e.g. meta-llama/Llama-3.1-8B")
     p.add_argument("--model-config", default=None,
-                   help="the model's HF config.json (default: the fork's configs/model/<model>.json)")
+                   help="the model's HF config.json (default: the --cost tables profile's, else the fork's "
+                        "configs/model/<model>.json, else the config of a profile shipped with augur)")
     p.add_argument("--workload", required=True, help="JSONL in the fork's format (flat and/or agentic)")
     p.add_argument("--num-entries", type=int, default=None, help="first N requests/sessions only")
     p.add_argument("--engines", type=int, default=1, help="colocated engines (ignored with --prefill-engines)")
@@ -90,14 +92,17 @@ def main(argv: list[str] | None = None) -> int:
                    help="requests reach the engine when this vLLM step log says, steps priced by --cost "
                         "(separates arrival timing from step pricing)")
     p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
-    p.add_argument("--cost", default="fixed", choices=["fixed", "tables", "llmservingsim", "auto"],
-                   help="step prices. tables: a profile shipped with augur (dense models, TP=1; no fork needed). "
+    p.add_argument("--cost", default="auto", choices=["fixed", "tables", "llmservingsim", "auto"],
+                   help="step prices. auto (default): tables when augur ships a profile for --hardware and "
+                        "--model (TP=1, no DP/EP), else llmservingsim. "
+                        "tables: a profile shipped with augur (dense models, TP=1; no fork needed). "
                         "llmservingsim: the fork's profiles and ASTRA-Sim (MoE, TP>1, DP). "
-                        "auto: tables when augur ships a profile for this hardware and model, else llmservingsim")
+                        "fixed: one constant step time (--fixed-step-ms, --fixed-per-token-us), no profile")
     p.add_argument("--profile", default=None, help="profile file for --cost tables (default: the one shipped "
                                                    "for --hardware and --model; python -m augur.cost.profiles lists them)")
-    p.add_argument("--fixed-step-ms", type=float, default=25.0)
-    p.add_argument("--fixed-per-token-us", type=float, default=0.0)
+    p.add_argument("--fixed-step-ms", type=float, default=None, help="--cost fixed only: base step time (default 25)")
+    p.add_argument("--fixed-per-token-us", type=float, default=None,
+                   help="--cost fixed only: added per batched token (default 0)")
     p.add_argument("--hardware", default="RTXPRO6000", help="profile hardware for --cost tables / llmservingsim")
     p.add_argument("--lss-cluster-config", default=None,
                    help="LLMServingSim cluster config for ASTRA-Sim (needed for --tp > 1)")
@@ -111,6 +116,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
 
+    if a.cost != "fixed" and (a.fixed_step_ms is not None or a.fixed_per_token_us is not None):
+        print(f"augur: --fixed-step-ms and --fixed-per-token-us only apply with --cost fixed (this run: --cost {a.cost})",
+              file=sys.stderr)
+        return 2
     if a.quiet:
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
     from augur.cost import FixedCost
@@ -121,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     from augur.trace.workload import Workload
 
     cache_root = os.path.expanduser("~/.cache/augur/models")
+    auto = a.cost == "auto"
     try:
         profile = None
         if a.cost in ("tables", "auto"):
@@ -134,10 +144,21 @@ def main(argv: list[str] | None = None) -> int:
                 except FileNotFoundError:
                     pass
             a.cost = "tables" if profile else "llmservingsim"
-        mdir = model_dir(a.fork, a.model, cache_root, a.model_config, profile)
         if a.cost == "llmservingsim" and not a.replay_durations:
-            from augur.cost.profiles import check
-            check(a.fork, a.hardware, a.model, a.tp)
+            from augur.cost.profiles import check, shipped
+            try:
+                check(a.fork, a.hardware, a.model, a.tp)
+            except FileNotFoundError:
+                if not auto:
+                    raise
+                have = "\n".join(f"  {h} {m} {d} tp{t}" for h, m, d, t in shipped())
+                raise FileNotFoundError(
+                    f"no step-time profile for {a.model} on {a.hardware} (tp={a.tp}, dp={a.dp}). "
+                    f"Profiles shipped with augur (dense, TP=1):\n{have}\n"
+                    "For another model or GPU, point augur at an LLMServingSim fork that has the profile "
+                    "(--fork DIR or AUGUR_FORK=DIR; python -m augur.cost.profiles --fork DIR lists them), "
+                    "or use --cost fixed (a constant step time, no profile).") from None
+        mdir = model_dir(a.fork, a.model, cache_root, a.model_config, profile)
     except FileNotFoundError as e:
         print(f"augur: {e}", file=sys.stderr)
         return 2
@@ -155,7 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         from augur.verify.replay import ReplayCost
         cost = ReplayCost.from_log(a.replay_durations)
     elif a.cost == "fixed":
-        cost = FixedCost(base_ns=int(a.fixed_step_ms * 1e6), per_token_ns=int(a.fixed_per_token_us * 1e3))
+        step_ms = 25.0 if a.fixed_step_ms is None else a.fixed_step_ms
+        cost = FixedCost(base_ns=int(step_ms * 1e6), per_token_ns=int((a.fixed_per_token_us or 0.0) * 1e3))
     elif a.cost == "tables":
         from augur.cost.tables import TableCost
         try:

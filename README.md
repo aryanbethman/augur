@@ -3,8 +3,8 @@
 Serving research without GPUs: augur runs vLLM's real control plane
 (scheduler, KV-cache manager, prefix caching, chunked prefill, preemption,
 async scheduling, NIXL prefill/decode, DP/EP) unmodified on a virtual clock,
-with no GPU and no model weights. Step and transfer times come from measured
-GPU profiles and LLMServingSim's ASTRA-Sim hardware model.
+with no GPU and no model weights. Step times come from measured GPU profiles;
+multi-GPU collectives and transfers from LLMServingSim's ASTRA-Sim.
 Design doc: https://claude.ai/artifact/X669zyopvMUTTc4wJR9x5p
 
 ## Use it like vLLM
@@ -26,12 +26,12 @@ After the report it prints how far each metric moves when step times change by
 ±1% (`--sensitivity`, 0 to turn off). Near saturation TTFT can move by tens of
 percent, on real hardware too; read it as a range there.
 
-For the LLMServingSim fork's traces (ShareGPT, SWE-bench agent sessions,
-scaled sessions), run augur directly:
+For traces (one JSON line per request or agent session; the format is described
+in `augur/trace/workload.py` and is LLMServingSim's), run augur directly:
 
 ```bash
-augur --cost tables --hardware RTXPRO6000 --hbm-gb 96 \
-  --model meta-llama/Llama-3.1-8B --workload trace.jsonl --output out/run.csv
+augur --hardware RTXPRO6000 --hbm-gb 96 --model meta-llama/Llama-3.1-8B \
+  --workload trace.jsonl --output out/run.csv
 ```
 
 Multi-GPU engines (`--tp`, with `--lss-cluster-config` for ASTRA-Sim),
@@ -82,18 +82,21 @@ docs/accuracy.md       current accuracy against real vLLM and LLMServingSim
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e ".[llmservingsim]"
-.venv/bin/python -m pytest      # tests
+uv pip install --python .venv/bin/python -e ".[test]"
+.venv/bin/python -m pytest      # 26 tests; 10 more with the LLMServingSim fork
 ```
 
-`python -m augur.cost.profiles` lists the GPU / model profiles. For the ones
-shipped with augur nothing else is needed: `augur bench` picks them up, and
-`--cost tables` uses them for traces. Their prices are identical to the
-LLMServingSim fork's, to the nanosecond (method and profile data: LLMServingSim,
-MIT licence, CASYS Lab at KAIST).
+That is all for the GPUs and models augur ships profiles for
+(`python -m augur.cost.profiles` lists them): `augur` and `augur bench` use
+them by default (`--cost auto`), and the profile carries the model's config.
+Their step prices are identical to the LLMServingSim fork's, to the nanosecond
+(method and profile data: LLMServingSim, MIT licence, CASYS Lab at KAIST).
+`augur bench` also needs the model's tokenizer, which vLLM fetches from
+Hugging Face as usual.
 
-MoE models, TP > 1, DP and other profiles go through the fork checkout
-(`--cost llmservingsim`; `--fork` or `AUGUR_FORK`, default
-`~/llmss-vllm-sim-20261114`): its profiles, model configs and ASTRA-Sim.
+MoE models, TP > 1, DP and other profiles go through a checkout of the fork
+(`--fork` or `AUGUR_FORK`, default `~/llmss-vllm-sim-20261114`; install the
+`llmservingsim` extra): its profiles, model configs and ASTRA-Sim.
 `python -m augur.cost.convert` turns one of its dense TP=1 profiles into a
-shipped one. `--model-config` takes any HF `config.json`.
+shipped one. `--model-config` takes any Hugging Face `config.json`, and
+`--cost fixed` runs any model with a constant step time.

@@ -1,8 +1,10 @@
 """Model configs without weights.
 
 vLLM builds its config from a directory holding ``config.json``. We take that
-file from the LLMServingSim fork's ``configs/model/<org>/<name>.json`` (the
-same HF config the fork simulates), so no download or HF token is needed.
+file from ``--model-config``, from the augur profile in use (profiles embed the
+model's config), from the LLMServingSim fork's ``configs/model/<org>/<name>.json``,
+or from any profile shipped with augur for that model, so no download or HF
+token is needed.
 """
 
 from __future__ import annotations
@@ -11,24 +13,41 @@ import json
 import os
 
 
+def _embedded_config(profile_path) -> str:
+    import gzip
+    with gzip.open(profile_path, "rt", encoding="utf-8") as f:
+        return json.dumps(json.load(f)["model_config"], indent=2, sort_keys=True) + "\n"
+
+
 def model_dir(fork_root: str, model: str, cache_root: str, config_path: str | None = None,
               profile_path=None) -> str:
     """Return a directory with ``config.json`` for ``model`` (e.g. 'meta-llama/Llama-3.1-8B').
 
     The config comes from ``config_path`` if given (any HF ``config.json``),
     else from the augur profile at ``profile_path`` (which carries the model's
-    config), else from the LLMServingSim fork's ``configs/model/<model>.json``."""
+    config), else from the LLMServingSim fork's ``configs/model/<model>.json``
+    if that exists, else from any profile shipped with augur for ``model``."""
     dst_dir = os.path.join(cache_root, model)
     dst = os.path.join(dst_dir, "config.json")
-    if config_path is None and profile_path is not None:
-        import gzip
-        with gzip.open(profile_path, "rt", encoding="utf-8") as f:
-            text = json.dumps(json.load(f)["model_config"], indent=2, sort_keys=True) + "\n"
+    fork_cfg = os.path.join(fork_root, "configs", "model", f"{model}.json")
+    if config_path is not None:
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"No model config for {model!r}: {config_path} does not exist")
+        text = open(config_path).read()
+    elif profile_path is not None:
+        text = _embedded_config(profile_path)
+    elif os.path.exists(fork_cfg):
+        text = open(fork_cfg).read()
     else:
-        src = config_path or os.path.join(fork_root, "configs", "model", f"{model}.json")
-        if not os.path.exists(src):
-            raise FileNotFoundError(f"No model config for {model!r}: {src} (pass --model-config <config.json>)")
-        text = open(src).read()
+        from augur.cost.profiles import shipped
+        from augur.cost.tables import bundled_profile
+        have = sorted({m for _, m, _, _ in shipped()})
+        hit = next(((hw, dt, tp) for hw, m, dt, tp in shipped() if m == model), None)
+        if hit is None:
+            raise FileNotFoundError(
+                f"No model config for {model!r}: not in the fork ({fork_cfg}) and augur ships configs only for "
+                f"{', '.join(have) or 'no models'}. Pass --model-config <config.json> (any Hugging Face config.json)")
+        text = _embedded_config(bundled_profile(hit[0], model, hit[2], hit[1]))
     os.makedirs(dst_dir, exist_ok=True)
     if not os.path.exists(dst) or open(dst).read() != text:
         tmp = f"{dst}.{os.getpid()}"

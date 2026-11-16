@@ -3,7 +3,8 @@
 Rebuilds every step of a real run from its step log (augur.verify.hooks,
 synchronous or async scheduling): which requests ran, how many tokens each, and how
 many tokens each already had in the KV cache. Pads it with vLLM's own CUDA-graph
-dispatcher (same engine settings) and prices it with augur's cost model. The
+dispatcher (same engine settings) and prices it with augur's cost model (the profile shipped with augur
+for --hardware and --model if there is one, else the fork's). The
 measured duration is the step's schedule start to its update end, so it
 includes vLLM's per-step CPU work; the profile prices GPU work only. The
 difference is reported per step class and as a fit against batch size.
@@ -59,7 +60,7 @@ def classify(shape: StepShape) -> str:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="augur.verify.stepcheck")
     p.add_argument("log")
-    p.add_argument("--fork", default=default_fork())
+    p.add_argument("--fork", default=default_fork(), help="LLMServingSim fork, for models augur ships no profile for")
     p.add_argument("--model", required=True)
     p.add_argument("--hardware", required=True)
     p.add_argument("--max-num-seqs", type=int, default=128)
@@ -70,12 +71,21 @@ def main(argv=None) -> int:
 
     from augur.sim.engine import EngineSpec, SimEngine
     from augur.cost.llmservingsim import LLMServingSimCost
+    from augur.cost.tables import TableCost, bundled_profile
     from augur.sim.models import model_dir
     from vllm.config import CUDAGraphMode
 
-    mdir = model_dir(a.fork, a.model, os.path.expanduser("~/.cache/augur/models"))
-    cost = LLMServingSimCost(fork_root=a.fork, hardware=a.hardware, model=a.model,
-                             max_num_batched_tokens=a.max_num_batched_tokens)
+    try:
+        try:  # as augur --cost auto: the profile shipped with augur, else the fork's
+            profile = bundled_profile(a.hardware, a.model)
+        except FileNotFoundError:
+            profile = None
+        mdir = model_dir(a.fork, a.model, os.path.expanduser("~/.cache/augur/models"), None, profile)
+        cost = TableCost(profile) if profile else LLMServingSimCost(
+            fork_root=a.fork, hardware=a.hardware, model=a.model, max_num_batched_tokens=a.max_num_batched_tokens)
+    except FileNotFoundError as e:
+        print(f"augur.verify.stepcheck: {e}", file=sys.stderr)
+        return 2
     # Only for vLLM's CUDA-graph dispatcher under the same engine settings.
     eng = SimEngine(0, EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=8 << 30,
                                   max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
