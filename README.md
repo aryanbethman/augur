@@ -5,7 +5,6 @@ Serving research without GPUs: augur runs vLLM's real control plane
 async scheduling, NIXL prefill/decode, DP/EP) unmodified on a virtual clock,
 with no GPU and no model weights. Step times come from measured GPU profiles;
 multi-GPU collectives and transfers from LLMServingSim's ASTRA-Sim.
-Design doc: https://claude.ai/artifact/X669zyopvMUTTc4wJR9x5p
 
 ## Use it like vLLM
 
