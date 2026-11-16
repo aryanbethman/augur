@@ -77,6 +77,7 @@ tests/                 pytest; replay self-tests and LLMServingSim comparison ne
   data/llmservingsim/  LLMServingSim reference outputs for the comparison
 scripts/               rebuild test data from the fork
 docs/accuracy.md       current accuracy against real vLLM and LLMServingSim
+augur-todo.md          open work, in priority order
 ```
 
 ## Setup
