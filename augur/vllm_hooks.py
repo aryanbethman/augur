@@ -101,8 +101,8 @@ class _LoggingMixin:
             k = (self._k_of or {}).pop(id(scheduler_output), self._k)
             log.write({"ev": "upd", "t": CLOCK("upd"), "k": k, "out": out, "fin": sorted(fin),
                        "left": self.get_num_unfinished_requests()})
-            if fin:
-                log.flush()
+            if fin or not self.get_num_unfinished_requests():
+                log.flush()  # an idle engine may be killed before atexit runs
         return outputs
 
 

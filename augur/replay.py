@@ -40,6 +40,18 @@ def is_async(events: list[dict]) -> bool:
     return False
 
 
+def scheduled(events: list[dict]) -> list[dict]:
+    """Every step that scheduled tokens, in order, with or without a logged update."""
+    return sorted((e for e in events if e["ev"] == "sched" and e["tok"]), key=lambda e: e["k"])
+
+
+def _unlogged_tail(events: list[dict]) -> int:
+    """Scheduled steps whose update the log lacks (an async engine's last batch
+    when the server was killed before flushing)."""
+    upd = {e["k"] for e in events if e["ev"] == "upd"}
+    return sum(1 for e in scheduled(events) if e["k"] not in upd)
+
+
 def steps(events: list[dict]) -> list[tuple[dict, dict | None]]:
     """(sched, upd) pairs for steps that ran tokens, in order."""
     out, pending = [], {}
@@ -85,6 +97,10 @@ class ReplayCost:
                 start = s["t"] if prev_finish is None else max(s["t"], prev_finish)
                 d.append(u["t"] - start)
                 prev_finish = u["t"]
+            # A batch scheduled but never logged as finished still runs; price it
+            # like the last one.
+            for _ in range(_unlogged_tail(ev) if d else 0):
+                d.append(d[-1])
             return cls(d, [s["t"] - t0 for s, _ in st], outs, toks)
         d = []
         for i, (s, u) in enumerate(st):
@@ -163,8 +179,8 @@ def _norm(step: dict) -> tuple:
 
 
 def compare(a_path: str, b_path: str) -> dict:
-    a = [s for s, _ in steps(read_log(a_path))]
-    b = [s for s, _ in steps(read_log(b_path))]
+    a = scheduled(read_log(a_path))
+    b = scheduled(read_log(b_path))
     same = 0
     first = None
     for i, (x, y) in enumerate(zip(a, b)):
