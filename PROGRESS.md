@@ -434,6 +434,13 @@ CUDA-graph dispatcher, prices it, and compares with the measured step
 | --- | --- | --- | --- |
 | ShareGPT 300 | 3,402 | 0.951 | −4.6% / −4.1% / −11.8% |
 | SWE-bench sessions | 11,030 | 0.950 | −7.0% / −1.9% / −11.1% |
+| ShareGPT 300, with skew sweep | 3,402 | 0.965 | −2.8% / −3.7% / −11.8% |
+| SWE-bench sessions, with skew sweep | 11,030 | 0.973 | −5.3% / +0.2% / −11.1% |
+
+The skew sweep (fork 4bbee2f; 24,335 attention cases with uneven KV lengths)
+closes most of SWE-bench's growing gap: its mixed steps are now priced to a
++0.2% median. End to end it changes almost nothing on the random 1,024/128
+benchmark below (uniform lengths): knee median TTFT is still −25%.
 
 augur is a little fast: the profile prices GPU work, and the measured step
 also holds vLLM's CPU work. ShareGPT's gap is ~1.5–3 ms per step at any
@@ -488,7 +495,11 @@ rejection and proposes the request's next recorded tokens as drafts
 loop does). Llama-3.1-8B ShareGPT, k=3: TPOT 31.5 ms without; 41.4 / 19.0 /
 10.8 ms at 0 / 70 / 90% acceptance; output lengths exact. In replay,
 acceptance and draft counts come from the log (self-test 1,040/1,040), so a
-real speculative run can be checked step for step. Speculation also runs
+real speculative run can be checked step for step. Against real vLLM
+(Qwen3-1.7B, ShareGPT 300, ngram k=3, synchronous, RTX 4060 Ti): 1,880/1,880
+steps identical, after a fix: the drafter does not know `max_tokens`, so one
+step before a request finishes it still proposes k drafts and vLLM schedules
+them all (augur had capped them). Speculation also runs
 under async scheduling (k=3 at 70%: TPOT 18.99 ms as in sync, TTFT 956 vs
 882 ms). Not yet: EAGLE/MTP drafter cost.
 
