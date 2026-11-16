@@ -241,17 +241,20 @@ class SimWorker:
                         for i in range(n_emit)]
                 st.num_output += n_emit
                 sampled.append(toks)
-                if self.ctx.spec_k and rec:
+                if self.ctx.spec_k:
                     # The drafter proposes the request's next recorded tokens,
-                    # so accepted drafts are the right tokens. Replay: as many
+                    # so accepted drafts are the right tokens. It does not know
+                    # max_tokens: near the end it still proposes k (vLLM stops
+                    # the request when it reaches max_tokens). Replay: as many
                     # drafts as the logged run scheduled next step (an ngram
                     # drafter proposes none when the prompt has no match).
                     n_next = self.ctx.spec_k
                     if replay is not None:
                         n_next = max(replay[1].get(call_id(rid), 1) - 1, 0)
-                    nxt = rec[st.num_output:st.num_output + n_next]
+                    nxt = list((rec or ())[st.num_output:st.num_output + n_next])
+                    nxt += [SYNTHETIC_TOKEN] * (n_next - len(nxt))
                     if nxt:
-                        drafts_next[rid] = list(nxt)
+                        drafts_next[rid] = nxt
             else:
                 sampled.append([])
         if self.ctx.spec_k:
