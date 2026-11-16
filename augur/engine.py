@@ -33,6 +33,7 @@ from augur.workload import Call, Session, Workload
 
 # The engine inside a synchronous step (for the step log's clock).
 _stepping: list = [None]
+_async_stepping: list = [None]  # engine inside step_with_batch_queue (for the step-log clock)
 
 
 def install_step_log_clock(coord: "Coordinator") -> None:
@@ -41,6 +42,10 @@ def install_step_log_clock(coord: "Coordinator") -> None:
     from augur import vllm_hooks
 
     def clock(phase: str) -> int:
+        if phase == "upd" and _async_stepping[0] is not None:
+            # Async: the batch being applied is the oldest one on the GPU.
+            fin = _async_stepping[0].batch_finish
+            return max(coord.now, fin[0]) if fin else coord.now
         if phase == "upd" and _stepping[0] is not None:
             return coord.now + _stepping[0].ctx.last_step_ns
         return coord.now
@@ -547,7 +552,11 @@ class Coordinator:
                     self._push(at, ARRIVAL, "wake", eng)
                 return
             t0 = time.perf_counter()
-            outputs, executed = eng.core.step_fn()
+            _async_stepping[0] = eng
+            try:
+                outputs, executed = eng.core.step_fn()
+            finally:
+                _async_stepping[0] = None
             progressed = progressed or executed or eng.ctx.last_delivered
             eng.sched_cpu_s += time.perf_counter() - t0
             eng.steps += 1

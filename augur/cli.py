@@ -74,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="write vLLM-scheduler step events (augur.vllm_hooks format) to <path>.<pid>.jsonl")
     p.add_argument("--replay-durations", default=None,
                    help="price step k with the duration recorded in this vLLM step log (see augur.replay)")
+    p.add_argument("--replay-arrivals", default=None,
+                   help="requests reach the engine when this vLLM step log says, steps priced by --cost "
+                        "(separates arrival timing from step pricing)")
     p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
     p.add_argument("--cost", default="fixed", choices=["fixed", "llmservingsim"])
     p.add_argument("--fixed-step-ms", type=float, default=25.0)
@@ -164,9 +167,10 @@ def main(argv: list[str] | None = None) -> int:
         for e in engines:
             e.step_log = []
     from augur.engine import PDLink
-    if a.replay_durations:
+    if a.replay_durations or a.replay_arrivals:
         from augur.replay import ReplayWorkload
-        workload = ReplayWorkload(a.workload, max_entries=a.num_entries, log_path=a.replay_durations,
+        workload = ReplayWorkload(a.workload, max_entries=a.num_entries,
+                                  log_path=a.replay_durations or a.replay_arrivals,
                                   recorded_outputs=not a.no_recorded_outputs, filler_vocab=a.filler_vocab)
     else:
         workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs,
