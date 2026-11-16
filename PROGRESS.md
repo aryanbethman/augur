@@ -472,8 +472,22 @@ so async scheduling; `max_num_seqs` 128, 2,048-token budget). augur uses the
   moves no metric by more than ~1%): vLLM hides its CPU work behind the
   GPU. It matters for synchronous runs (the 1.5–3 ms per step above).
 - Left: augur's GPU time is ~2% low (throughput +1.9% when saturated), which
-  queueing turns into the TTFT error at the knee. The profile's skew sweep
-  (attention with uneven KV lengths) is the open item.
+  queueing turns into the TTFT error at the knee.
+
+**Why the knee TTFT is off (6 req/s, rerun with the logging scheduler).**
+The real benchmark run replays step for step (778/778; `vllm bench serve`
+request ids now map to the trace). Holding the real engine arrivals fixed
+(`--replay-arrivals`), median TTFT is 1,111 ms with the real step times and
+855 ms with the profile's prices, while every step class is priced within
+~1% (decode −0.5%, mixed −0.9%, total 0.990) and the run ends 0.4 s (0.7%)
+earlier. At the knee a request's TTFT is set by the backlog that built up
+over tens of seconds, so a 1% step-time bias becomes a ~23% median TTFT
+bias. The API server adds load-dependent delay too (engine arrival 29 ms
+past the minimum early in the run, 60–80 ms later; augur's
+`--frontend-latency-ms` is fixed), but that is ~50 ms of the ~250 ms. Two
+identical real runs differed by 8% in median TTFT (1,186 vs 1,289 ms).
+Knee TTFT therefore needs sub-1% step pricing; throughput, TPOT and TTFT
+away from the knee do not.
 
 **Synchronous runs**, augur (profile + `--step-cpu-us 3000`) vs the real
 synchronous runs' client-side results, run normally (not replayed):
