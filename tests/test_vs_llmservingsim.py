@@ -2,10 +2,12 @@
 
 Same workloads, RTX PRO 6000 profiles and KV sizes on both sides; augur with
 ``--lss-loop-compat`` (LLMServingSim's loop timing, not vLLM behaviour) for
-the synchronous cases. The reference CSVs in data/llmservingsim/ are LLMServingSim's own outputs (fork
-branch feature/vllm-sim-20261114, analytical network, synchronous scheduling
-unless noted), with the per-token ITL column dropped. Each case asserts how
-many calls have the identical TTFT, TPOT, latency and end time, to the ns.
+the synchronous cases, and ``--step-cpu-us 0`` (LLMServingSim has no CPU
+term). The reference CSVs in data/llmservingsim/ are LLMServingSim's own
+outputs (fork branch feature/vllm-sim-20261114, analytical network,
+synchronous scheduling unless noted), with the per-token ITL column dropped.
+Each case asserts how many calls have the identical TTFT, TPOT, latency and
+end time, to the ns.
 Where that is not every call, the difference is LLMServingSim's
 (docs/accuracy.md, section 4): its idle loop for 2 engines, its async slot
 release for async.
@@ -87,7 +89,7 @@ def test_matches_llmservingsim(tmp_path, swe_fullids, name, ref, args, identical
     out = tmp_path / f"{name}.csv"
     args = [a.replace("{swe}", swe_fullids) for a in args]
     subprocess.run([sys.executable, "-m", "augur.cli", "--cost", "llmservingsim", "--hardware", "RTXPRO6000",
-                    "--max-num-seqs", "128", "--max-num-batched-tokens", "2048", "--quiet", *args,
+                    "--max-num-seqs", "128", "--max-num-batched-tokens", "2048", "--step-cpu-us", "0", "--quiet", *args,
                     "--output", str(out)],
                    check=True, env=dict(os.environ, VLLM_LOGGING_LEVEL="WARNING"),
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

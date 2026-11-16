@@ -53,10 +53,25 @@ compares with the measured step:
 | SWE-bench sessions, sync | 0.973 | −5.3% / +0.2% / −11.1% |
 | random 1,024/128 at 6 req/s, async | 0.990 | −0.5% / −0.9% / — |
 
-The profile prices GPU work only. A synchronous step also holds vLLM's CPU
-work, about 1.5–3 ms per step here; `--step-cpu-us` adds it. Under async
-scheduling vLLM hides that CPU work behind the previous batch, so it barely
-matters there.
+The profile prices GPU work only, and for GPU work it is about as accurate as
+the hardware is repeatable. On the two async runs with step logs (where the
+measured step is close to pure GPU time) predicted / measured is 1.012 and
+0.986 for decode steps and 0.992 for mixed steps on both: within ~1%, with no
+stable sign to calibrate out. Identical steps within one real run vary by
+about 2.5% (std / median).
+
+Fitting step times directly on logged steps instead (linear models on batch
+size, padded tokens, KV lengths; fitted on one run, scored on another) was
+worse than the profile: held-out totals between 0.56 and 1.15, because a
+workload's steps cover too little of the shape space to identify the terms.
+The layer profile stays.
+
+**vLLM's CPU time.** A synchronous step also holds vLLM's own work (schedule,
+process outputs): 1–3 ms longer than the profile's price at every batch size.
+`--step-cpu-us` adds it, default 2,000 (the best end-to-end fit on both sync
+workloads below; measured with vLLM 0.33 on an i7-12700, and it will differ on
+other host CPUs). Under async scheduling vLLM hides this work behind the
+previous batch, and results do not move with it.
 
 ## 3. End to end
 
@@ -67,16 +82,22 @@ server:
 
 | Rate | Throughput | Mean TTFT | Median TTFT | Mean TPOT |
 | --- | --- | --- | --- | --- |
-| 2 req/s (light) | +0.1% | −11.8% (−1.0% with `--frontend-latency-ms 15`) | −12.2% (−0.2%) | −1.9% |
-| 6 req/s (knee) | +0.7% | −10.8% | −26.7% | −1.1% |
-| 12 req/s (overloaded) | +2.0% | −3.6% | −2.8% | −2.1% |
+| 2 req/s (light) | +0.1% | −11.7% (−0.8% with `--frontend-latency-ms 15`) | −12.5% (−0.5%) | −1.9% |
+| 6 req/s (knee) | +0.8% | −12.0% | −29.2% | −1.4% |
+| 12 req/s (overloaded) | +2.0% | −3.5% | −2.8% | −2.1% |
 
-ShareGPT 300, the same trace replayed against the real server, augur run
-normally (not replayed): sync, mean TTFT / TPOT / latency −3.3 / −3.4 / −3.3%
-(+2.1 / +1.4 / +1.8% with `--step-cpu-us 3000`, which now overshoots;
-~1.5–2 ms fits); async +1.7 / +1.1 / +1.4%. Per-request median errors
-1–3%. SWE-bench sessions, sync: means within 1.6–2.9%, per-call medians 7–9%
-(sessions compound small timing differences).
+The same traces replayed against the real server, augur run normally (not
+replayed), mean TTFT / TPOT / latency:
+
+| Run | Error | Median per-call error (absolute) |
+| --- | --- | --- |
+| ShareGPT 300, sync | +0.2 / −0.2 / 0.0% | 0.6 / 0.9 / 0.4% |
+| SWE-bench sessions (765 calls), sync | +0.5 / +0.2 / 0.0% | 7.2 / 5.9 / 4.6% |
+| ShareGPT 300, async | +1.7 / +1.1 / +1.4% | 2.4 / 1.2 / 1.5% |
+
+Without the CPU term (`--step-cpu-us 0`) the sync rows are −3.3 / −3.4 / −3.3%
+and −4.4 / −2.9 / −3.8%. SWE-bench's per-call errors stay larger because
+sessions compound small timing differences.
 
 **Light load TTFT** is mostly the API server (HTTP, tokenizing the prompt),
 which augur does not simulate; `--frontend-latency-ms` adds a fixed delay.
@@ -87,8 +108,12 @@ ms later).
 (`--replay-arrivals`), median TTFT is 1,111 ms with the real step times and
 855 ms with the profile's, although every step class is priced within ~1%. At
 the knee a request's TTFT is set by a backlog built over tens of seconds, so
-a 1% step bias becomes a ~23% median TTFT bias. Two identical real runs
-differed by 8% in median TTFT. Getting this right needs sub-1% step pricing.
+a 1% step difference becomes a ~23% median TTFT difference. Two identical
+real runs differed by 8% in median TTFT, and augur's own result moves by a few
+points with changes that should not matter (−26.7% to −30.6% across CPU-term
+values that leave every other metric alone). A point estimate here is not
+meaningful, from augur or from one real run; step pricing is already at the
+hardware's repeatability (section 2).
 
 ## 4. Against LLMServingSim
 
@@ -96,20 +121,23 @@ differed by 8% in median TTFT. Getting this right needs sub-1% step pricing.
 
 | Run | Metric | LLMServingSim | augur |
 | --- | --- | --- | --- |
-| ShareGPT 300, sync | mean TTFT / TPOT / latency | −3.3 / −3.4 / −3.4% | −3.3 / −3.4 / −3.3% |
+| ShareGPT 300, sync | mean TTFT / TPOT / latency | −3.3 / −3.4 / −3.4% | +0.2 / −0.2 / 0.0% (−3.3 / −3.4 / −3.3% without the CPU term) |
 | ShareGPT 300, async | mean TTFT / TPOT / latency | +1.4 / +0.9 / +1.2% | +1.7 / +1.1 / +1.4% |
-| random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −11.8 / −1.9% |
-| random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −10.8 / −26.7%, −1.1% |
-| random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.6%, −2.1%, +2.0% |
+| random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −11.7 / −1.9% |
+| random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −12.0 / −29.2%, −1.4% |
+| random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.5%, −2.1%, +2.0% |
 
-On aggregates the two are equally close. LLMServingSim's async runs come out
-~1% slower than augur's, which offsets the profile's ~1% low bias at 6–12
-req/s (cause not yet known). Its scheduler is its own reimplementation;
-augur's decisions are vLLM's (section 1).
+On sync runs augur is closer: LLMServingSim has no term for vLLM's CPU time.
+On async runs the two are equally close. LLMServingSim's async runs come out
+~1% slower than augur's (cause not yet known); the real 6 and 12 req/s runs
+were also ~1% slower than the profile, so it lands closer there, and further
+on async ShareGPT, where the real run was faster than the profile. Its
+scheduler is its own reimplementation; augur's decisions are vLLM's
+(section 1).
 
-**Same simulated hardware, scheduler only** (`tests/test_vs_llmservingsim.py`, RTX PRO
-6000 profiles; `--lss-loop-compat` reproduces LLMServingSim's loop timing,
-which is not vLLM behaviour). Calls with identical TTFT, TPOT, latency and end
+**Same simulated hardware, scheduler only** (`tests/test_vs_llmservingsim.py`,
+RTX PRO 6000 profiles; `--lss-loop-compat` reproduces LLMServingSim's loop
+timing, which is not vLLM behaviour; `--step-cpu-us 0`). Calls with identical TTFT, TPOT, latency and end
 time, to the ns:
 
 | Case | Identical calls |

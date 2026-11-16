@@ -61,8 +61,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--frontend-latency-ms", type=float, default=0.0,
                    help="API-server time before a request reaches the engine (HTTP, tokenization); "
                         "counted in TTFT and latency")
-    p.add_argument("--step-cpu-us", type=float, default=0.0,
-                   help="vLLM's fixed per-step CPU time not in GPU profiles (sync: added; async: delays launch)")
+    p.add_argument("--step-cpu-us", type=float, default=2000.0,
+                   help="vLLM's per-step CPU time, which GPU profiles do not hold (sync: added to the step; "
+                        "async: delays the launch, hidden behind the previous batch). Default measured with "
+                        "vLLM 0.33 on an i7-12700; 0 for GPU time only. Ignored with --replay-durations")
     p.add_argument("--step-cpu-per-request-us", type=float, default=0.0,
                    help="vLLM's per-step CPU time per scheduled request")
     p.add_argument("--filler-vocab", type=int, default=None,
@@ -160,9 +162,10 @@ def main(argv: list[str] | None = None) -> int:
         engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), cost) for i, r in enumerate(roles)]
     else:
         engines = [SimEngine(i, spec, cost) for i in range(a.engines)]
-    for e in engines:
-        e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
-        e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
+    if not a.replay_durations:  # a logged step's duration already holds its CPU time
+        for e in engines:
+            e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
+            e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
     if a.step_log:
         for e in engines:
             e.step_log = []
