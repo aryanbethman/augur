@@ -115,6 +115,20 @@ values that leave every other metric alone). A point estimate here is not
 meaningful, from augur or from one real run; step pricing is already at the
 hardware's repeatability (section 2).
 
+So `augur bench` reports a range: it reruns the trace with step times at −1%
+and +1% (`--sensitivity`, default 1; the profile's accuracy) and prints how
+far each metric moves. On this benchmark:
+
+| Rate | Median TTFT at −1% / 0 / +1% | Spread | Real runs |
+| --- | --- | --- | --- |
+| 2 req/s | 108 / 109 / 111 ms | 2.0% | 125 ms |
+| 6 req/s (knee) | 735 / 913 / 1,293 ms | 61% | 1,289 and 1,186 ms |
+| 12 req/s | 9,533 / 9,763 / 9,887 ms | 3.6% | 10,043 ms |
+
+A large spread marks an operating point where no single number, simulated or
+measured, is reliable. At 2 req/s the gap to the real run is the API server,
+not step time.
+
 ## 4. Against LLMServingSim
 
 **Same real runs, same profile and KV size** (error vs real vLLM):

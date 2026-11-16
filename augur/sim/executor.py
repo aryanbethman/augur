@@ -84,6 +84,7 @@ class SimContext:
     cpu_fixed_ns: int = 0
     cpu_per_request_ns: int = 0
     last_cpu_ns: int = 0
+    step_time_scale: float = 1.0  # multiplies the cost model's GPU time, not the CPU time
 
 
 @dataclass
@@ -274,6 +275,8 @@ class SimWorker:
             shape = StepShape(seqs=tuple(seqs), padded_tokens=desc.num_tokens)
             self.ctx.last_shape = shape
             gpu = self.ctx.cost.step_ns(shape) if seqs else 0
+            if self.ctx.step_time_scale != 1.0:
+                gpu = round(gpu * self.ctx.step_time_scale)
             cpu = (self.ctx.cpu_fixed_ns + self.ctx.cpu_per_request_ns * len(seqs)) if seqs else 0
             self.ctx.last_cpu_ns = cpu
             self.ctx.last_step_ns = gpu + cpu if not self.ctx.async_cpu else gpu

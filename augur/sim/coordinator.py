@@ -377,6 +377,7 @@ class Coordinator:
             else:
                 final.append(StepShape(seqs=s.seqs, padded_tokens=p))
         per_rank = g[0].ctx.cost.round_ns(final, first_rank=first_rank)
+        per_rank = self._scaled(g, per_rank)
         self.dp_rounds += 1
         for e, sh, ns in zip(g, final, per_rank):
             if e.step_log is not None:
@@ -385,6 +386,11 @@ class Coordinator:
         for e, outputs, ns in zip(g, outs, per_rank):
             e.busy = True
             self._push(self.now + ns, STEP_DONE, "step_done", (e, outputs))
+
+    @staticmethod
+    def _scaled(g, per_rank):
+        f = g[0].ctx.step_time_scale
+        return per_rank if f == 1.0 else [round(ns * f) for ns in per_rank]
 
     def _after_step(self, eng: SimEngine) -> None:
         self._start_transfers(eng)
@@ -525,6 +531,7 @@ class Coordinator:
             else:
                 final.append(StepShape(seqs=s.seqs, padded_tokens=p))
         per_rank = g[0].ctx.cost.round_ns(final)
+        per_rank = self._scaled(g, per_rank)
         self.dp_rounds += 1
         self._dpa_running = x
         self._dpa_left = {e.engine_id for e in g}

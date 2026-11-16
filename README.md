@@ -22,6 +22,10 @@ Requests and arrival times are sampled with vLLM's own benchmark code (same
 seed, same requests), and the report is vLLM's `calculate_metrics`. Any augur
 engine flag passes through. Outputs always run to their requested length.
 
+After the report it prints how far each metric moves when step times change by
+±1% (`--sensitivity`, 0 to turn off). Near saturation TTFT can move by tens of
+percent, on real hardware too; read it as a range there.
+
 For the LLMServingSim fork's traces (ShareGPT, SWE-bench agent sessions,
 scaled sessions), run augur directly:
 

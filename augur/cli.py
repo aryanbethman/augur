@@ -65,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="vLLM's per-step CPU time, which GPU profiles do not hold (sync: added to the step; "
                         "async: delays the launch, hidden behind the previous batch). Default measured with "
                         "vLLM 0.33 on an i7-12700; 0 for GPU time only. Ignored with --replay-durations")
+    p.add_argument("--step-time-scale", type=float, default=1.0,
+                   help="multiply every GPU step time from the cost model by this (sensitivity runs: 0.99, 1.01); "
+                        "not the CPU term, KV transfers or front-end latency. Ignored with --replay-durations")
     p.add_argument("--step-cpu-per-request-us", type=float, default=0.0,
                    help="vLLM's per-step CPU time per scheduled request")
     p.add_argument("--filler-vocab", type=int, default=None,
@@ -166,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         for e in engines:
             e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
             e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
+            e.ctx.step_time_scale = a.step_time_scale
     if a.step_log:
         for e in engines:
             e.step_log = []

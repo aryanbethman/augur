@@ -14,6 +14,10 @@ server, it runs them through augur (any augur engine flag, e.g. --hardware,
 
 Outputs run to the requested length (as with --ignore-eos): augur generates
 no text, so it cannot know where a model would stop.
+
+The same trace is also run with step times scaled by 1 -/+ --sensitivity percent
+and the spread of each metric is printed, since near saturation a 1% change in
+step time can move TTFT by tens of percent.
 """
 
 from __future__ import annotations
@@ -57,44 +61,20 @@ def _arrival_offsets(requests, args) -> list[float]:
     return offsets
 
 
-def main(argv=None) -> int:
-    from vllm.benchmarks import serve
-    from vllm.benchmarks.datasets.datasets import get_samples
-    from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
-    from vllm.tokenizers import get_tokenizer
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-    p = FlexibleArgumentParser(prog="augur bench", description=__doc__,
-                               formatter_class=argparse.RawDescriptionHelpFormatter)
-    serve.add_cli_args(p)
-    args, augur_args = p.parse_known_args(argv)
-    if not args.ignore_eos:
-        print("augur bench: outputs always run to their requested length (as with --ignore-eos)", file=sys.stderr)
-
-    tokenizer = get_tokenizer(args.tokenizer or args.model, trust_remote_code=args.trust_remote_code)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    requests = get_samples(args, tokenizer)
-    offsets = _arrival_offsets(requests, args)
-
-    work = tempfile.mkdtemp(prefix="augur-bench-")
-    trace = os.path.join(work, "requests.jsonl")
-    with open(trace, "w") as f:
-        for r, t in zip(requests, offsets):
-            ids = r.prompt if isinstance(r.prompt, list) and r.prompt and isinstance(r.prompt[0], int) \
-                else tokenizer(r.prompt).input_ids
-            f.write(json.dumps({"input_toks": len(ids), "output_toks": r.expected_output_len,
-                                "arrival_time_ns": int(t * 1e9), "input_tok_ids": ids}) + "\n")
-
-    from augur.cli import main as augur_main
-    if "--cost" not in augur_args:
-        augur_args = ["--cost", "llmservingsim"] + augur_args
-    out_csv = os.path.join(work, "calls.csv")
-    t0 = time.perf_counter()
+def _run(args, augur_args, trace, requests, offsets, tokenizer, scale):
+    """One augur run of the trace: (metrics, end time s, wall s), or an int exit code."""
     import contextlib
     import io
+
+    from vllm.benchmarks import serve
+    from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
+
+    from augur.cli import main as augur_main
+    out_csv = trace[:-len(".jsonl")] + f"-{scale}.csv"
+    t0 = time.perf_counter()
     with contextlib.redirect_stdout(io.StringIO()):  # augur's own summary; vLLM's report follows
-        rc = augur_main(["--model", args.model, "--workload", trace, "--output", out_csv, "--quiet"] + augur_args)
+        rc = augur_main(["--model", args.model, "--workload", trace, "--output", out_csv, "--quiet",
+                         "--step-time-scale", repr(scale)] + augur_args)
     wall = time.perf_counter() - t0
     if rc:
         return rc
@@ -116,6 +96,69 @@ def main(argv=None) -> int:
     selected = [float(x) for x in args.metric_percentiles.split(",")]
     goodput = serve.check_goodput_args(args)
     metrics, _ = serve.calculate_metrics(requests, outputs, end, tokenizer, selected, goodput)
+    return metrics, end, wall
+
+
+def _sens_values(m) -> dict:
+    v = {"request_throughput": m.request_throughput, "mean_ttft_ms": m.mean_ttft_ms,
+         "median_ttft_ms": m.median_ttft_ms}
+    v.update({f"p{pct:g}_ttft_ms": x for pct, x in m.percentiles_ttft_ms if pct == 99})
+    v.update({"mean_tpot_ms": m.mean_tpot_ms, "median_tpot_ms": m.median_tpot_ms, "mean_e2el_ms": m.mean_e2el_ms})
+    return v
+
+
+_SENS_NAMES = {"request_throughput": "Request throughput (req/s)", "mean_ttft_ms": "Mean TTFT (ms)",
+               "median_ttft_ms": "Median TTFT (ms)", "p99_ttft_ms": "P99 TTFT (ms)",
+               "mean_tpot_ms": "Mean TPOT (ms)", "median_tpot_ms": "Median TPOT (ms)",
+               "mean_e2el_ms": "Mean E2EL (ms)"}
+
+
+def main(argv=None) -> int:
+    from vllm.benchmarks import serve
+    from vllm.benchmarks.datasets.datasets import get_samples
+    from vllm.tokenizers import get_tokenizer
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    p = FlexibleArgumentParser(prog="augur bench", description=__doc__,
+                               formatter_class=argparse.RawDescriptionHelpFormatter)
+    serve.add_cli_args(p)
+    p.add_argument("--sensitivity", type=float, default=1.0,
+                   help="also run with step times scaled by 1 -/+ this many percent and print how much each "
+                        "metric moves (3 runs); 0 disables")
+    p.add_argument("--step-time-scale", type=float, default=1.0,
+                   help="augur's --step-time-scale: multiplies every GPU step time (applied to all sensitivity runs)")
+    args, augur_args = p.parse_known_args(argv)
+    if not args.ignore_eos:
+        print("augur bench: outputs always run to their requested length (as with --ignore-eos)", file=sys.stderr)
+
+    tokenizer = get_tokenizer(args.tokenizer or args.model, trust_remote_code=args.trust_remote_code)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    requests = get_samples(args, tokenizer)
+    offsets = _arrival_offsets(requests, args)
+
+    work = tempfile.mkdtemp(prefix="augur-bench-")
+    trace = os.path.join(work, "requests.jsonl")
+    with open(trace, "w") as f:
+        for r, t in zip(requests, offsets):
+            ids = r.prompt if isinstance(r.prompt, list) and r.prompt and isinstance(r.prompt[0], int) \
+                else tokenizer(r.prompt).input_ids
+            f.write(json.dumps({"input_toks": len(ids), "output_toks": r.expected_output_len,
+                                "arrival_time_ns": int(t * 1e9), "input_tok_ids": ids}) + "\n")
+
+    if "--cost" not in augur_args:
+        augur_args = ["--cost", "llmservingsim"] + augur_args
+    base = args.step_time_scale
+    f = args.sensitivity / 100
+    scales = [base * (1 - f), base, base * (1 + f)] if f > 0 else [base]
+    runs = []
+    for sc in scales:
+        r = _run(args, augur_args, trace, requests, offsets, tokenizer, sc)
+        if isinstance(r, int):
+            return r
+        runs.append(r)
+    metrics, end, _ = runs[len(runs) // 2]
+    wall = sum(r[2] for r in runs)
 
     print("{s:{c}^60}".format(s=" augur Benchmark Result ", c="="))
     rows = [("Successful requests:", metrics.completed), ("Benchmark duration (s):", f"{end:.2f}"),
@@ -133,10 +176,30 @@ def main(argv=None) -> int:
     print("{:<40} {:<10}".format("augur wall time (s):", f"{wall:.2f}"))
     print("=" * 60)
 
+    sens = None
+    if f > 0:
+        vals = [_sens_values(r[0]) for r in runs]
+        spread = {k: 100 * (max(v[k] for v in vals) - min(v[k] for v in vals)) / vals[1][k] if vals[1][k] else 0.0
+                  for k in vals[1]}
+        print(f"\nSensitivity to step time +-{args.sensitivity:g}%")
+        print("{:<28} {:>12} {:>12} {:>12} {:>9}".format("", f"x{scales[0]:.4g}", f"x{scales[1]:.4g}",
+                                                       f"x{scales[2]:.4g}", "spread"))
+        for k in vals[1]:
+            print("{:<28} {:>12.2f} {:>12.2f} {:>12.2f} {:>8.1f}%".format(
+                _SENS_NAMES[k], vals[0][k], vals[1][k], vals[2][k], spread[k]))
+        worst = max((spread[k] for k in spread if "ttft" in k), default=0.0)
+        if worst > 10:
+            print(f"TTFT moves by up to {worst:.0f}% for a +-{args.sensitivity:g}% change in step time: the system "
+                  "is near saturation, so read TTFT as a range, not a single number.")
+        sens = {"percent": args.sensitivity,
+                "runs": [{"step_time_scale": sc, **v} for sc, v in zip(scales, vals)]}
+
     if args.save_result:
         result = {"backend": "augur", "model_id": args.model, "num_prompts": args.num_prompts,
                   "request_rate": args.request_rate, "burstiness": args.burstiness, "duration": end,
                   "augur_wall_s": wall, "augur_args": augur_args}
+        if sens:
+            result["sensitivity"] = sens
         result.update({k: v for k, v in vars(metrics).items() if not k.startswith("_")})
         name = args.result_filename or f"augur-{args.request_rate}qps-{os.path.basename(args.model)}.json"
         path = os.path.join(args.result_dir or ".", name)
