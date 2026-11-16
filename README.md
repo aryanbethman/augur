@@ -55,7 +55,7 @@ Results so far are in `PROGRESS.md`.
 | `augur/engine.py` | `SimEngine` (an unmodified `EngineCore`) and the `Coordinator` (event queue, virtual clock, routing, PD proxy, DP rounds) |
 | `augur/lss_cost.py`, `augur/astra_oracle.py` | Step prices from LLMServingSim profiles; collectives and DP rounds through ASTRA-Sim |
 | `augur/nixl_sim.py` | vLLM's NIXL connector with its network handshake off |
-| `augur/workload.py`, `augur/router.py`, `augur/metrics.py`, `augur/models.py` | Traces, routers, per-call CSV, model configs |
+| `augur/workload.py`, `augur/router.py`, `augur/metrics.py`, `augur/models.py`, `augur/profiles.py` | Traces, routers, per-call CSV, model configs, available profiles |
 | `augur/bench.py`, `augur/client.py`, `augur/replay.py`, `augur/stepcheck.py`, `augur/vllm_hooks.py`, `augur/compare.py` | Front end and verification tools above |
 
 ## Setup
@@ -67,4 +67,5 @@ uv pip install --python .venv/bin/python -e ".[llmservingsim]"
 
 Profiles, model configs and ASTRA-Sim come from the LLMServingSim fork
 checkout (`--fork` or `AUGUR_FORK`; default `~/llmss-vllm-sim-20261114`).
+`python -m augur.profiles` lists the GPU / model / TP profiles it holds.
 `--model-config` takes any HF `config.json` instead of the fork's.
