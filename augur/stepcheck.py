@@ -1,7 +1,7 @@
 """How well does augur price real vLLM steps?
 
 Rebuilds every step of a real run from its step log (augur.vllm_hooks,
-synchronous scheduling): which requests ran, how many tokens each, and how
+synchronous or async scheduling): which requests ran, how many tokens each, and how
 many tokens each already had in the KV cache. Pads it with vLLM's own CUDA-graph
 dispatcher (same engine settings) and prices it with augur's cost model. The
 measured duration is the step's schedule start to its update end, so it
@@ -27,11 +27,13 @@ from augur.replay import is_async, read_log, steps
 
 
 def real_steps(events):
-    """[(shape without padding, measured ns)] for a synchronous step log."""
-    if is_async(events):
-        raise SystemExit("stepcheck needs a synchronous run (async step times overlap)")
+    """[(shape without padding, measured ns)] for a step log."""
+    # Async runs overlap scheduling with the GPU: a batch runs from when it was
+    # scheduled or the previous batch finished, whichever is later, to its update.
+    async_run = is_async(events)
     computed: dict[str, int] = {}
     out = []
+    prev_finish = None
     for s, u in steps(events):
         seqs = []
         for rid, n in s["tok"].items():
@@ -42,7 +44,9 @@ def real_steps(events):
             computed[rid] = before + n
         for rid in s["pre"]:
             computed[rid] = 0
-        out.append((StepShape(seqs=tuple(seqs)), u["t"] - s["t"]))
+        start = max(s["t"], prev_finish) if async_run and prev_finish is not None else s["t"]
+        prev_finish = u["t"]
+        out.append((StepShape(seqs=tuple(seqs)), u["t"] - start))
     return out
 
 
