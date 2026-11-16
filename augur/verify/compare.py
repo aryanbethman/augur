@@ -7,7 +7,7 @@ which can differ between simulators once timing differs, so sessions are
 matched on (arrival order of the session, call index) when both files carry
 the extra columns, else by id.
 
-Usage: python -m augur.compare A.csv B.csv
+Usage: python -m augur.verify.compare A.csv B.csv
 """
 
 from __future__ import annotations

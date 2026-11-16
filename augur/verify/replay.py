@@ -1,13 +1,13 @@
 """Replay a recorded vLLM run through augur, and compare scheduling decisions.
 
-A step log (augur.vllm_hooks format) from real vLLM, or from augur itself,
+A step log (augur.verify.hooks format) from real vLLM, or from augur itself,
 fixes everything except vLLM's scheduler: when each request reached the
 engine, and how long each step took. Replaying it through augur with those
 arrival times and step durations must reproduce the log's decisions step for
 step, since the scheduler is the same code. A mismatch is a bug in what augur
 wraps around vLLM (executor, coordinator), not in timing.
 
-    python -m augur.replay compare A.jsonl B.jsonl
+    python -m augur.verify.replay compare A.jsonl B.jsonl
     augur ... --workload trace.jsonl --replay-durations run.<pid>.jsonl --step-log-vllm out/replayed
 """
 
@@ -18,8 +18,7 @@ import sys
 from dataclasses import dataclass, field
 
 from augur.cost import StepShape
-from augur.vllm_hooks import call_id
-from augur.workload import Call, Session, Workload
+from augur.trace.workload import Call, Session, Workload, call_id
 
 
 def read_log(path: str) -> list[dict]:

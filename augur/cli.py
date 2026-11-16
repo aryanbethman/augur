@@ -4,19 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
 
-from augur.profiles import default_fork
+from augur.cost.profiles import default_fork
 
 
 def _scheduler_cls(a) -> str | None:
     if not a.step_log_vllm:
         return None
     os.environ["AUGUR_STEP_LOG"] = a.step_log_vllm
-    return ("augur.vllm_hooks.LoggingAsyncScheduler" if a.async_scheduling
-            else "augur.vllm_hooks.LoggingScheduler")
+    return ("augur.verify.hooks.LoggingAsyncScheduler" if a.async_scheduling
+            else "augur.verify.hooks.LoggingScheduler")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,13 +66,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--step-cpu-per-request-us", type=float, default=0.0,
                    help="vLLM's per-step CPU time per scheduled request")
     p.add_argument("--filler-vocab", type=int, default=None,
-                   help="fill unrecorded prompt tokens with in-vocabulary ids below this (match augur.client runs)")
+                   help="fill unrecorded prompt tokens with in-vocabulary ids below this (match augur.verify.client runs)")
     p.add_argument("--no-recorded-outputs", action="store_true",
                    help="emit unique output ids instead of the trace's recorded outputs (as a real model does)")
     p.add_argument("--step-log-vllm", default=None,
-                   help="write vLLM-scheduler step events (augur.vllm_hooks format) to <path>.<pid>.jsonl")
+                   help="write vLLM-scheduler step events (augur.verify.hooks format) to <path>.<pid>.jsonl")
     p.add_argument("--replay-durations", default=None,
-                   help="price step k with the duration recorded in this vLLM step log (see augur.replay)")
+                   help="price step k with the duration recorded in this vLLM step log (see augur.verify.replay)")
     p.add_argument("--replay-arrivals", default=None,
                    help="requests reach the engine when this vLLM step log says, steps priced by --cost "
                         "(separates arrival timing from step pricing)")
@@ -97,16 +96,17 @@ def main(argv: list[str] | None = None) -> int:
     if a.quiet:
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
     from augur.cost import FixedCost
-    from augur.engine import Coordinator, EngineSpec, SimEngine
-    from augur.models import estimate_weight_bytes, model_dir
-    from augur.router import ROUTERS
-    from augur.workload import Workload
+    from augur.sim.coordinator import Coordinator
+    from augur.sim.engine import EngineSpec, SimEngine
+    from augur.sim.models import estimate_weight_bytes, model_dir
+    from augur.sim.router import ROUTERS
+    from augur.trace.workload import Workload
 
     cache_root = os.path.expanduser("~/.cache/augur/models")
     try:
         mdir = model_dir(a.fork, a.model, cache_root, a.model_config)
         if a.cost == "llmservingsim" and not a.replay_durations:
-            from augur.profiles import check
+            from augur.cost.profiles import check
             check(a.fork, a.hardware, a.model, a.tp)
     except FileNotFoundError as e:
         print(f"augur: {e}", file=sys.stderr)
@@ -122,12 +122,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if a.replay_durations:
-        from augur.replay import ReplayCost
+        from augur.verify.replay import ReplayCost
         cost = ReplayCost.from_log(a.replay_durations)
     elif a.cost == "fixed":
         cost = FixedCost(base_ns=int(a.fixed_step_ms * 1e6), per_token_ns=int(a.fixed_per_token_us * 1e3))
     else:
-        from augur.lss_cost import LLMServingSimCost
+        from augur.cost.llmservingsim import LLMServingSimCost
         cost = LLMServingSimCost(fork_root=a.fork, hardware=a.hardware, model=a.model, tp=a.tp,
                                  max_num_batched_tokens=a.max_num_batched_tokens or 2048,
                                  cpu_mem_bw_gbps=a.cpu_mem_bw, cpu_mem_latency_ns=a.cpu_mem_latency_ns,
@@ -166,9 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     if a.step_log:
         for e in engines:
             e.step_log = []
-    from augur.engine import PDLink
+    from augur.sim.coordinator import PDLink
     if a.replay_durations or a.replay_arrivals:
-        from augur.replay import ReplayWorkload
+        from augur.verify.replay import ReplayWorkload
         workload = ReplayWorkload(a.workload, max_entries=a.num_entries,
                                   log_path=a.replay_durations or a.replay_arrivals,
                                   recorded_outputs=not a.no_recorded_outputs, filler_vocab=a.filler_vocab)
@@ -181,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
                         frontend_latency_ns=int(a.frontend_latency_ms * 1e6))
     if a.step_log_vllm:
-        from augur.engine import install_step_log_clock
+        from augur.sim.coordinator import install_step_log_clock
         install_step_log_clock(coord)
     rec = coord.run()
     if a.output:

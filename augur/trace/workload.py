@@ -22,6 +22,7 @@ from __future__ import annotations
 import itertools
 import json
 import random
+import re
 import zlib
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -132,3 +133,20 @@ class Workload:
         s.next_index += 1
         return self.make_call(s.sub_requests[i], call_id=f"{s.session_id}#{i}", session_id=s.session_id,
                               index=i, arrival_ns=arrival_ns)
+
+
+_BENCH_RID = re.compile(r"^(?:cmpl-)?bench-[0-9a-f]{8}-(\d+)-")
+
+
+def call_id(rid: str) -> str:
+    """The workload call id inside a request id.
+
+    augur's trace client sends ``augur.<call_id>.``, which real vLLM wraps as
+    ``cmpl-augur.<call_id>.-0`` (plus any internal suffix). Inside augur the
+    request id is the call id, with ``@p`` / ``@d`` for PD halves."""
+    if "augur." in rid:
+        return rid.split("augur.", 1)[1].split(".", 1)[0]
+    m = _BENCH_RID.match(rid)
+    if m:  # `vllm bench serve`: request i of the benchmark is augur's req_<i>
+        return f"req_{m.group(1)}"
+    return rid.split("@", 1)[0]

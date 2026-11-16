@@ -1,6 +1,6 @@
 """How well does augur price real vLLM steps?
 
-Rebuilds every step of a real run from its step log (augur.vllm_hooks,
+Rebuilds every step of a real run from its step log (augur.verify.hooks,
 synchronous or async scheduling): which requests ran, how many tokens each, and how
 many tokens each already had in the KV cache. Pads it with vLLM's own CUDA-graph
 dispatcher (same engine settings) and prices it with augur's cost model. The
@@ -8,7 +8,7 @@ measured duration is the step's schedule start to its update end, so it
 includes vLLM's per-step CPU work; the profile prices GPU work only. The
 difference is reported per step class and as a fit against batch size.
 
-    python -m augur.stepcheck out/real/run/steps.<pid>.jsonl --model Qwen/Qwen3-1.7B \\
+    python -m augur.verify.stepcheck out/real/run/steps.<pid>.jsonl --model Qwen/Qwen3-1.7B \\
         --hardware RTX4060Ti --max-num-seqs 128 --max-num-batched-tokens 2048 --max-model-len 8192
 """
 
@@ -22,8 +22,8 @@ import sys
 import numpy as np
 
 from augur.cost import SeqWork, StepShape
-from augur.profiles import default_fork
-from augur.replay import is_async, read_log, steps
+from augur.cost.profiles import default_fork
+from augur.verify.replay import is_async, read_log, steps
 
 
 def real_steps(events):
@@ -57,7 +57,7 @@ def classify(shape: StepShape) -> str:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="augur.stepcheck")
+    p = argparse.ArgumentParser(prog="augur.verify.stepcheck")
     p.add_argument("log")
     p.add_argument("--fork", default=default_fork())
     p.add_argument("--model", required=True)
@@ -68,9 +68,9 @@ def main(argv=None) -> int:
     p.add_argument("--csv", default=None, help="per-step rows: class, tokens, seqs, padded, measured, predicted")
     a = p.parse_args(argv)
 
-    from augur.engine import EngineSpec, SimEngine
-    from augur.lss_cost import LLMServingSimCost
-    from augur.models import model_dir
+    from augur.sim.engine import EngineSpec, SimEngine
+    from augur.cost.llmservingsim import LLMServingSimCost
+    from augur.sim.models import model_dir
     from vllm.config import CUDAGraphMode
 
     mdir = model_dir(a.fork, a.model, os.path.expanduser("~/.cache/augur/models"))

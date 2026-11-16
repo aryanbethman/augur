@@ -2,8 +2,8 @@
 
 Plug in with vLLM's ``scheduler_cls`` (``--scheduler-cls`` on ``vllm serve``):
 
-    augur.vllm_hooks.LoggingScheduler        (synchronous scheduling)
-    augur.vllm_hooks.LoggingAsyncScheduler   (async scheduling, vLLM's default)
+    augur.verify.hooks.LoggingScheduler        (synchronous scheduling)
+    augur.verify.hooks.LoggingAsyncScheduler   (async scheduling, vLLM's default)
 
 These subclass vLLM's Scheduler / AsyncScheduler and only observe: every
 decision is still vLLM's. Set ``AUGUR_STEP_LOG=<path>``; each process writes
@@ -25,7 +25,6 @@ from __future__ import annotations
 import atexit
 import json
 import os
-import re
 import time
 from typing import Callable
 
@@ -113,20 +112,3 @@ class LoggingScheduler(_LoggingMixin, Scheduler):
 
 class LoggingAsyncScheduler(_LoggingMixin, AsyncScheduler):
     pass
-
-
-_BENCH_RID = re.compile(r"^(?:cmpl-)?bench-[0-9a-f]{8}-(\d+)-")
-
-
-def call_id(rid: str) -> str:
-    """The workload call id inside a request id.
-
-    augur's trace client sends ``augur.<call_id>.``, which real vLLM wraps as
-    ``cmpl-augur.<call_id>.-0`` (plus any internal suffix). Inside augur the
-    request id is the call id, with ``@p`` / ``@d`` for PD halves."""
-    if "augur." in rid:
-        return rid.split("augur.", 1)[1].split(".", 1)[0]
-    m = _BENCH_RID.match(rid)
-    if m:  # `vllm bench serve`: request i of the benchmark is augur's req_<i>
-        return f"req_{m.group(1)}"
-    return rid.split("@", 1)[0]

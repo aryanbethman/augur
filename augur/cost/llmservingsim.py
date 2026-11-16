@@ -35,7 +35,7 @@ class LLMServingSimCost:
                  cpu_mem_bw_gbps: float = 256.0, cpu_mem_latency_ns: int = 0,
                  cluster_config: str | None = None, dp: int = 1):
         self.fork_root = os.path.abspath(fork_root)
-        from augur.profiles import check
+        from augur.cost.profiles import check
         check(self.fork_root, hardware, model, tp)
         if self.fork_root not in sys.path:
             sys.path.insert(0, self.fork_root)
@@ -71,7 +71,7 @@ class LLMServingSimCost:
         if tp > 1 or ep > 1 or dp > 1:
             if cluster_config is None:
                 raise ValueError("tp/ep/dp > 1 needs an LLMServingSim cluster config for ASTRA-Sim (--lss-cluster-config)")
-            from augur.astra_oracle import AstraOracle
+            from augur.cost.astra import AstraOracle
             self.oracle = AstraOracle(self.fork_root, cluster_config)
         self._cache: dict[tuple, int] = {}
         self._batch_id = 0

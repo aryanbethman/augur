@@ -1,4 +1,4 @@
-"""Which GPU profiles exist: ``python -m augur.profiles [--fork DIR]``.
+"""Which GPU profiles exist: ``python -m augur.cost.profiles [--fork DIR]``.
 
 Profiles live in the LLMServingSim fork under
 ``profiler/perf/<hardware>/<org>/<model>/<dtype>/tp<N>/``; each one prices
@@ -45,11 +45,11 @@ def check(fork_root: str, hardware: str, model: str, tp: int) -> None:
     near = [f"  {h} {m} {d} tp{t}" for h, m, d, t in have if h == hardware or m == model] or \
            [f"  {h} {m} {d} tp{t}" for h, m, d, t in have]
     raise FileNotFoundError(f"no profile for {model} on {hardware} at tp{tp}. Available:\n" + "\n".join(near)
-                            + "\n(python -m augur.profiles lists all; the fork's profiler adds new ones)")
+                            + "\n(python -m augur.cost.profiles lists all; the fork's profiler adds new ones)")
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="python -m augur.profiles", description=__doc__.splitlines()[0])
+    p = argparse.ArgumentParser(prog="python -m augur.cost.profiles", description=__doc__.splitlines()[0])
     p.add_argument("--fork", default=default_fork())
     a = p.parse_args(argv)
     rows = available(a.fork)

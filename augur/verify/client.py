@@ -1,9 +1,9 @@
 """Replay an augur/LLMServingSim JSONL trace against a real `vllm serve`.
 
-Prompts are sent as the same token ids augur would use (augur.workload builds
+Prompts are sent as the same token ids augur would use (augur.trace.workload builds
 them), with exact output lengths (`min_tokens = max_tokens`, `ignore_eos`) and
 request ids `augur.<call_id>.`, so a real run lines up with an augur run call
-for call (start the server with `--scheduler-cls augur.vllm_hooks.Logging...`
+for call (start the server with `--scheduler-cls augur.verify.hooks.Logging...`
 and AUGUR_STEP_LOG set to also get its step log). Flat requests are sent at
 their arrival times; a session's next call is sent when the previous one
 finishes plus its recorded tool wait.
@@ -12,7 +12,7 @@ Writes per-call results in augur's CSV format, plus the generated token ids
 (JSONL), which differ from the trace's recorded outputs: the model generates
 its own tokens.
 
-    python -m augur.client --url http://localhost:8000 --model Qwen/Qwen3-1.7B \\
+    python -m augur.verify.client --url http://localhost:8000 --model Qwen/Qwen3-1.7B \\
         --workload trace.jsonl --output out/real.csv
 """
 
@@ -26,8 +26,8 @@ import time
 
 import aiohttp
 
-from augur.metrics import CallRecord, Recorder
-from augur.workload import Call, Session, Workload
+from augur.trace.metrics import CallRecord, Recorder
+from augur.trace.workload import Call, Session, Workload
 
 
 class Client:
@@ -101,7 +101,7 @@ class Client:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="augur.client")
+    p = argparse.ArgumentParser(prog="augur.verify.client")
     p.add_argument("--url", default="http://localhost:8000")
     p.add_argument("--model", required=True, help="served model name")
     p.add_argument("--workload", required=True)

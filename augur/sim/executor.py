@@ -32,7 +32,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 
 from augur.cost import CostModel, SeqWork, StepShape
-from augur.vllm_hooks import call_id
+from augur.trace.workload import call_id
 
 SYNTHETIC_TOKEN = 0  # emitted when the workload recorded no output IDs
 

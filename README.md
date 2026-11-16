@@ -39,33 +39,46 @@ many engines (`--engines`, `--router`), prefill/decode
 
 | Tool | What it does |
 | --- | --- |
-| `augur.vllm_hooks.LoggingScheduler` / `LoggingAsyncScheduler` | vLLM's own schedulers, logging every step (`--scheduler-cls` on `vllm serve`, `AUGUR_STEP_LOG=<path>`) |
-| `augur.client` | Replays a trace against `vllm serve` with the same token-id prompts and exact output lengths |
-| `augur ... --replay-durations <log>` + `python -m augur.replay compare` | Reruns a logged run with its arrival times and step durations; scheduling decisions must match step for step |
-| `augur.stepcheck` | Prices every step of a real run and compares with its measured time |
+| `augur.verify.hooks.LoggingScheduler` / `LoggingAsyncScheduler` | vLLM's own schedulers, logging every step (`--scheduler-cls` on `vllm serve`, `AUGUR_STEP_LOG=<path>`) |
+| `augur.verify.client` | Replays a trace against `vllm serve` with the same token-id prompts and exact output lengths |
+| `augur ... --replay-durations <log>` + `python -m augur.verify.replay compare` | Reruns a logged run with its arrival times and step durations; scheduling decisions must match step for step |
+| `augur.verify.stepcheck` | Prices every step of a real run and compares with its measured time |
 | `scripts/validate.sh` | All comparisons against stored LLMServingSim outputs, plus a replay self-test |
 
-Results so far are in `PROGRESS.md`.
+How close it gets, and how that was measured: [docs/accuracy.md](docs/accuracy.md).
 
 ## Layout
 
-| Module | Role |
-| --- | --- |
-| `augur/executor.py` | `SimExecutor`: vLLM's executor seam with no GPU; KV spec from the model config; emits tokens and asks the cost model for step time |
-| `augur/engine.py` | `SimEngine` (an unmodified `EngineCore`) and the `Coordinator` (event queue, virtual clock, routing, PD proxy, DP rounds) |
-| `augur/lss_cost.py`, `augur/astra_oracle.py` | Step prices from LLMServingSim profiles; collectives and DP rounds through ASTRA-Sim |
-| `augur/nixl_sim.py` | vLLM's NIXL connector with its network handshake off |
-| `augur/workload.py`, `augur/router.py`, `augur/metrics.py`, `augur/models.py`, `augur/profiles.py` | Traces, routers, per-call CSV, model configs, available profiles |
-| `augur/bench.py`, `augur/client.py`, `augur/replay.py`, `augur/stepcheck.py`, `augur/vllm_hooks.py`, `augur/compare.py` | Front end and verification tools above |
+```
+augur/
+  cli.py, bench.py     the `augur` and `augur bench` commands
+  sim/                 the simulator
+    coordinator.py     virtual clock, event queue, routing, PD proxy, DP rounds
+    engine.py          SimEngine: an unmodified vLLM EngineCore
+    executor.py        SimExecutor: vLLM's executor seam with no GPU; asks the cost model for step time
+    router.py          cluster routers
+    nixl.py            vLLM's NIXL connector with its network handshake off
+    models.py          model configs without weights
+  cost/                step pricing (interface in __init__.py)
+    llmservingsim.py   step prices from LLMServingSim profiles
+    astra.py           collectives and DP rounds through ASTRA-Sim
+    profiles.py        which GPU profiles exist
+  trace/               workloads in (fork JSONL), per-call results out (fork CSV)
+  verify/              checking against real vLLM (table above)
+tests/                 pytest; the replay self-tests need the fork
+scripts/validate.sh    scheduler comparison against stored LLMServingSim outputs
+docs/accuracy.md       current accuracy against real vLLM and LLMServingSim
+```
 
 ## Setup
 
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[llmservingsim]"
+.venv/bin/python -m pytest      # tests
 ```
 
 Profiles, model configs and ASTRA-Sim come from the LLMServingSim fork
 checkout (`--fork` or `AUGUR_FORK`; default `~/llmss-vllm-sim-20261114`).
-`python -m augur.profiles` lists the GPU / model / TP profiles it holds.
+`python -m augur.cost.profiles` lists the GPU / model / TP profiles it holds.
 `--model-config` takes any HF `config.json` instead of the fork's.

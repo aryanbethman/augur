@@ -11,9 +11,13 @@ dependencies = ["vllm==0.33.0"]
 
 [project.optional-dependencies]
 llmservingsim = ["pandas", "pyyaml", "scipy"]
+test = ["pytest"]
 
 [project.scripts]
 augur = "augur.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["augur*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
