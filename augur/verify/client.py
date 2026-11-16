@@ -85,7 +85,8 @@ class Client:
 
     async def run(self) -> Recorder:
         timeout = aiohttp.ClientTimeout(total=None)
-        async with aiohttp.ClientSession(timeout=timeout) as http:
+        # No connection cap: aiohttp's default of 100 would queue calls in the client.
+        async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=0)) as http:
             self._t0 = time.monotonic_ns()
             tasks = []
             for e in self.workload.entries():

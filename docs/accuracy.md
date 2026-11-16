@@ -82,27 +82,47 @@ server:
 
 | Rate | Throughput | Mean TTFT | Median TTFT | Mean TPOT |
 | --- | --- | --- | --- | --- |
-| 2 req/s (light) | +0.1% | −11.7% (−0.8% with `--frontend-latency-ms 15`) | −12.5% (−0.5%) | −1.9% |
-| 6 req/s (knee) | +0.8% | −12.0% | −29.2% | −1.4% |
-| 12 req/s (overloaded) | +2.0% | −3.5% | −2.8% | −2.1% |
+| 2 req/s (light) | +0.1% | −1.2% | −0.9% | −1.9% |
+| 6 req/s (knee) | +0.8% | −11.2% | −28.1% | −1.4% |
+| 12 req/s (overloaded) | +2.0% | −3.4% | −2.6% | −2.1% |
 
 The same traces replayed against the real server, augur run normally (not
 replayed), mean TTFT / TPOT / latency:
 
 | Run | Error | Median per-call error (absolute) |
 | --- | --- | --- |
-| ShareGPT 300, sync | +0.2 / −0.2 / 0.0% | 0.6 / 0.9 / 0.4% |
-| SWE-bench sessions (765 calls), sync | +0.5 / +0.2 / 0.0% | 7.2 / 5.9 / 4.6% |
-| ShareGPT 300, async | +1.7 / +1.1 / +1.4% | 2.4 / 1.2 / 1.5% |
+| ShareGPT 300, sync | +0.2 / −0.2 / 0.0% | 0.7 / 0.9 / 0.4% |
+| SWE-bench sessions (765 calls), sync | +0.4 / 0.0 / +0.2% | 7.3 / 5.9 / 4.9% |
+| ShareGPT 300, async | +1.7 / +1.1 / +1.5% | 2.6 / 1.2 / 1.5% |
 
 Without the CPU term (`--step-cpu-us 0`) the sync rows are −3.3 / −3.4 / −3.3%
 and −4.4 / −2.9 / −3.8%. SWE-bench's per-call errors stay larger because
 sessions compound small timing differences.
 
-**Light load TTFT** is mostly the API server (HTTP, tokenizing the prompt),
-which augur does not simulate; `--frontend-latency-ms` adds a fixed delay.
-The real delay grows with load (about 29 ms early in the 6 req/s run, 60–80
-ms later).
+The two ShareGPT runs were made with a trace client that capped itself at 100
+open connections (fixed since), so most of their calls queued in the client
+first; both systems were throughput-bound, and the per-call times still agree.
+
+**The API server and the client.** augur simulates the engine, and adds two
+constants around it, measured on the 6 req/s run by lining up the client's
+send times with the engine's step log (same clock):
+
+- `--frontend-latency-ms`, default 6.5: client send to the engine process
+  (HTTP, tokenization, hand-off). Constant to within about 1 ms for 298 of 300
+  requests.
+- `--delivery-latency-ms`, default 8: engine emits a token to the client
+  having it (output processing, detokenization, streaming, client parse). It
+  does not accumulate: mean client inter-token latency equals the engine's.
+
+The rest of the delay before a request is scheduled, 63 ms on average in that
+run and growing with load, is not the API server: the engine takes new
+requests only between steps. augur's engine loop reproduces that wait.
+Replaying the real run with each request arriving at its client send time
+plus a constant 6 ms, instead of at its logged engine arrival, still gives
+775 of 778 steps with identical decisions (726 with no delay, 549 with 15 ms).
+Without the two constants light-load TTFT reads 12% low (−11.7% mean at 2
+req/s). Both were measured with vLLM 0.33 on an i7-12700 and 1,024-token text
+prompts; other hosts and prompt lengths will differ.
 
 **Knee TTFT** is the hardest metric. With the real engine arrivals held fixed
 (`--replay-arrivals`), median TTFT is 1,111 ms with the real step times and
@@ -110,7 +130,7 @@ ms later).
 the knee a request's TTFT is set by a backlog built over tens of seconds, so
 a 1% step difference becomes a ~23% median TTFT difference. Two identical
 real runs differed by 8% in median TTFT, and augur's own result moves by a few
-points with changes that should not matter (−26.7% to −30.6% across CPU-term
+points with changes that should not matter (−26.7% to −30.6% in an earlier sweep across CPU-term
 values that leave every other metric alone). A point estimate here is not
 meaningful, from augur or from one real run; step pricing is already at the
 hardware's repeatability (section 2).
@@ -121,13 +141,12 @@ far each metric moves. On this benchmark:
 
 | Rate | Median TTFT at −1% / 0 / +1% | Spread | Real runs |
 | --- | --- | --- | --- |
-| 2 req/s | 108 / 109 / 111 ms | 2.0% | 125 ms |
-| 6 req/s (knee) | 735 / 913 / 1,293 ms | 61% | 1,289 and 1,186 ms |
-| 12 req/s | 9,533 / 9,763 / 9,887 ms | 3.6% | 10,043 ms |
+| 2 req/s | 123 / 124 / 125 ms | 1.8% | 125 ms |
+| 6 req/s (knee) | 750 / 927 / 1,308 ms | 60% | 1,289 and 1,186 ms |
+| 12 req/s | 9,547 / 9,778 / 9,902 ms | 3.6% | 10,043 ms |
 
 A large spread marks an operating point where no single number, simulated or
-measured, is reliable. At 2 req/s the gap to the real run is the API server,
-not step time.
+measured, is reliable.
 
 ## 4. Against LLMServingSim
 
@@ -136,13 +155,14 @@ not step time.
 | Run | Metric | LLMServingSim | augur |
 | --- | --- | --- | --- |
 | ShareGPT 300, sync | mean TTFT / TPOT / latency | −3.3 / −3.4 / −3.4% | +0.2 / −0.2 / 0.0% (−3.3 / −3.4 / −3.3% without the CPU term) |
-| ShareGPT 300, async | mean TTFT / TPOT / latency | +1.4 / +0.9 / +1.2% | +1.7 / +1.1 / +1.4% |
-| random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −11.7 / −1.9% |
-| random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −12.0 / −29.2%, −1.4% |
-| random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.5%, −2.1%, +2.0% |
+| ShareGPT 300, async | mean TTFT / TPOT / latency | +1.4 / +0.9 / +1.2% | +1.7 / +1.1 / +1.5% |
+| random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −1.2 / −1.9% |
+| random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −11.2 / −28.1%, −1.4% |
+| random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.4%, −2.1%, +2.0% |
 
-On sync runs augur is closer: LLMServingSim has no term for vLLM's CPU time.
-On async runs the two are equally close. LLMServingSim's async runs come out
+On sync runs and at light load augur is closer: LLMServingSim has no term for
+vLLM's CPU time, the API server or the client. On loaded async runs the two
+are equally close. LLMServingSim's async runs come out
 ~1% slower than augur's (cause not yet known); the real 6 and 12 req/s runs
 were also ~1% slower than the profile, so it lands closer there, and further
 on async ShareGPT, where the real run was faster than the profile. Its
@@ -151,7 +171,7 @@ scheduler is its own reimplementation; augur's decisions are vLLM's
 
 **Same simulated hardware, scheduler only** (`tests/test_vs_llmservingsim.py`,
 RTX PRO 6000 profiles; `--lss-loop-compat` reproduces LLMServingSim's loop
-timing, which is not vLLM behaviour; `--step-cpu-us 0`). Calls with identical TTFT, TPOT, latency and end
+timing, which is not vLLM behaviour; CPU, front-end and delivery terms at 0). Calls with identical TTFT, TPOT, latency and end
 time, to the ns:
 
 | Case | Identical calls |
@@ -196,5 +216,5 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
 - EAGLE/MTP drafter cost (ngram speculation is modeled).
 - Pipeline parallelism; KV offload connectors (LMCache, CPU offload).
 - vLLM Router policies (augur has round-robin and least-loaded).
-- Load-dependent API-server delay.
+- API-server time as a function of prompt length (one constant now).
 - DP rounds are one full ASTRA-Sim run each (slow at large DP).

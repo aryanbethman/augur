@@ -107,9 +107,10 @@ class _Event:
 class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
-                 pd_link: PDLink | None = None, frontend_latency_ns: int = 0):
+                 pd_link: PDLink | None = None, frontend_latency_ns: int = 0, delivery_latency_ns: int = 0):
         self.engines = engines
         self.frontend_latency_ns = frontend_latency_ns
+        self.delivery_latency_ns = delivery_latency_ns  # engine emits a token -> the client has it
         # PD disaggregation: the coordinator plays vLLM's PD proxy. A call goes
         # to a prefill engine with max_tokens=1 and do_remote_decode; the
         # kv_transfer_params that engine's NIXL scheduler returns go with the
@@ -265,7 +266,7 @@ class Coordinator:
                         # The proxy forwards to decode once it has this response.
                         self._push(self.now, CAUSED_ARRIVAL, "decode_dispatch", (cid, o.kv_transfer_params))
                     continue
-                rec.token_times.extend([self.now] * len(o.new_token_ids))
+                rec.token_times.extend([self.now + self.delivery_latency_ns] * len(o.new_token_ids))
                 if o.finish_reason is not None:
                     self._finish(cid, rec, eng)
         if eng.core.scheduler.get_num_unfinished_requests() == 0 and eng.idle_since is None:
@@ -274,7 +275,9 @@ class Coordinator:
             eng.idle_since = self.now
 
     def _finish(self, call_id: str, rec: CallRecord, eng: SimEngine) -> None:
-        rec.end_ns = self.now
+        # The client has the last token, and acts on it, delivery_latency_ns after the engine emits it.
+        done_ns = self.now + self.delivery_latency_ns
+        rec.end_ns = done_ns
         self.recorder.done.append(rec)
         call = self._calls.pop(call_id)
         del self._records[call_id]
@@ -284,15 +287,15 @@ class Coordinator:
             s = self._sessions[call.session_id]
             s.calls_done += 1
             if s.next_index < len(s.sub_requests):
-                prio = CAUSED_ARRIVAL if call.tool_wait_ns == 0 else ARRIVAL
+                prio = CAUSED_ARRIVAL if call.tool_wait_ns + self.delivery_latency_ns == 0 else ARRIVAL
                 if prio == CAUSED_ARRIVAL and self.lss_idle_quantum_ns and eng.spec.tensor_parallel_size > 1:
                     # LLMServingSim compat only: at TP>1 the other ranks' reports
                     # at this instant route and schedule again, so the call joins
                     # the next step. Not possible in vLLM.
                     prio = ARRIVAL
-                self._push(self.now + call.tool_wait_ns, prio, "session_call", s.session_id)
+                self._push(done_ns + call.tool_wait_ns, prio, "session_call", s.session_id)
             else:
-                s.finish_ns = self.now
+                s.finish_ns = done_ns
                 del self._sessions[s.session_id]
 
     def _dp_padded_tokens(self, wants: list[tuple[int, bool]]) -> list[int]:

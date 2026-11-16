@@ -15,7 +15,7 @@ Design doc: https://claude.ai/artifact/X669zyopvMUTTc4wJR9x5p
 python -m augur.bench --model Qwen/Qwen3-1.7B --dataset-name random \
   --random-input-len 1024 --random-output-len 128 --num-prompts 300 \
   --request-rate 6 --ignore-eos --seed 0 \
-  --hardware RTX4060Ti --num-gpu-blocks 5300 --max-num-seqs 128 --frontend-latency-ms 15
+  --hardware RTX4060Ti --num-gpu-blocks 5300 --max-num-seqs 128
 ```
 
 Requests and arrival times are sampled with vLLM's own benchmark code (same

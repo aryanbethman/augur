@@ -58,9 +58,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
-    p.add_argument("--frontend-latency-ms", type=float, default=0.0,
-                   help="API-server time before a request reaches the engine (HTTP, tokenization); "
-                        "counted in TTFT and latency")
+    p.add_argument("--frontend-latency-ms", type=float, default=6.5,
+                   help="API-server time before the engine sees a request (HTTP, tokenization, hand-off); "
+                        "counted in TTFT and latency. Default measured with vLLM 0.33 on an i7-12700 for "
+                        "1,024-token text prompts; the further wait for the engine's next loop iteration is "
+                        "simulated, not part of this. Ignored with --replay-durations and --replay-arrivals")
+    p.add_argument("--delivery-latency-ms", type=float, default=8.0,
+                   help="the client receives each token this long after the engine emits it (output "
+                        "processing, detokenization, streaming, client parse): token times, TTFT, end time "
+                        "and latency grow by this, inter-token latencies do not, and a session's next call "
+                        "is released this much later. Engine behaviour is unchanged. Default measured with "
+                        "vLLM 0.33 on an i7-12700. Ignored with --replay-durations and --replay-arrivals")
     p.add_argument("--step-cpu-us", type=float, default=2000.0,
                    help="vLLM's per-step CPU time, which GPU profiles do not hold (sync: added to the step; "
                         "async: delays the launch, hidden behind the previous batch). Default measured with "
@@ -174,7 +182,8 @@ def main(argv: list[str] | None = None) -> int:
         for e in engines:
             e.step_log = []
     from augur.sim.coordinator import PDLink
-    if a.replay_durations or a.replay_arrivals:
+    replaying = bool(a.replay_durations or a.replay_arrivals)  # arrival times are engine-side: no client latencies
+    if replaying:
         from augur.verify.replay import ReplayWorkload
         workload = ReplayWorkload(a.workload, max_entries=a.num_entries,
                                   log_path=a.replay_durations or a.replay_arrivals,
@@ -186,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
                         decode_router=ROUTERS[a.router](),
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
-                        frontend_latency_ns=int(a.frontend_latency_ms * 1e6))
+                        frontend_latency_ns=0 if replaying else int(a.frontend_latency_ms * 1e6),
+                        delivery_latency_ns=0 if replaying else int(a.delivery_latency_ms * 1e6))
     if a.step_log_vllm:
         from augur.sim.coordinator import install_step_log_clock
         install_step_log_clock(coord)
