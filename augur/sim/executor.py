@@ -247,10 +247,12 @@ class SimWorker:
                     # max_tokens: near the end it still proposes k (vLLM stops
                     # the request when it reaches max_tokens). Replay: as many
                     # drafts as the logged run scheduled next step (an ngram
-                    # drafter proposes none when the prompt has no match).
+                    # drafter proposes none when the prompt has no match). A
+                    # request missing from the next logged step (preempted,
+                    # because its drafts needed KV the cache lacked) keeps k.
                     n_next = self.ctx.spec_k
-                    if replay is not None:
-                        n_next = max(replay[1].get(call_id(rid), 1) - 1, 0)
+                    if replay is not None and call_id(rid) in replay[1]:
+                        n_next = max(replay[1][call_id(rid)] - 1, 0)
                     nxt = list((rec or ())[st.num_output:st.num_output + n_next])
                     nxt += [SYNTHETIC_TOKEN] * (n_next - len(nxt))
                     if nxt:
