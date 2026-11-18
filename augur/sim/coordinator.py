@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from augur.sim.engine import SimEngine, _stepping
 from augur.sim.router import Router
 from augur.trace.metrics import CallRecord, Recorder
-from augur.trace.workload import Call, Session, Workload
+from augur.trace.workload import Call, Session, Workload, strip_pd_suffix
 
 _async_stepping: list = [None]  # engine inside step_with_batch_queue (for the step-log clock)
 
@@ -188,7 +188,7 @@ class Coordinator:
 
     @staticmethod
     def _cid(request_id: str) -> str:
-        return request_id.split("@", 1)[0]  # PD request ids are <call>@p / <call>@d
+        return strip_pd_suffix(request_id)
 
     def _pick(self, router: Router, call: Call, engines: list[SimEngine]) -> SimEngine:
         eid = router.route(call, engines, self.now)
@@ -211,6 +211,7 @@ class Coordinator:
             # The API server's work before the engine sees the request (HTTP,
             # tokenization, hand-off); the call's times stay measured from
             # when the client sent it.
+            eng.admitting += 1
             self._push(self.now + self.frontend_latency_ns, ARRIVAL, "admit", (eng, call))
         else:
             self._admit(eng, call)
@@ -239,6 +240,7 @@ class Coordinator:
         elif ev.kind == "poll":
             p.xfer_wake_at = None
         elif ev.kind == "admit":
+            p[0].admitting -= 1
             self._admit(*p)
         elif ev.kind == "decode_dispatch":
             cid, params = p
@@ -293,7 +295,6 @@ class Coordinator:
         eng.ctx.output_ids.pop(call_id + "@d" if self.pd else call_id, None)
         if call.session_id is not None:
             s = self._sessions[call.session_id]
-            s.calls_done += 1
             if s.next_index < len(s.sub_requests):
                 prio = CAUSED_ARRIVAL if call.tool_wait_ns + self.delivery_latency_ns == 0 else ARRIVAL
                 if prio == CAUSED_ARRIVAL and self.lss_idle_quantum_ns and eng.spec.tensor_parallel_size > 1:
@@ -303,7 +304,6 @@ class Coordinator:
                     prio = ARRIVAL
                 self._push(done_ns + call.tool_wait_ns, prio, "session_call", s.session_id)
             else:
-                s.finish_ns = done_ns
                 del self._sessions[s.session_id]
 
     def _dp_padded_tokens(self, wants: list[tuple[int, bool]]) -> list[int]:
@@ -389,6 +389,10 @@ class Coordinator:
                 final.append(StepShape(seqs=s.seqs, padded_tokens=p))
         per_rank = g[0].ctx.cost.round_ns(final, first_rank=first_rank)
         per_rank = self._scaled(g, per_rank)
+        # The ranks meet in the round's first collective, so the slowest rank's CPU time holds up all of them.
+        cpu_ns = max((e.ctx.cpu_fixed_ns + e.ctx.cpu_per_request_ns * len(s.seqs)
+                      for e, s in zip(g, shapes) if s is not None), default=0)
+        per_rank = [ns + cpu_ns for ns in per_rank]
         self.dp_rounds += 1
         for e, sh, ns in zip(g, final, per_rank):
             if e.step_log is not None:

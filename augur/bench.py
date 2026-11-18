@@ -8,7 +8,7 @@ server, it runs them through augur (any augur engine flag, e.g. --hardware,
 --tp, --num-gpu-blocks, passes through) and reports with vLLM's own
 `calculate_metrics`, in the same format.
 
-    python -m augur.bench --model Qwen/Qwen3-1.7B --dataset-name random \\
+    augur bench --model Qwen/Qwen3-1.7B --dataset-name random \\
         --random-input-len 1024 --random-output-len 128 --num-prompts 200 \\
         --request-rate 4 --ignore-eos --hardware RTX4060Ti --num-gpu-blocks 5300
 
@@ -33,6 +33,8 @@ import tempfile
 import time
 
 import numpy as np
+
+from augur.trace.metrics import ensure_parent_dir
 
 
 def _arrival_offsets(requests, args) -> list[float]:
@@ -131,6 +133,10 @@ def main(argv=None) -> int:
     p.add_argument("--step-time-scale", type=float, default=1.0,
                    help="augur's --step-time-scale: multiplies every GPU step time (applied to all sensitivity runs)")
     args, augur_args = p.parse_known_args(argv)
+    if args.max_concurrency is not None:
+        print("augur bench: --max-concurrency is not modeled: requests arrive on the --request-rate schedule alone",
+              file=sys.stderr)
+        return 2
     if not args.ignore_eos:
         print("augur bench: outputs always run to their requested length (as with --ignore-eos)", file=sys.stderr)
 
@@ -147,26 +153,25 @@ def main(argv=None) -> int:
     requests = get_samples(args, tokenizer)
     offsets = _arrival_offsets(requests, args)
 
-    work = tempfile.mkdtemp(prefix="augur-bench-")
-    trace = os.path.join(work, "requests.jsonl")
-    with open(trace, "w") as f:
-        for r, t in zip(requests, offsets):
-            ids = r.prompt if isinstance(r.prompt, list) and r.prompt and isinstance(r.prompt[0], int) \
-                else tokenizer(r.prompt).input_ids
-            f.write(json.dumps({"input_toks": len(ids), "output_toks": r.expected_output_len,
-                                "arrival_time_ns": int(t * 1e9), "input_tok_ids": ids}) + "\n")
-
     if "--cost" not in augur_args:
         augur_args = ["--cost", "auto"] + augur_args
     base = args.step_time_scale
     f = args.sensitivity / 100
     scales = [base * (1 - f), base, base * (1 + f)] if f > 0 else [base]
     runs = []
-    for sc in scales:
-        r = _run(args, augur_args, trace, requests, offsets, tokenizer, sc)
-        if isinstance(r, int):
-            return r
-        runs.append(r)
+    with tempfile.TemporaryDirectory(prefix="augur-bench-") as work:
+        trace = os.path.join(work, "requests.jsonl")
+        with open(trace, "w") as out:
+            for r, t in zip(requests, offsets):
+                ids = r.prompt if isinstance(r.prompt, list) and r.prompt and isinstance(r.prompt[0], int) \
+                    else tokenizer(r.prompt).input_ids
+                out.write(json.dumps({"input_toks": len(ids), "output_toks": r.expected_output_len,
+                                      "arrival_time_ns": int(t * 1e9), "input_tok_ids": ids}) + "\n")
+        for sc in scales:
+            r = _run(args, augur_args, trace, requests, offsets, tokenizer, sc)
+            if isinstance(r, int):
+                return r
+            runs.append(r)
     metrics, end, _ = runs[len(runs) // 2]
     wall = sum(r[2] for r in runs)
 
@@ -213,6 +218,7 @@ def main(argv=None) -> int:
         result.update({k: v for k, v in vars(metrics).items() if not k.startswith("_")})
         name = args.result_filename or f"augur-{args.request_rate}qps-{os.path.basename(args.model)}.json"
         path = os.path.join(args.result_dir or ".", name)
+        ensure_parent_dir(path)
         with open(path, "w") as f:
             json.dump(result, f, indent=2, default=str)
         print("saved", path)

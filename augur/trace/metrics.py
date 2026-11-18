@@ -9,6 +9,7 @@ tokens, and preemption count.
 from __future__ import annotations
 
 import csv
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -16,6 +17,13 @@ import numpy as np
 FORK_COLUMNS = ['instance id', 'request id', 'model', 'input', 'output', 'arrival', 'end_time',
                 'latency', 'queuing_delay', 'TTFT', 'TPOT', 'ITL']
 EXTRA_COLUMNS = ['session_id', 'sub_request_index', 'cached_tokens', 'num_preemptions', 'prefill_done']
+
+
+def ensure_parent_dir(path: str | None) -> None:
+    """Create the folder a result file will be written to. Called by: cli.main,
+    bench.main, client.main, before the work that produces the file."""
+    if path:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
 
 @dataclass

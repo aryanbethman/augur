@@ -1,11 +1,11 @@
 """Compare two request CSVs in the fork's format (e.g. augur vs LLMServingSim).
 
-Requests are matched on 'request id'. For the fork, ids are assigned in
-release order; augur assigns them the same way, so flat workloads match
-directly. For agentic workloads the fork numbers calls as it releases them,
-which can differ between simulators once timing differs, so sessions are
-matched on (arrival order of the session, call index) when both files carry
-the extra columns, else by id.
+When both files carry augur's session columns, a session's call is matched on
+(session id, call index) and a flat request on its arrival order. Otherwise
+(the fork's own CSVs) requests are matched on 'request id', or, when ids
+disagree on lengths, on (input, output) length and arrival order: the fork
+numbers calls as it releases them, which differs between simulators once their
+timing differs.
 
 Usage: python -m augur.verify.compare A.csv B.csv
 """
@@ -25,14 +25,19 @@ def load(path: str) -> dict[int, dict]:
         return {int(r["request id"]): r for r in csv.DictReader(f)}
 
 
-def align(a: dict[int, dict], b: dict[int, dict]) -> tuple[dict[int, dict], dict[int, dict]]:
-    """Pair calls by (input, output) length and arrival order when ids disagree.
+def _by_call(rows: dict[int, dict]) -> dict[tuple, dict]:
+    """Rows keyed by (session id, call index); flat requests by ("", arrival order).
+    Called by: align."""
+    flat = sorted((r for r in rows.values() if not r["session_id"]), key=lambda r: int(r["arrival"]))
+    keyed = {("", str(k)): r for k, r in enumerate(flat)}
+    keyed.update({(r["session_id"], r["sub_request_index"]): r for r in rows.values() if r["session_id"]})
+    return keyed
 
-    Agentic workloads number calls in release order, which differs between
-    simulators once their timings differ. Calls are then paired by their
-    (input, output) lengths, the k-th such call by arrival in A with the k-th
-    in B.
-    """
+
+def align(a: dict[int, dict], b: dict[int, dict]) -> tuple[dict, dict]:
+    """Pair each call in A with the same call in B (see the module docstring)."""
+    if all("session_id" in r and "sub_request_index" in r for d in (a, b) for r in d.values()):
+        return _by_call(a), _by_call(b)
     ids = set(a) & set(b)
     if all(a[i]["input"] == b[i]["input"] and a[i]["output"] == b[i]["output"] for i in ids):
         return a, b

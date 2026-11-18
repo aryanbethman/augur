@@ -11,7 +11,7 @@ multi-GPU collectives and transfers from LLMServingSim's ASTRA-Sim.
 `augur bench` takes `vllm bench serve`'s arguments and prints its report:
 
 ```bash
-python -m augur.bench --model Qwen/Qwen3-1.7B --dataset-name random \
+augur bench --model Qwen/Qwen3-1.7B --dataset-name random \
   --random-input-len 1024 --random-output-len 128 --num-prompts 300 \
   --request-rate 6 --ignore-eos --seed 0 \
   --hardware RTX4060Ti --num-gpu-blocks 5300 --max-num-seqs 128
@@ -20,6 +20,12 @@ python -m augur.bench --model Qwen/Qwen3-1.7B --dataset-name random \
 Requests and arrival times are sampled with vLLM's own benchmark code (same
 seed, same requests), and the report is vLLM's `calculate_metrics`. Any augur
 engine flag passes through. Outputs always run to their requested length.
+`--max-concurrency` is refused: augur does not model a client-side cap yet.
+
+Unset `--max-num-seqs` and `--max-num-batched-tokens` take the values `vllm
+serve` picks for the simulated GPU (`--hbm-gb`, `--hardware`), from vLLM's own
+table: 256 / 2,048 below 70 GB, 1,024 / 8,192 from 70 GB (A100s stay at 256 /
+2,048), 1,024 / 16,384 from 160 GB.
 
 After the report it prints how far each metric moves when step times change by
 ±1% (`--sensitivity`, 0 to turn off). Near saturation TTFT can move by tens of

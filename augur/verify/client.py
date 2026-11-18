@@ -26,7 +26,7 @@ import time
 
 import aiohttp
 
-from augur.trace.metrics import CallRecord, Recorder
+from augur.trace.metrics import CallRecord, Recorder, ensure_parent_dir
 from augur.trace.workload import Call, Session, Workload
 
 
@@ -53,21 +53,25 @@ class Client:
                 "min_tokens": call.output_toks, "ignore_eos": True, "temperature": 0.0,
                 "stream": True, "return_token_ids": True, "request_id": f"augur.{call.call_id}."}
         generated: list[int] = []
-        async with http.post(self.url, json=body) as resp:
-            if resp.status != 200:
-                self.failed.append((call.call_id, f"HTTP {resp.status}: {(await resp.text())[:200]}"))
-                return
-            async for raw in resp.content:
-                line = raw.decode().strip()
-                if not line.startswith("data: ") or line == "data: [DONE]":
-                    continue
-                chunk = json.loads(line[6:])
-                for choice in chunk.get("choices", []):
-                    ids = choice.get("token_ids") or []
-                    n = len(ids) if ids else (1 if choice.get("text") else 0)
-                    if n:
-                        rec.token_times.extend([self._now()] * n)
-                        generated.extend(ids)
+        try:
+            async with http.post(self.url, json=body) as resp:
+                if resp.status != 200:
+                    self.failed.append((call.call_id, f"HTTP {resp.status}: {(await resp.text())[:200]}"))
+                    return
+                async for raw in resp.content:
+                    line = raw.decode().strip()
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    chunk = json.loads(line[6:])
+                    for choice in chunk.get("choices", []):
+                        ids = choice.get("token_ids") or []
+                        n = len(ids) if ids else (1 if choice.get("text") else 0)
+                        if n:
+                            rec.token_times.extend([self._now()] * n)
+                            generated.extend(ids)
+        except (aiohttp.ClientError, TimeoutError, ConnectionError) as e:
+            self.failed.append((call.call_id, f"{type(e).__name__}: {e}"))
+            return
         rec.end_ns = self._now()
         if len(rec.token_times) != call.output_toks:
             self.failed.append((call.call_id, f"{len(rec.token_times)} of {call.output_toks} tokens"))
@@ -112,6 +116,8 @@ def main(argv=None) -> int:
     p.add_argument("--filler-vocab", type=int, default=150000,
                    help="unrecorded prompt tokens get in-vocabulary ids below this (default suits Qwen3)")
     a = p.parse_args(argv)
+    ensure_parent_dir(a.output)
+    ensure_parent_dir(a.tokens_out)
     client = Client(a.url, a.model, Workload(a.workload, max_entries=a.num_entries, filler_vocab=a.filler_vocab),
                     a.tokens_out)
     rec = asyncio.run(client.run())

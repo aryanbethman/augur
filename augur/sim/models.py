@@ -9,6 +9,7 @@ token is needed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -26,9 +27,9 @@ def model_dir(fork_root: str, model: str, cache_root: str, config_path: str | No
     The config comes from ``config_path`` if given (any HF ``config.json``),
     else from the augur profile at ``profile_path`` (which carries the model's
     config), else from the LLMServingSim fork's ``configs/model/<model>.json``
-    if that exists, else from any profile shipped with augur for ``model``."""
-    dst_dir = os.path.join(cache_root, model)
-    dst = os.path.join(dst_dir, "config.json")
+    if that exists, else from any profile shipped with augur for ``model``.
+    Each distinct config gets its own folder, so concurrent runs of one model
+    with different configs never read each other's."""
     fork_cfg = os.path.join(fork_root, "configs", "model", f"{model}.json")
     if config_path is not None:
         if not os.path.exists(config_path):
@@ -48,8 +49,10 @@ def model_dir(fork_root: str, model: str, cache_root: str, config_path: str | No
                 f"No model config for {model!r}: not in the fork ({fork_cfg}) and augur ships configs only for "
                 f"{', '.join(have) or 'no models'}. Pass --model-config <config.json> (any Hugging Face config.json)")
         text = _embedded_config(bundled_profile(hit[0], model, hit[2], hit[1]))
+    dst_dir = os.path.join(cache_root, model, hashlib.sha256(text.encode()).hexdigest()[:16])
+    dst = os.path.join(dst_dir, "config.json")
     os.makedirs(dst_dir, exist_ok=True)
-    if not os.path.exists(dst) or open(dst).read() != text:
+    if not os.path.exists(dst):
         tmp = f"{dst}.{os.getpid()}"
         with open(tmp, "w") as f:
             f.write(text)
