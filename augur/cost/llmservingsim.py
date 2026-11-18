@@ -75,8 +75,6 @@ class LLMServingSimCost:
             self.oracle = AstraOracle(self.fork_root, cluster_config)
         self._cache: dict[tuple, int] = {}
         self._batch_id = 0
-        self.lookups = 0
-        self.hits = 0
 
     def _batch(self, shape: StepShape):
         q_list, k_list = [], []
@@ -142,7 +140,6 @@ class LLMServingSimCost:
                 members.append((rows, trace.header_line, rank))
         finally:
             os.chdir(cwd)
-        self.lookups += 1
         return self.oracle.run_group(members, self.model, self.hardware, first_member=first_rank)
 
     def _step_ns_astra(self, shape: StepShape) -> int:
@@ -150,7 +147,6 @@ class LLMServingSimCost:
 
         Checked exact against a full ASTRA-Sim run of the same trace for
         decode, mixed and prefill steps at TP2."""
-        self.lookups += 1
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         n_dec = len(dec)
@@ -159,7 +155,6 @@ class LLMServingSimCost:
                shape.forward_tokens, len(shape.seqs))
         hit = self._cache.get(key)
         if hit is not None:
-            self.hits += 1
             return hit
         trace = self._trace(shape)
         comp = sum(int(r[1]) for r in trace.rows if len(r) == 11 and r[0] not in ("kv_load", "kv_evict"))
@@ -184,7 +179,6 @@ class LLMServingSimCost:
     def step_ns(self, shape: StepShape) -> int:
         if self.oracle is not None:
             return self._step_ns_astra(shape)
-        self.lookups += 1
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         n_dec = len(dec)
@@ -193,7 +187,6 @@ class LLMServingSimCost:
                shape.forward_tokens, len(shape.seqs))
         hit = self._cache.get(key)
         if hit is not None:
-            self.hits += 1
             return hit
         cwd = os.getcwd()
         os.chdir(self._run_dir)

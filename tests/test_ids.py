@@ -17,3 +17,9 @@ def test_augur_internal_ids():
     assert call_id("req_5") == "req_5"
     assert call_id("req_5@p") == "req_5"  # PD prefill half
     assert call_id("req_5@d") == "req_5"  # PD decode half
+
+
+def test_session_ids_may_contain_an_at_sign():
+    assert call_id("alice@lab#0") == "alice@lab#0"
+    assert call_id("alice@lab#0@p") == "alice@lab#0"
+    assert call_id("alice@lab#0@d") == "alice@lab#0"

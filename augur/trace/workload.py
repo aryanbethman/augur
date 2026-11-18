@@ -51,8 +51,6 @@ class Session:
     arrival_ns: int
     sub_requests: list[dict]
     next_index: int = 0
-    calls_done: int = 0
-    finish_ns: int | None = None
 
 
 class _Filler:
@@ -138,6 +136,12 @@ class Workload:
 _BENCH_RID = re.compile(r"^(?:cmpl-)?bench-[0-9a-f]{8}-(\d+)-")
 
 
+def strip_pd_suffix(rid: str) -> str:
+    """The call id of a PD half (<call>@p, <call>@d). A session id may itself
+    contain "@". Called by: call_id, Coordinator._cid."""
+    return rid[:-2] if rid.endswith(("@p", "@d")) else rid
+
+
 def call_id(rid: str) -> str:
     """The workload call id inside a request id.
 
@@ -149,4 +153,4 @@ def call_id(rid: str) -> str:
     m = _BENCH_RID.match(rid)
     if m:  # `vllm bench serve`: request i of the benchmark is augur's req_<i>
         return f"req_{m.group(1)}"
-    return rid.split("@", 1)[0]
+    return strip_pd_suffix(rid)

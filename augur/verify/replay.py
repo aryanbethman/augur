@@ -202,9 +202,12 @@ def compare(a_path: str, b_path: str) -> dict:
             same += 1
         elif first is None:
             first = i
+    if first is None and len(a) != len(b):
+        first = min(len(a), len(b))  # one log stops early: its missing step is the difference
+    at = None if first is None else {"a": _norm(a[first]) if first < len(a) else None,
+                                     "b": _norm(b[first]) if first < len(b) else None}
     return {"steps_a": len(a), "steps_b": len(b), "identical_steps": same,
-            "first_difference": first,
-            "at_first_difference": None if first is None else {"a": _norm(a[first]), "b": _norm(b[first])}}
+            "first_difference": first, "at_first_difference": at}
 
 
 def main(argv=None) -> int:
@@ -214,11 +217,12 @@ def main(argv=None) -> int:
         return 2
     r = compare(argv[1], argv[2])
     print(json.dumps({k: v for k, v in r.items() if k != "at_first_difference"}, indent=2))
-    if r["first_difference"] is not None:
-        print("first difference, step", r["first_difference"])
-        print("  A:", str(r["at_first_difference"]["a"])[:400])
-        print("  B:", str(r["at_first_difference"]["b"])[:400])
-    return 0
+    if r["first_difference"] is None:
+        return 0
+    print("first difference, step", r["first_difference"])
+    print("  A:", str(r["at_first_difference"]["a"])[:400])
+    print("  B:", str(r["at_first_difference"]["b"])[:400])
+    return 1
 
 
 if __name__ == "__main__":

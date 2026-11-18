@@ -10,6 +10,10 @@ Order: top to bottom. Status: [ ] open, [~] in progress, [x] done.
 Branch feature/router-offload-20261118: vLLM Router policies, KV offload to CPU, tiered KV offload. 115 tests pass and the six real-GPU replays are still exact. None of the
 new features has been checked against real hardware.
 
+Audit fixes (2026-11-18): least-loaded counts calls still in the API server; unset batch limits follow `vllm serve`
+for the simulated GPU; `replay compare` exits 1 on any difference; sync DP pays --step-cpu-us; `augur bench` is a
+command; PD and DP+async have tests. 151 tests pass. Not fixed: DP + async scheduling still has no per-step CPU term.
+
 ## Verification runs, once the GPUs and CPUs are free
 1. Real-GPU check of CPU offload (section 4; script ready)
 2. Rerun the PD async comparisons after the async loop fix (section 4; CPU only)

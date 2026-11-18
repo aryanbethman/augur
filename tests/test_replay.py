@@ -3,6 +3,7 @@
 import json
 
 from augur.verify.replay import ReplayCost, compare, is_async, scheduled
+from augur.verify.replay import main as replay_main
 from augur.verify.stepcheck import real_steps
 
 
@@ -78,3 +79,22 @@ def test_compare_maps_request_ids(tmp_path):
     sim[0]["tok"] = {"req_0": 3}
     r = compare(write(tmp_path, "r.jsonl", real), write(tmp_path, "s.jsonl", sim))
     assert r["first_difference"] == 0
+
+
+def steps_log(tmp_path, name, toks):
+    return write(tmp_path, name, [sched(k, k, {"req_0": n}) for k, n in enumerate(toks)])
+
+
+def test_compare_exits_0_only_when_every_step_matches(tmp_path):
+    a = steps_log(tmp_path, "a.jsonl", [4, 1, 1])
+    assert replay_main(["compare", a, steps_log(tmp_path, "same.jsonl", [4, 1, 1])]) == 0
+    assert replay_main(["compare", a, steps_log(tmp_path, "other.jsonl", [4, 2, 1])]) == 1
+
+
+def test_compare_counts_a_log_that_stops_early_as_a_difference(tmp_path):
+    a = steps_log(tmp_path, "a.jsonl", [4, 1, 1])
+    short = steps_log(tmp_path, "short.jsonl", [4])
+    r = compare(a, short)
+    assert r["first_difference"] == 1 and r["at_first_difference"]["b"] is None
+    assert replay_main(["compare", a, short]) == 1
+    assert replay_main(["compare", short, a]) == 1

@@ -253,8 +253,6 @@ class TableCost:
         self._out_bytes_per_seq = p["remote"]["output_bytes_per_seq"]
         self._warned: set = set()
         self._cache: dict[tuple, int] = {}
-        self.lookups = 0
-        self.hits = 0
         if self.tp > 1:
             self._comm_ns(1, 1)  # a setting outside the exact regime fails here, before a run starts
 
@@ -330,7 +328,6 @@ class TableCost:
         raise NotImplementedError("TableCost does not price DP rounds (EP collectives)")
 
     def step_ns(self, shape: StepShape) -> int:
-        self.lookups += 1
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         n_dec = len(dec)
@@ -342,7 +339,6 @@ class TableCost:
         key = (pre, n_dec, dq, kv_mean, kv_max, tokens, rows)
         hit = self._cache.get(key)
         if hit is not None:
-            self.hits += 1
             return hit
 
         comm = self._comm_ns(tokens, rows) if self.tp > 1 else None

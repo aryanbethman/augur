@@ -7,7 +7,7 @@ import os
 import random
 import subprocess
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import pytest
 
@@ -225,3 +225,12 @@ def test_cache_aware_hits_the_prefix_cache_more_than_round_robin_end_to_end(tmp_
     assert max(engines_per_session(rr)) > 1
     assert engines_per_session(ca) == [1] * N_SESSIONS
     assert cached(ca) > cached(rr)
+
+
+def test_least_loaded_spreads_a_burst_still_in_the_api_server(tmp_path):
+    """Calls routed but not yet in an engine's scheduler (--frontend-latency-ms) count as that engine's load."""
+    burst = tmp_path / "burst.jsonl"
+    burst.write_text("".join(json.dumps({"input_toks": 64, "output_toks": 8, "arrival_time_ns": 0}) + "\n"
+                             for _ in range(8)))
+    rows = run(tmp_path, str(burst), "least-loaded")
+    assert Counter(r["instance id"] for r in rows) == {"0": 2, "1": 2, "2": 2, "3": 2}

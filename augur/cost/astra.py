@@ -18,6 +18,7 @@ system and memory configs are exactly those LLMServingSim would use.
 
 from __future__ import annotations
 
+import atexit
 import itertools
 import os
 import shutil
@@ -34,6 +35,8 @@ class AstraOracle:
             sys.path.insert(0, self.fork_root)
         self.astra_sim = os.path.join(self.fork_root, "astra-sim")
         self.workdir = os.path.abspath(workdir or tempfile.mkdtemp(prefix="augur-astra-"))
+        if workdir is None:
+            atexit.register(self.close)
         cluster_config = os.path.abspath(cluster_config)
         cwd = os.getcwd()
         os.chdir(self.run_dir)

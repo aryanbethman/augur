@@ -6,9 +6,13 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from vllm.engine import arg_utils
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
 
@@ -48,6 +52,22 @@ class EngineSpec:
     kv_offload_gib: float | None = None  # vLLM --kv-offloading-size: CPU tier for the KV cache (native connector)
     kv_offload_link: OffloadLink | None = None  # GPU <-> CPU transfer cost (required with kv_offload_gib)
     kv_offload_tiers: tuple[TierSpec, ...] = ()  # secondary tiers behind the CPU one, in order (vLLM tiering)
+    hbm_gb: float | None = None  # simulated GPU memory: unset batch limits are `vllm serve`'s for this GPU
+    hardware: str = ""  # simulated GPU's name, which vLLM's batch defaults also look at
+
+
+def _simulated_gpu_batch_defaults(spec: EngineSpec):
+    """vLLM's own batch-limit table, read for the simulated GPU instead of the
+    machine augur runs on. Called by: SimEngine.__init__."""
+    name = spec.hardware.lower()
+    gpu = SimpleNamespace(get_device_total_memory=lambda: int(spec.hbm_gb * GIB), get_device_name=lambda: name,
+                          is_device_capability=lambda capability: "gb10" in name,
+                          is_tpu=lambda: False, is_cpu=lambda: False)
+
+    def defaults(world_size: int):
+        with patch.object(arg_utils, "current_platform", gpu):
+            return EngineArgs.get_batch_defaults(world_size)
+    return defaults
 
 
 class SimEngine:
@@ -91,7 +111,11 @@ class SimEngine:
         if spec.speculative:
             self.ctx.spec_k = int(spec.speculative["num_speculative_tokens"])
             self.ctx.spec_accept_rate = spec.spec_accept_rate
-        self.vllm_config = args.create_engine_config()
+        usage_context = None
+        if spec.hbm_gb is not None:
+            args.get_batch_defaults = _simulated_gpu_batch_defaults(spec)
+            usage_context = UsageContext.OPENAI_API_SERVER  # what `vllm serve` passes
+        self.vllm_config = args.create_engine_config(usage_context=usage_context)
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
                                log_stats=False)
         self.max_model_len = self.vllm_config.model_config.max_model_len
@@ -101,6 +125,7 @@ class SimEngine:
             self.ctx.offload = SimOffloadWorker(spec.kv_offload_link, self.ctx.kv_block_bytes,
                                                 replay_done_ns=getattr(cost, "kv_done", None))
         self.busy = False
+        self.admitting = 0  # calls routed here that are still in the API server (--frontend-latency-ms)
         self.xfer_wake_at: int | None = None  # offload: the poll already queued for a finishing transfer
         self.last_progress_ns = 0  # last step that scheduled tokens, or when work arrived at an idle engine
         self.async_sched = self.core.batch_queue is not None
@@ -146,7 +171,7 @@ class SimEngine:
 
     def load(self) -> int:
         s = self.core.scheduler
-        return len(s.waiting) + len(s.running)
+        return len(s.waiting) + len(s.running) + self.admitting
 
     def add(self, call: Call, now_ns: int, request_id: str | None = None, max_tokens: int | None = None,
             kv_transfer_params: dict | None = None) -> None:

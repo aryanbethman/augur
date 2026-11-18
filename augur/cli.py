@@ -109,6 +109,10 @@ def _offload_tiers(a) -> tuple:
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         pin_hash_seed("augur.cli")
+    args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ["bench"]:
+        from augur.bench import main as bench_main
+        return bench_main(args[1:])
     p = argparse.ArgumentParser(prog="augur")
     p.add_argument("--fork", default=default_fork(),
                    help="LLMServingSim fork checkout (model configs, profiles); "
@@ -176,8 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--num-gpu-blocks", type=int, default=None,
                    help="exact KV-cache block count (vLLM num_gpu_blocks_override), e.g. from a real run's log")
     p.add_argument("--max-model-len", type=int, default=None)
-    p.add_argument("--max-num-batched-tokens", type=int, default=None)
-    p.add_argument("--max-num-seqs", type=int, default=None)
+    p.add_argument("--max-num-batched-tokens", type=int, default=None,
+                   help="default: what `vllm serve` picks for the simulated GPU (--hbm-gb, --hardware)")
+    p.add_argument("--max-num-seqs", type=int, default=None,
+                   help="default: what `vllm serve` picks for the simulated GPU (--hbm-gb, --hardware)")
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
@@ -264,6 +270,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"augur: --fixed-step-ms and --fixed-per-token-us only apply with --cost fixed (this run: --cost {a.cost})",
               file=sys.stderr)
         return 2
+    if bool(a.prefill_engines) != bool(a.decode_engines):
+        print("augur: PD needs both --prefill-engines and --decode-engines", file=sys.stderr)
+        return 2
+    num_engines = a.dp if a.dp > 1 else (a.prefill_engines + a.decode_engines or a.engines)
+    if a.step_log_vllm and num_engines > 1:
+        print("augur: --step-log-vllm logs one engine (engines would share one file and their step numbers collide)",
+              file=sys.stderr)
+        return 2
     if a.kv_offload_gib and (a.prefill_engines or a.dp > 1):
         print("augur: --kv-offload-gib with PD or DP is not modeled yet", file=sys.stderr)
         return 2
@@ -274,6 +288,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if a.quiet:
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+    from augur.trace.metrics import ensure_parent_dir
+    for path in (a.output, a.step_log, a.step_log_vllm):
+        ensure_parent_dir(path)  # before the run: results are written at its end
     from augur.cost import FixedCost
     from augur.sim.coordinator import Coordinator
     from augur.sim.engine import EngineSpec, SimEngine
@@ -370,11 +387,7 @@ def main(argv: list[str] | None = None) -> int:
                       scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks,
                       kv_offload_gib=a.kv_offload_gib,
                       kv_offload_link=_offload_link(a, *cpu_flags) if a.kv_offload_gib else None,
-                      kv_offload_tiers=a.kv_offload_tiers)
-    notes = []
-    if a.async_scheduling and a.num_speculative_tokens:
-        notes.append("speculative decoding is modeled with synchronous scheduling only; this run is synchronous")
-        print("augur: " + notes[-1], file=sys.stderr)
+                      kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware)
     import dataclasses
     if a.dp > 1:
         engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
@@ -385,6 +398,8 @@ def main(argv: list[str] | None = None) -> int:
         engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), cost) for i, r in enumerate(roles)]
     else:
         engines = [SimEngine(i, spec, cost) for i in range(a.engines)]
+    if hasattr(cost, "max_num_batched_tokens"):  # the fork's traces are built for the engine's real budget
+        cost.max_num_batched_tokens = engines[0].vllm_config.scheduler_config.max_num_batched_tokens
     if not a.replay_durations:  # a logged step's duration already holds its CPU time
         for e in engines:
             e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
@@ -443,8 +458,6 @@ def main(argv: list[str] | None = None) -> int:
         summary["dp_rounds"] = coord.dp_rounds
         summary["dp_dummy_forwards"] = coord.dp_dummy_forwards
     summary["async_scheduling"] = spec.async_scheduling
-    if notes:
-        summary["notes"] = notes
     summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
                     "vllm_step_cpu_ms_per_step": round(1e3 * cpu / max(steps, 1), 3),
                     "kv_cache_gib_per_engine": round(kv_bytes / 2**30, 2),
