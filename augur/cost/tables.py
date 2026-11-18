@@ -192,6 +192,12 @@ class _Attention:
         return max(1, int(v0 + t_pc * (v1 - v0)))
 
 
+# GPU memory bandwidth (GB/s) for hardware whose profiles carry none because the fork's
+# hardware_defaults has no entry for it. H100: SXM5 HBM3, 3.35 TB/s, the value the fork's H100
+# cluster configs set (an H100 PCIe has 2.0 TB/s: pass npu_mem_bw for it).
+NPU_MEM_BW_GBPS = {"H100": 3350.0}
+
+
 class OutsideRegime(ValueError):
     """A TP>1 step whose communication time the closed form does not reproduce exactly."""
 
@@ -202,7 +208,8 @@ class TableCost:
     ``cpu_mem_bw`` (GB/s = bytes/ns) and ``cpu_mem_latency_ns`` price the two
     tensors that live in CPU memory, as in ``LLMServingSimCost``.  At TP>1 the
     collectives are priced from ``link_bw`` (GB/s), ``link_latency_ns`` and
-    ``npu_mem_bw`` (GB/s; default: the profile's ``hardware`` entry).
+    ``npu_mem_bw`` (GB/s; default: the profile's ``hardware`` entry, else
+    ``NPU_MEM_BW_GBPS`` for its hardware).
     """
 
     def __init__(self, profile_path, cpu_mem_bw: float = 256.0, cpu_mem_latency_ns: int = 0,
@@ -222,6 +229,8 @@ class TableCost:
                                ("all_reduce_count", "all_reduce_bytes_per_token", "all_gather_bytes_per_seq")):
                 raise NotImplementedError(f"tp={self.tp} profile has no collective coefficients")
             npu = npu_mem_bw if npu_mem_bw is not None else (p.get("hardware") or {}).get("npu_mem_bw_gbps")
+            if npu is None:
+                npu = NPU_MEM_BW_GBPS.get(ident.get("hardware"))
             if npu is None:
                 raise ValueError("TP>1 needs npu_mem_bw (GB/s): the profile has no default for this hardware")
             if int(npu) < 1 or int(cpu_mem_bw) < 1 or link_bw <= 0 or link_latency_ns < 0:

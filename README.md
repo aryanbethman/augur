@@ -35,9 +35,20 @@ augur --hardware RTXPRO6000 --hbm-gb 96 --model meta-llama/Llama-3.1-8B \
 
 Multi-GPU engines (`--tp`; link and memory settings from `--tp-link-bw`,
 `--tp-link-latency-ns`, `--npu-mem-bw` or an LLMServingSim cluster config,
-`--lss-cluster-config`), many engines (`--engines`, `--router`), prefill/decode
+`--lss-cluster-config`), many engines (`--engines`, `--router`: least-loaded,
+round-robin, or the vLLM Router's random, power-of-two, cache-aware,
+consistent-hash, rendezvous-hash and sticky-least-loaded policies), prefill/decode
 (`--prefill-engines/--decode-engines`), DP+EP MoE (`--dp`,
-`--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33).
+`--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33), KV
+offload to CPU memory (`--kv-offload-gib`, vLLM's `--kv-offloading-size`;
+transfer cost from `--kv-offload-gbps` / `--kv-offload-latency-ns`, by default
+the CPU memory's, as LLMServingSim prices KV loads), and secondary tiers behind
+the CPU one through vLLM's offload tiering (`--kv-offload-tier
+NAME:GIB:GBPS[:LATENCY_NS]`, e.g. CXL memory `cxl:64:30:250`; repeatable).
+
+augur pins `PYTHONHASHSEED` (0 unless set): with KV offload, vLLM's CPU-tier
+eviction order follows Python's hash order. Give a real server the same value
+when comparing with it.
 
 ## Check it against real vLLM
 
@@ -60,8 +71,10 @@ augur/
     coordinator.py     virtual clock, event queue, routing, PD proxy, DP rounds
     engine.py          SimEngine: an unmodified vLLM EngineCore
     executor.py        SimExecutor: vLLM's executor seam with no GPU; asks the cost model for step time
-    router.py          cluster routers
+    router.py          cluster routers, including the vLLM Router's policies
     nixl.py            vLLM's NIXL connector with its network handshake off
+    offload.py         KV offload to CPU: the GPU-worker half of vLLM's OffloadingConnector
+    tiers.py           simulated secondary KV tiers (CXL, memory pools) for vLLM's offload tiering
     models.py          model configs without weights
   cost/                step pricing (interface in __init__.py)
     tables.py          from profiles shipped with augur: dense models on one node, no fork needed
@@ -84,7 +97,7 @@ augur-todo.md          open work, in priority order
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[test]"
-.venv/bin/python -m pytest      # 26 tests; 10 more with the LLMServingSim fork
+.venv/bin/python -m pytest      # 115 tests, 10 of which need the LLMServingSim fork
 ```
 
 That is all for the GPUs and models augur ships profiles for

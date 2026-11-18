@@ -14,6 +14,8 @@ from vllm.v1.engine.core import EngineCore
 
 from augur.cost import CostModel
 from augur.sim.executor import SimContext, SimHardware, make_sim_executor
+from augur.sim.offload import OffloadLink, SimOffloadWorker
+from augur.sim.tiers import GIB, TierSpec, register_clock
 from augur.trace.workload import Call
 
 # The engine inside a synchronous step (for the step log's clock).
@@ -43,6 +45,9 @@ class EngineSpec:
     async_scheduling: bool = False  # vLLM 0.33's default is True
     speculative: dict | None = None  # vLLM speculative_config, e.g. {"method": "ngram", "num_speculative_tokens": 3}
     spec_accept_rate: float = 0.0
+    kv_offload_gib: float | None = None  # vLLM --kv-offloading-size: CPU tier for the KV cache (native connector)
+    kv_offload_link: OffloadLink | None = None  # GPU <-> CPU transfer cost (required with kv_offload_gib)
+    kv_offload_tiers: tuple[TierSpec, ...] = ()  # secondary tiers behind the CPU one, in order (vLLM tiering)
 
 
 class SimEngine:
@@ -50,6 +55,11 @@ class SimEngine:
         self.engine_id = engine_id
         self.spec = spec
         self.ctx = SimContext(cost=cost, hardware=SimHardware(kv_cache_bytes=spec.kv_cache_bytes))
+        # Secondary tiers are built inside vLLM from plain config: they find
+        # this engine's clock by key.
+        clock_key = f"augur-{engine_id}-{id(self.ctx)}"
+        register_clock(clock_key, self.ctx)
+        tiered = bool(spec.kv_offload_tiers)
         args = EngineArgs(
             model=spec.model_dir,
             served_model_name=spec.model_name,
@@ -68,10 +78,14 @@ class SimEngine:
             speculative_config=spec.speculative,
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
-            kv_transfer_config=self._kv_transfer_config(engine_id, spec),
+            kv_transfer_config=self._kv_transfer_config(engine_id, spec, clock_key),
             data_parallel_size=spec.data_parallel_size,
             data_parallel_rank=spec.data_parallel_rank if spec.data_parallel_size > 1 else None,
             enable_expert_parallel=spec.enable_expert_parallel,
+            # Tiered offload configures the connector itself (above), as vLLM's
+            # --kv-offloading-size cannot name secondary tiers.
+            kv_offloading_size=None if tiered else spec.kv_offload_gib,
+            kv_offloading_backend="native",
         )
         self.ctx.defer_cost = spec.data_parallel_size > 1
         if spec.speculative:
@@ -81,7 +95,14 @@ class SimEngine:
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
                                log_stats=False)
         self.max_model_len = self.vllm_config.model_config.max_model_len
+        if spec.kv_offload_gib:
+            # The connector's scheduler half is vLLM's; this is its worker half.
+            # kv_block_bytes was set while EngineCore sized the KV cache.
+            self.ctx.offload = SimOffloadWorker(spec.kv_offload_link, self.ctx.kv_block_bytes,
+                                                replay_done_ns=getattr(cost, "kv_done", None))
         self.busy = False
+        self.xfer_wake_at: int | None = None  # offload: the poll already queued for a finishing transfer
+        self.last_progress_ns = 0  # last step that scheduled tokens, or when work arrived at an idle engine
         self.async_sched = self.core.batch_queue is not None
         self.ctx.async_cpu = self.async_sched
         # DP + async: rounds this rank's queued batches belong to (FIFO, as
@@ -92,6 +113,7 @@ class SimEngine:
         self.dp_next_round = 0
         self.gpu_free_at = 0  # async: when the GPU stream finishes its queued batches
         self.batch_finish: "deque[int]" = deque()  # async: finish time per queued batch, FIFO
+        self.batch_reports: "deque[bool]" = deque()  # async: per queued batch, its KV connector worker reported something
         self.sched_cpu_s = 0.0
         self.steps = 0
         # Only for --lss-idle-quantum (diagnostic): when this engine went idle,
@@ -101,10 +123,18 @@ class SimEngine:
         self.step_log: list[tuple] | None = None  # (start_ns, dur_ns, total, prefill_tokens, n_decode, n_prefill)
 
     @staticmethod
-    def _kv_transfer_config(engine_id: int, spec: EngineSpec):
+    def _kv_transfer_config(engine_id: int, spec: EngineSpec, clock_key: str):
+        from vllm.config import KVTransferConfig
+        if spec.kv_offload_tiers:
+            # vLLM's OffloadingConnector with its tiering spec (augur's variant:
+            # no /dev/shm buffer) and augur's simulated secondary tiers.
+            extra = {"cpu_bytes_to_use": int(spec.kv_offload_gib * GIB),
+                     "spec_name": "SimTieringOffloadingSpec", "spec_module_path": "augur.sim.tiers",
+                     "secondary_tiers": [t.tier_config(clock_key) for t in spec.kv_offload_tiers]}
+            return KVTransferConfig(kv_connector="OffloadingConnector", kv_role="kv_both",
+                                    kv_connector_extra_config=extra)
         if spec.kv_role is None:
             return None
-        from vllm.config import KVTransferConfig
         # vLLM's real NIXL connector; only its scheduler half is built (our
         # executor stands in for the worker half and never loads NIXL).
         return KVTransferConfig(kv_connector="SimNixlConnector", kv_connector_module_path="augur.sim.nixl",
@@ -125,6 +155,8 @@ class SimEngine:
                             output_kind=RequestOutputKind.DELTA, detokenize=False,
                             extra_args={"kv_transfer_params": kv_transfer_params} if kv_transfer_params else None)
         rid = request_id or call.call_id
+        if not self.core.scheduler.get_num_unfinished_requests():
+            self.last_progress_ns = now_ns
         req = EngineCoreRequest(
             request_id=rid, prompt_token_ids=call.prompt_ids, mm_features=None,
             sampling_params=sp, pooling_params=None, arrival_time=now_ns / 1e9,

@@ -52,6 +52,10 @@ def install_step_log_clock(coord: "Coordinator") -> None:
 # schedules again right away. So it is applied after steps start.
 ARRIVAL, TRANSFER_DONE, STEP_DONE, CAUSED_ARRIVAL = 0, 1, 2, 3
 
+# An engine with unfinished requests that schedules no token for this long
+# (simulated) is stuck: a run stops rather than spinning forever.
+STALL_NS = 60 * 1_000_000_000
+
 
 @dataclass
 class PDLink:
@@ -187,7 +191,7 @@ class Coordinator:
         return request_id.split("@", 1)[0]  # PD request ids are <call>@p / <call>@d
 
     def _pick(self, router: Router, call: Call, engines: list[SimEngine]) -> SimEngine:
-        eid = router.route(call, engines)
+        eid = router.route(call, engines, self.now)
         return next(e for e in engines if e.engine_id == eid)
 
     def _release(self, call: Call, exact: bool = True) -> None:
@@ -232,6 +236,8 @@ class Coordinator:
             self._release(self.workload.next_call(s, self.now), exact=False)
         elif ev.kind == "wake":
             p.wake_at = None
+        elif ev.kind == "poll":
+            p.xfer_wake_at = None
         elif ev.kind == "admit":
             self._admit(*p)
         elif ev.kind == "decode_dispatch":
@@ -261,6 +267,7 @@ class Coordinator:
                     if o.finish_reason is not None:
                         eng.ctx.output_ids.pop(o.request_id, None)
                         rec.prefill_done_ns = self.now
+                        self.router.release(self._calls[cid], self.now)
                         if not o.kv_transfer_params:
                             raise RuntimeError(f"{o.request_id}: prefill engine returned no kv_transfer_params")
                         # The proxy forwards to decode once it has this response.
@@ -280,6 +287,7 @@ class Coordinator:
         rec.end_ns = done_ns
         self.recorder.done.append(rec)
         call = self._calls.pop(call_id)
+        (self.decode_router if self.pd else self.router).release(call, done_ns)
         del self._records[call_id]
         self._call_engine.pop(call_id, None)
         eng.ctx.output_ids.pop(call_id + "@d" if self.pd else call_id, None)
@@ -418,21 +426,16 @@ class Coordinator:
         time, one step stale, as in vLLM."""
         progressed = False
         for _ in range(10_000):
-            starts = getattr(eng.ctx.cost, "starts", None)
-            if (starts and eng.ctx.cost.k < len(starts) and self.now < starts[eng.ctx.cost.k]
-                    and eng.core.scheduler.has_requests()):
-                # Replay: the logged engine scheduled its next batch later.
-                at = starts[eng.ctx.cost.k]
-                if eng.wake_at != at:
-                    eng.wake_at = at
-                    self._push(at, ARRIVAL, "wake", eng)
-                return
+            if eng.core.scheduler.has_requests() and not self._transfer_due(eng) and self._replay_holds(eng):
+                return  # replay: the logged engine scheduled its next batch later
             t0 = time.perf_counter()
             _async_stepping[0] = eng
+            self._set_step_clock(eng, gpu_free_ns=max(self.now, eng.gpu_free_at))
             try:
                 outputs, executed = eng.core.step_fn()
             finally:
                 _async_stepping[0] = None
+            self._check_progress(eng, executed)
             progressed = progressed or executed or eng.ctx.last_delivered
             eng.sched_cpu_s += time.perf_counter() - t0
             eng.steps += 1
@@ -441,6 +444,7 @@ class Coordinator:
                 start = max(self.now + (eng.ctx.last_cpu_ns if ns else 0), eng.gpu_free_at)
                 eng.gpu_free_at = start + ns
                 eng.batch_finish.append(eng.gpu_free_at)
+                eng.batch_reports.append(eng.ctx.last_kv_report)
                 if ns and eng.step_log is not None and eng.ctx.last_shape is not None:
                     sh = eng.ctx.last_shape
                     eng.step_log.append((start, ns, sh.total_tokens,
@@ -454,11 +458,20 @@ class Coordinator:
                     continue  # queue not full: schedule the next batch now
                 return  # nothing queued, nothing to schedule: idle
             done_at = max(self.now, eng.batch_finish.popleft())
+            # What the batch's KV connector worker reported (KV arrived,
+            # transfers done) reaches the scheduler only with this output.
+            reported = eng.batch_reports.popleft()
+            progressed = progressed or reported
             if done_at == self.now:
                 self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (eng, outputs)))
-                if not progressed or (not eng.core.scheduler.has_requests() and not eng.batch_finish):
-                    # Nothing computed or delivered (e.g. only requests waiting
-                    # for remote KV): wait for the next event.
+                if not eng.core.scheduler.has_requests():
+                    if eng.batch_finish:
+                        continue  # vLLM's loop drains the queue at once
+                    return
+                if not progressed and not any(eng.batch_reports):
+                    # Nothing computed or reported, and no queued batch carries
+                    # a report (vLLM's loop would spin until it is applied):
+                    # wait for the next event.
                     return
                 progressed = False
                 continue
@@ -571,6 +584,8 @@ class Coordinator:
             if eng.async_sched:
                 if eng.core.scheduler.has_requests() or eng.batch_finish:
                     self._step_async(eng)
+                    self._poll_when_transfers_finish(eng)
+                    self._replay_spin(eng)
                 continue
             pending_kv = bool(eng.ctx.deliver_recving or eng.ctx.deliver_sending)
             if not eng.core.scheduler.has_requests() and not pending_kv:
@@ -589,24 +604,19 @@ class Coordinator:
                         self._push(start, ARRIVAL, "wake", eng)
                     continue
             eng.idle_since = None
-            starts = getattr(eng.ctx.cost, "starts", None)
-            if starts and eng.ctx.cost.k < len(starts) and self.now < starts[eng.ctx.cost.k]:
-                # Replay: the logged engine started this step later than the
-                # earliest moment it could (its loop's wake-up); start it at
-                # the logged time so the same arrivals are in view.
-                at = starts[eng.ctx.cost.k]
-                if eng.wake_at != at:
-                    eng.wake_at = at
-                    self._push(at, ARRIVAL, "wake", eng)
+            if self._replay_holds(eng) and not self._transfer_due(eng):
                 continue
             for _ in range(4):
+                self._set_step_clock(eng, gpu_free_ns=self.now)
                 outputs, executed, step_ns = eng.step()
                 self._start_transfers(eng)
-                if executed or step_ns or not eng.ctx.last_delivered:
+                self._poll_when_transfers_finish(eng)
+                if executed or step_ns or not eng.ctx.last_delivered or self._replay_holds(eng):
                     break
                 # An empty step that only delivered finished KV transfers: vLLM
                 # promotes those requests at the next schedule, right away.
                 self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (eng, outputs)))
+            self._check_progress(eng, executed)
             for rid, hit in eng.ctx.last_new_req_ids.items():
                 rec = self._records.get(self._cid(rid))
                 if rec is not None and rec.first_sched_ns is None:
@@ -628,6 +638,75 @@ class Coordinator:
                                      sh.forward_tokens, 0))
             eng.busy = True
             self._push(self.now + step_ns, STEP_DONE, "step_done", (eng, outputs))
+
+    def _replay_holds(self, eng: SimEngine) -> bool:
+        """Replay: the logged engine started its next step later than the
+        earliest moment it could (its loop's wake-up); hold the engine until
+        the logged time so the same arrivals are in view. A logged empty
+        step is let through too: it can hand a KV connector new requests."""
+        cost = eng.ctx.cost
+        starts = getattr(cost, "starts", None)
+        if not starts or cost.k >= len(starts) or self.now >= starts[cost.k]:
+            return False
+        at = cost.next_schedule_ns(self.now)
+        if at == self.now:
+            return False
+        at = starts[cost.k] if at is None else min(at, starts[cost.k])
+        if eng.wake_at != at:
+            eng.wake_at = at
+            self._push(at, ARRIVAL, "wake", eng)
+        return True
+
+    def _replay_spin(self, eng: SimEngine) -> None:
+        """Replay, async: the logged engine loop kept scheduling (empty
+        batches too) while it had requests; each schedule shapes its batch
+        queue. Wake at its next logged schedule."""
+        next_schedule = getattr(eng.ctx.cost, "next_schedule_ns", None)
+        if next_schedule is None or eng.busy or not eng.core.scheduler.has_requests():
+            return
+        at = next_schedule(self.now + 1)
+        if at is not None and eng.wake_at != at:
+            eng.wake_at = at
+            self._push(at, ARRIVAL, "wake", eng)
+
+    def _check_progress(self, eng: SimEngine, executed: bool) -> None:
+        """Raise if the engine has had requests but scheduled no token for
+        STALL_NS. Called by: _start_steps, _step_async (after each step)."""
+        waiting = eng.core.scheduler.get_num_unfinished_requests()
+        if executed or not waiting:
+            eng.last_progress_ns = self.now
+            return
+        if self.now - eng.last_progress_ns > STALL_NS:
+            raise RuntimeError(
+                f"engine {eng.engine_id} scheduled no token for {STALL_NS // 1_000_000_000} s of simulated time "
+                f"({eng.last_progress_ns / 1e9:.3f} s to {self.now / 1e9:.3f} s) while {waiting} requests wait. "
+                "With tiered KV offload the likely cause is a request whose prefix needs more chunks than the "
+                "CPU tier holds: vLLM's tiering keeps promoting them and evicting them again. Give "
+                "--kv-offload-gib room for at least one request's context.")
+
+    def _set_step_clock(self, eng: SimEngine, gpu_free_ns: int) -> None:
+        """What the executor and the offload tiers need to know about time
+        before an engine step: now, and when the GPU work queued before it is done."""
+        eng.ctx.now_ns = eng.ctx.tier_clock_ns = self.now
+        eng.ctx.gpu_free_ns = gpu_free_ns
+
+    @staticmethod
+    def _transfer_sources(eng: SimEngine) -> list:
+        """The engine's offload worker and secondary tiers (each has next_end / deliverable)."""
+        return ([eng.ctx.offload] if eng.ctx.offload is not None else []) + eng.ctx.tiers
+
+    def _transfer_due(self, eng: SimEngine) -> bool:
+        """An offload transfer has finished: vLLM's engine loop, polling while
+        transfers are pending, takes a step now to report it."""
+        return any(src.deliverable(self.now) for src in self._transfer_sources(eng))
+
+    def _poll_when_transfers_finish(self, eng: SimEngine) -> None:
+        """vLLM keeps stepping while offload transfers are pending; the step
+        that matters is the first after one finishes. Queue it."""
+        t = min((e for src in self._transfer_sources(eng) if (e := src.next_end()) is not None), default=None)
+        if t is not None and t > self.now and eng.xfer_wake_at != t:
+            eng.xfer_wake_at = t
+            self._push(t, ARRIVAL, "poll", eng)
 
     def _start_transfers(self, eng: SimEngine) -> None:
         """The decode worker starts pulling KV in the step its scheduler parks

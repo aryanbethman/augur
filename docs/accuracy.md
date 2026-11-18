@@ -218,10 +218,36 @@ Multi-GPU timing has not been compared with real hardware: the collective
 model is ASTRA-Sim's (ring over point-to-point links), not a measurement. On the 4060 Ti
 benchmarks above augur takes 1–4 s per run against 55–152 s for the real one.
 
+## Modeled, not yet checked against real vLLM
+
+- **KV offload to CPU** (`--kv-offload-gib`). vLLM's OffloadingConnector
+  scheduler half runs unmodified; augur stands in for its GPU worker
+  (augur/sim/offload.py). Checked against augur's own logs only: sync and
+  async runs replay step for step, and runs repeat exactly. Transfer time is
+  latency + bytes / bandwidth on three FIFO lanes (stores, loads, sync loads)
+  that do not share bandwidth; the real PCIe rate and any contention with
+  compute are untested. `scripts/real_offload_check.sh` runs the real check
+  (50 SWE-bench sessions, 16 GiB CPU tier, GPU 0).
+- **Secondary KV tiers** (`--kv-offload-tier`). vLLM's TieringOffloadingManager
+  runs unmodified (stores cascade from the CPU tier to every secondary tier;
+  hits there are promoted to the CPU tier, then loaded to the GPU). augur's
+  `SimMemoryTier` stands in for the tier itself: capacity with LRU eviction,
+  a write lane and a read lane, each FIFO at latency + bytes / bandwidth on
+  the virtual clock. Checked against augur's own logs (exact replay, sync and
+  async). Nothing real to compare with yet; parameters for CXL memory come
+  from its spec sheet or LLMServingSim's cluster config.
+- **vLLM Router policies** (`--router`). Ported from the router's source
+  (src/policies, main of 2026-11-18): random, power-of-two, cache-aware
+  (its default; per-engine token prefix trees), consistent-hash,
+  rendezvous-hash, sticky-least-loaded. Its hash function is replaced by
+  BLAKE2b (engine URLs are synthetic, so placement is statistically, not
+  bit-for-bit, the same); every engine is healthy.
+
 ## Not modeled yet
 
 - EAGLE/MTP drafter cost (ngram speculation is modeled).
-- Pipeline parallelism; KV offload connectors (LMCache, CPU offload).
-- vLLM Router policies (augur has round-robin and least-loaded).
+- Pipeline parallelism; LMCache; KV offload with PD or DP; storage tiers (files,
+  object stores) as anything but a slower memory tier.
+- The vLLM Router's kv-aware policy (needs the engines' KV events).
 - API-server time as a function of prompt length (one constant now).
 - DP rounds are one full ASTRA-Sim run each (slow at large DP).
