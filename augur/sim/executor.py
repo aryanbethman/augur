@@ -26,6 +26,7 @@ import zlib
 import torch
 
 from vllm.config import CUDAGraphMode
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import OffloadingConnectorMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -85,6 +86,19 @@ class SimContext:
     cpu_per_request_ns: int = 0
     last_cpu_ns: int = 0
     step_time_scale: float = 1.0  # multiplies the cost model's GPU time, not the CPU time
+    # KV offload to CPU (augur.sim.offload.SimOffloadWorker): set by the
+    # coordinator before each step, the virtual time of this execute_model
+    # call and when the GPU work queued before it is done.
+    offload: Any = None
+    now_ns: int = 0
+    gpu_free_ns: int = 0
+    last_kv_report: bool = False  # this step's output carries a KV connector report
+    # Tiered offload (augur.sim.tiers): the engine's secondary tiers, and the
+    # virtual time of the scheduler-side work running now (the step's start
+    # while it schedules; once execute_model has run, when vLLM applies the
+    # step's outputs, which is when cascades to the tiers start).
+    tiers: list = field(default_factory=list)
+    tier_clock_ns: int = 0
 
 
 @dataclass
@@ -150,6 +164,18 @@ class SimWorker:
         nxt = cost.toks[cost.k + 1] if cost.k + 1 < len(cost.toks) else {}
         return outs[cost.k], nxt
 
+    def _offload_output(self, meta, forward_ready: int, cpu_ns: int, gpu_ns: int) -> KVConnectorOutput | None:
+        """Post-forward offload hooks: loads queue behind this forward, then the
+        worker polls (as vLLM, right after launching the forward)."""
+        ctx = self.ctx
+        launch = max(ctx.now_ns + cpu_ns, ctx.gpu_free_ns) if gpu_ns else max(forward_ready, ctx.gpu_free_ns)
+        finished_recving, worker_meta = ctx.offload.post_forward(meta, forward_end_ns=launch + gpu_ns,
+                                                                 poll_ns=forward_ready)
+        ctx.last_delivered = ctx.last_delivered or bool(finished_recving)
+        if not finished_recving and worker_meta is None:
+            return None
+        return KVConnectorOutput(finished_recving=finished_recving or None, kv_connector_worker_meta=worker_meta)
+
     def take_draft_token_ids(self):
         out, self.ctx.pending_drafts = self.ctx.pending_drafts, None
         return out
@@ -172,6 +198,10 @@ class SimWorker:
             self.ctx.new_recvs.append((rid, max(n_local - n_done, 0),
                                        r.engine_id if r else None, r.request_id if r else None))
         kvo = None
+        offload_meta = meta if isinstance(meta, OffloadingConnectorMetadata) else None
+        forward_ready = self.ctx.now_ns
+        if offload_meta is not None:
+            forward_ready = self.ctx.offload.pre_forward(offload_meta, self.ctx.now_ns, self.ctx.gpu_free_ns)
         self.ctx.last_delivered = bool(self.ctx.deliver_recving or self.ctx.deliver_sending)
         if self.ctx.last_delivered:
             kvo = KVConnectorOutput(finished_sending=set(self.ctx.deliver_sending) or None,
@@ -278,8 +308,17 @@ class SimWorker:
             if self.ctx.step_time_scale != 1.0:
                 gpu = round(gpu * self.ctx.step_time_scale)
             cpu = (self.ctx.cpu_fixed_ns + self.ctx.cpu_per_request_ns * len(seqs)) if seqs else 0
+            if not hasattr(self.ctx.cost, "durations"):  # a replayed duration already holds its stalls
+                cpu += forward_ready - self.ctx.now_ns  # offload waits (flushed stores, sync loads) hold the step
             self.ctx.last_cpu_ns = cpu
             self.ctx.last_step_ns = gpu + cpu if not self.ctx.async_cpu else gpu
+            if offload_meta is not None:
+                kvo = self._offload_output(offload_meta, forward_ready, cpu, gpu)
+        self.ctx.last_kv_report = kvo is not None
+        # Sync: this step's outputs land when it ends. Async: the update that
+        # follows is for the batch launched before, done when the GPU frees.
+        self.ctx.tier_clock_ns = (self.ctx.gpu_free_ns if self.ctx.async_cpu
+                                  else self.ctx.now_ns + self.ctx.last_step_ns)
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={r: i for i, r in enumerate(req_ids)},

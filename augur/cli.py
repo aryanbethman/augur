@@ -8,6 +8,22 @@ import os
 import sys
 
 from augur.cost.profiles import default_fork
+from augur.sim.router import ROUTERS, make_router
+
+
+def pin_hash_seed(module: str) -> None:
+    """Re-run this program once with PYTHONHASHSEED=0 if it is unset.
+
+    vLLM iterates sets of request ids (e.g. the requests finished in a step),
+    so with KV offload the order the CPU tier ranks blocks for eviction, and
+    so later hits, depends on Python's string hashing, which is random per
+    process unless the seed is fixed at start-up. Pinned, a run repeats
+    exactly; a real vLLM run to compare with should use the same seed.
+    Called by: cli.main, bench.main (as programs only)."""
+    if os.environ.get("PYTHONHASHSEED") is not None:
+        return
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.execv(sys.executable, [sys.executable, "-m", module, *sys.argv[1:]])
 
 
 def _scheduler_cls(a) -> str | None:
@@ -59,7 +75,40 @@ def _tp_params(a, cpu_bw, cpu_lat) -> dict:
     return {k: defaults.get(k) if v is None else v for k, v in flags.items()}
 
 
+def _offload_link(a, cpu_bw, cpu_lat):
+    """GPU <-> CPU KV transfer cost: --kv-offload-* flags, else the CPU memory's
+    (--cpu-mem-* flags, else the cluster config's cpu_mem, else the fork's
+    defaults), the numbers LLMServingSim prices its KV loads with."""
+    from augur.sim.offload import OffloadLink
+    if a.lss_cluster_config and (cpu_bw is None or cpu_lat is None):
+        with open(a.lss_cluster_config, encoding="utf-8") as f:
+            cpu = ((json.load(f).get("nodes") or [{}])[0]).get("cpu_mem") or {}
+        cpu_bw = cpu.get("mem_bw") if cpu_bw is None else cpu_bw
+        cpu_lat = cpu.get("mem_latency") if cpu_lat is None else cpu_lat
+    bw = a.kv_offload_gbps if a.kv_offload_gbps is not None else (cpu_bw if cpu_bw is not None else 256.0)
+    lat = a.kv_offload_latency_ns if a.kv_offload_latency_ns is not None else (cpu_lat or 0)
+    return OffloadLink(gbps=float(bw), latency_ns=int(lat))
+
+
+def _offload_tiers(a) -> tuple:
+    """--kv-offload-tier values as TierSpecs, in order. Raises ValueError with
+    the reason on a malformed or misplaced tier. Called by: main."""
+    if not a.kv_offload_tier:
+        return ()
+    if not a.kv_offload_gib:
+        raise ValueError("--kv-offload-tier needs --kv-offload-gib (the CPU tier every secondary tier sits behind)")
+    from augur.sim.tiers import TierSpec
+    tiers = tuple(TierSpec.parse(t) for t in a.kv_offload_tier)
+    names = [t.name for t in tiers]
+    twice = sorted({n for n in names if names.count(n) > 1})
+    if twice:
+        raise ValueError(f"--kv-offload-tier: {', '.join(twice)} named twice")
+    return tiers
+
+
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        pin_hash_seed("augur.cli")
     p = argparse.ArgumentParser(prog="augur")
     p.add_argument("--fork", default=default_fork(),
                    help="LLMServingSim fork checkout (model configs, profiles); "
@@ -85,7 +134,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--pd-link-latency-ns", type=int, default=20_000)
     p.add_argument("--pd-contention", choices=["none", "decode"], default="none",
                    help="decode: concurrent KV pulls into a decode engine share its link bandwidth")
-    p.add_argument("--router", default="least-loaded")
+    p.add_argument("--router", default="least-loaded", choices=list(ROUTERS),
+                   help="engine for each call (and, with PD, the decode engine): least-loaded (fewest requests in "
+                        "the engine, as LLMServingSim) and round-robin, or a vLLM Router policy: random, "
+                        "power-of-two, cache-aware (the vLLM Router's default), consistent-hash, rendezvous-hash, "
+                        "sticky-least-loaded (augur/sim/router.py)")
+    p.add_argument("--router-seed", type=int, default=0, help="random, power-of-two: random seed")
+    p.add_argument("--router-cache-threshold", type=float, default=0.3,
+                   help="cache-aware: share of the prompt an engine must already hold to be preferred "
+                        "(vLLM Router --cache-threshold)")
+    p.add_argument("--router-balance-abs-threshold", type=int, default=64,
+                   help="cache-aware: in-flight counts are imbalanced (prefix ignored) when max - min exceeds "
+                        "this and max exceeds min times --router-balance-rel-threshold")
+    p.add_argument("--router-balance-rel-threshold", type=float, default=1.5)
+    p.add_argument("--router-eviction-interval-s", type=float, default=120.0,
+                   help="cache-aware: how often each engine's prefix tree is cut back to --router-max-tree-size")
+    p.add_argument("--router-max-tree-size", type=int, default=1 << 25,
+                   help="cache-aware: characters each engine's prefix tree keeps (the router counts 8 per token)")
+    p.add_argument("--router-session-expiry-s", type=float, default=7200.0,
+                   help="sticky-least-loaded: a session idle this long gets an engine afresh "
+                        "(VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S)")
+    p.add_argument("--router-session-ids", action=argparse.BooleanOptionalAction, default=True,
+                   help="consistent-hash, rendezvous-hash, sticky-least-loaded: clients send each call's session "
+                        "id (x-session-id); without, those policies key a call on its prompt")
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--tp-link-bw", type=float, default=None,
                    help="--cost tables at TP>1: GPU-to-GPU link bandwidth for the collectives, GB/s (default 16; "
@@ -94,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="--cost tables at TP>1: link latency per hop (default 20000; or the file's link_latency)")
     p.add_argument("--npu-mem-bw", type=float, default=None,
                    help="--cost tables at TP>1: GPU memory bandwidth, GB/s (default: the profile's, if the fork "
-                        "defines one for the hardware; or the file's npu_mem.mem_bw)")
+                        "defines one for the hardware, else augur's for it (H100: 3350, SXM); or the file's "
+                        "npu_mem.mem_bw)")
     p.add_argument("--hbm-gb", type=float, default=80.0, help="simulated GPU memory")
     p.add_argument("--mem-util", type=float, default=0.9, help="vLLM's --gpu-memory-utilization")
     p.add_argument("--kv-reserve-gib", type=float, default=0.0,
@@ -161,6 +233,22 @@ def main(argv: list[str] | None = None) -> int:
                         "are used (so one file drives either pricer); a contradicting flag is an error")
     p.add_argument("--cpu-mem-bw", type=float, default=None, help="GB/s, the fork's cpu_mem.mem_bw (default 256)")
     p.add_argument("--cpu-mem-latency-ns", type=int, default=None, help="default 0")
+    p.add_argument("--kv-offload-gib", type=float, default=None,
+                   help="KV offload to CPU memory, GiB per engine: vLLM's --kv-offloading-size (native "
+                        "OffloadingConnector; its scheduler half runs unmodified, augur/sim/offload.py stands in "
+                        "for its GPU worker)")
+    p.add_argument("--kv-offload-gbps", type=float, default=None,
+                   help="GPU <-> CPU KV transfer bandwidth, GB/s each way (default: the CPU memory's, "
+                        "--cpu-mem-bw or the cluster config's cpu_mem.mem_bw, as LLMServingSim prices its KV "
+                        "loads; a PCIe link is usually far slower, so set it for real hardware)")
+    p.add_argument("--kv-offload-latency-ns", type=int, default=None,
+                   help="per GPU <-> CPU transfer (default: --cpu-mem-latency-ns or the cluster config's "
+                        "cpu_mem.mem_latency)")
+    p.add_argument("--kv-offload-tier", action="append", default=None, metavar="NAME:GIB:GBPS[:LATENCY_NS]",
+                   help="a secondary KV tier behind the CPU one (e.g. CXL memory: cxl:64:30:250), as vLLM's "
+                        "offload tiering runs it: stores cascade to it, hits in it are promoted to the CPU "
+                        "tier, then loaded to the GPU. Capacity in GiB, bandwidth in GB/s each way, latency per "
+                        "transfer. Repeat for more tiers (in order); needs --kv-offload-gib")
     p.add_argument("--output", default=None, help="request CSV (fork format)")
     p.add_argument("--step-log", default=None, help="per-step CSV: start, duration, batch shape")
     p.add_argument("--lss-loop-compat", action="store_true",
@@ -176,13 +264,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"augur: --fixed-step-ms and --fixed-per-token-us only apply with --cost fixed (this run: --cost {a.cost})",
               file=sys.stderr)
         return 2
+    if a.kv_offload_gib and (a.prefill_engines or a.dp > 1):
+        print("augur: --kv-offload-gib with PD or DP is not modeled yet", file=sys.stderr)
+        return 2
+    try:
+        a.kv_offload_tiers = _offload_tiers(a)
+    except ValueError as e:
+        print(f"augur: {e}", file=sys.stderr)
+        return 2
     if a.quiet:
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
     from augur.cost import FixedCost
     from augur.sim.coordinator import Coordinator
     from augur.sim.engine import EngineSpec, SimEngine
     from augur.sim.models import estimate_weight_bytes, model_dir
-    from augur.sim.router import ROUTERS
     from augur.trace.workload import Workload
 
     cache_root = os.path.expanduser("~/.cache/augur/models")
@@ -272,7 +367,10 @@ def main(argv: list[str] | None = None) -> int:
                                     "prompt_lookup_max": 4, "prompt_lookup_min": 2}
                                    if a.num_speculative_tokens else None),
                       spec_accept_rate=a.spec_accept_rate,
-                      scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks)
+                      scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks,
+                      kv_offload_gib=a.kv_offload_gib,
+                      kv_offload_link=_offload_link(a, *cpu_flags) if a.kv_offload_gib else None,
+                      kv_offload_tiers=a.kv_offload_tiers)
     notes = []
     if a.async_scheduling and a.num_speculative_tokens:
         notes.append("speculative decoding is modeled with synchronous scheduling only; this run is synchronous")
@@ -305,9 +403,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs,
                             filler_vocab=a.filler_vocab)
-    coord = Coordinator(engines, ROUTERS[a.router](), workload,
+    router_options = dict(seed=a.router_seed, cache_threshold=a.router_cache_threshold,
+                          balance_abs_threshold=a.router_balance_abs_threshold,
+                          balance_rel_threshold=a.router_balance_rel_threshold,
+                          eviction_interval_s=a.router_eviction_interval_s, max_tree_size=a.router_max_tree_size,
+                          session_expiry_s=a.router_session_expiry_s, session_ids=a.router_session_ids)
+    coord = Coordinator(engines, make_router(a.router, **router_options), workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
-                        decode_router=ROUTERS[a.router](),
+                        decode_router=make_router(a.router, **router_options),
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
                         frontend_latency_ns=0 if replaying else int(a.frontend_latency_ms * 1e6),
                         delivery_latency_ns=0 if replaying else int(a.delivery_latency_ms * 1e6))

@@ -13,6 +13,7 @@ wraps around vLLM (executor, coordinator), not in timing.
 
 from __future__ import annotations
 
+import bisect
 import json
 import sys
 from dataclasses import dataclass, field
@@ -78,7 +79,18 @@ class ReplayCost:
     # tokens it was scheduled in each step (1 + drafts for a decode), by call id.
     outs: list[dict] = field(default_factory=list)
     toks: list[dict] = field(default_factory=list)
+    # KV offload: job id -> when the logged worker reported it finished (the
+    # start of the step whose output carried it; the worker polls then).
+    kv_done: dict[int, int] = field(default_factory=dict)
+    # Every logged schedule, empty ones too (log time 0 = first event): an
+    # empty step can still matter (it hands a KV connector new requests).
+    sched_times: list[int] = field(default_factory=list)
     k: int = 0
+
+    def next_schedule_ns(self, now_ns: int) -> int | None:
+        """The first logged schedule at or after now_ns."""
+        i = bisect.bisect_left(self.sched_times, now_ns)
+        return self.sched_times[i] if i < len(self.sched_times) else None
 
     @classmethod
     def from_log(cls, path: str) -> "ReplayCost":
@@ -87,6 +99,9 @@ class ReplayCost:
         st = steps(ev)
         outs = [{call_id(r): n for r, n in u["out"].items()} for _, u in st]
         toks = [{call_id(r): n for r, n in s["tok"].items()} for s, _ in st]
+        sched_t = {e["k"]: e["t"] for e in ev if e["ev"] == "sched"}
+        kv_done = {jid: sched_t[e["k"]] - t0 for e in ev if e["ev"] == "upd" for jid in e.get("jobs", ())}
+        sched_times = sorted(t - t0 for t in sched_t.values())
         if is_async(ev):
             # The GPU runs batches back to back: batch k starts when it was
             # scheduled or when batch k-1 finished, whichever is later, and
@@ -100,14 +115,14 @@ class ReplayCost:
             # like the last one.
             for _ in range(_unlogged_tail(ev) if d else 0):
                 d.append(d[-1])
-            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks)
+            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times)
         d = []
         for i, (s, u) in enumerate(st):
             if u["left"] > 0 and i + 1 < len(st):
                 d.append(st[i + 1][0]["t"] - s["t"])
             else:
                 d.append(u["t"] - s["t"])
-        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks)
+        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times)
 
     def step_ns(self, shape: StepShape) -> int:
         if self.k >= len(self.durations):

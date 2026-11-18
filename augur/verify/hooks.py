@@ -12,7 +12,10 @@ decision is still vLLM's. Set ``AUGUR_STEP_LOG=<path>``; each process writes
     {"ev": "add",   "t": ns, "rid": ..., "prompt": n}
     {"ev": "sched", "t": ns, "k": step, "tok": {rid: n}, "new": {rid: computed},
      "pre": [rid...]}
-    {"ev": "upd",   "t": ns, "k": step, "out": {rid: n}, "fin": [rid...], "left": n}
+    {"ev": "upd",   "t": ns, "k": step, "out": {rid: n}, "fin": [rid...], "left": n,
+     "jobs": [id...], "recv": [rid...], "xfer": {"load": [bytes, s, n], "store": [...]}}
+
+(the last three only when the KV connector's worker reported something).
 
 ``t`` comes from ``CLOCK(phase)`` (monotonic ns in real vLLM; augur points it
 at its virtual clock, where an update lands at the end of its step). ``new`` holds a request's computed tokens at its first schedule,
@@ -100,10 +103,30 @@ class _LoggingMixin:
                         fin.append(o.request_id)
             k = (self._k_of or {}).pop(id(scheduler_output), self._k)
             log.write({"ev": "upd", "t": CLOCK("upd"), "k": k, "out": out, "fin": sorted(fin),
-                       "left": self.get_num_unfinished_requests()})
+                       "left": self.get_num_unfinished_requests(), **_kv_report(model_runner_output)})
             if fin or not self.get_num_unfinished_requests():
                 log.flush()  # an idle engine may be killed before atexit runs
         return outputs
+
+
+def _kv_report(model_runner_output) -> dict:
+    """What the KV connector's worker reported in this step's output: finished
+    offload jobs, requests whose KV arrived, and bytes / seconds moved each
+    way (offload). Empty when it reported nothing."""
+    kvo = getattr(model_runner_output, "kv_connector_output", None)
+    if kvo is None:
+        return {}
+    rec = {}
+    worker_meta = kvo.kv_connector_worker_meta
+    if getattr(worker_meta, "completed_jobs", None):
+        rec["jobs"] = sorted(worker_meta.completed_jobs)
+    if kvo.finished_recving:
+        rec["recv"] = sorted(kvo.finished_recving)
+    stats = getattr(worker_meta, "transfer_stats", None)
+    if stats is not None and not stats.is_empty():
+        rec["xfer"] = {"load": [stats.load.bytes, stats.load.time, len(stats.load.sizes)],
+                       "store": [stats.store.bytes, stats.store.time, len(stats.store.sizes)]}
+    return rec
 
 
 class LoggingScheduler(_LoggingMixin, Scheduler):

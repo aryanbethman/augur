@@ -6,6 +6,21 @@ inference experiments. Every item is judged by that.
 
 Order: top to bottom. Status: [ ] open, [~] in progress, [x] done.
 
+## Current state (2026-11-18)
+Branch feature/router-offload-20261118: vLLM Router policies, KV offload to CPU, tiered KV offload. 115 tests pass and the six real-GPU replays are still exact. None of the
+new features has been checked against real hardware.
+
+## Verification runs, once the GPUs and CPUs are free
+1. Real-GPU check of CPU offload (section 4; script ready)
+2. Rerun the PD async comparisons after the async loop fix (section 4; CPU only)
+3. Real-GPU runs where the schedulers differ (section 6)
+4. `vllm bench serve` vs `augur bench` end to end (section 1)
+5. 256-GPU scale run with the table pricer; the 51.6 GB RSS at 256 NPUs (section 6, Also open)
+6. Wheel pip-installed into a clean venv (section 6)
+
+## Next features (proposed order, no runs needed)
+1. vLLM Router kv-aware policy  2. EAGLE/MTP drafter cost  3. KV offload with PD or DP
+
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
 - [x] Replay (augur.replay); self-test exact on ShareGPT, SWE-bench, heavy
@@ -38,12 +53,36 @@ Order: top to bottom. Status: [ ] open, [~] in progress, [x] done.
 - [x] Speculative decoding with async scheduling (runs; not checked against real async yet)
 - [x] Real-GPU replay of an ngram run (sync): 1,880/1,880 after drafter fix (e0f0a18)
 - [x] Real-GPU replay of an async ngram run: 1,722/1,722 (818a204)
-- [ ] Speculative decoding: EAGLE/MTP drafter cost
-- [ ] KV offload connectors (LMCache, CPU offload) — memory tiers (paper 2)
+- [ ] Speculative decoding: EAGLE/MTP drafter cost. Medium: vLLM needs a draft-model config (a synthetic one must
+      pass its checks; EAGLE also changes KV allocation through lookahead tokens), and both cost models price
+      whole-model steps only, so the drafter needs per-layer pricing. No EAGLE head cached to check against
+- [x] KV offload to CPU (2026-11-18, branch feature/router-offload-20261118): vLLM's OffloadingConnector
+      unmodified, augur/sim/offload.py as its GPU worker (store/load/sync-load FIFO lanes, latency + bytes/bw,
+      default the CPU memory's as LLMServingSim); --kv-offload-gib/-gbps/-latency-ns; step log records offload
+      jobs, replay re-times them. Own-log replay exact (sync and async); runs repeat exactly (PYTHONHASHSEED pinned)
+- [ ] Real-GPU check of CPU offload: scripts/real_offload_check.sh (SWE-bench 50 sessions, 16 GiB CPU tier,
+      GPU 0, ~15 min), then replay + measured PCIe rate + e2e. Waiting for a free GPU
+- [x] Tiered KV offload (2026-11-18): vLLM's TieringOffloadingManager unmodified (cascade CPU -> tiers,
+      promotion tier -> CPU -> GPU), augur/sim/tiers.py SimMemoryTier as the tier (capacity, LRU, FIFO
+      write/read lanes, latency + bytes/bw on the virtual clock), CPU tier buffer anonymous (no /dev/shm).
+      --kv-offload-tier NAME:GIB:GBPS[:LATENCY_NS], repeatable — memory tiers (paper 2). Own-log replay exact
+- [ ] Tiered offload: real-hardware check (needs a CXL box or a second memory pool)
+- [ ] Tiered offload: CXL parameters from LLMServingSim's cxl_mem config; storage tiers (fs/obj) modeled as more
+      than a slow memory tier
+- [ ] KV offload with PD or DP (needs vLLM's MultiConnector so NIXL and offload run together)
+- [ ] KV offload: LMCache connector
+- [ ] vLLM's tiering livelocks when one request's prefix needs more chunks than the CPU tier holds (promote,
+      evict, promote ...); augur now stops such a run after 60 s simulated without a token (STALL_NS).
+      Worth reporting upstream?
 - [ ] Pipeline parallelism
 - [x] Async scheduling with DP (68f24df)
 - [x] PD M x N engines; shared-link KV pull contention (55da69c)
-- [ ] Real vLLM Router policies
+- [x] vLLM Router policies (2026-11-18): random, power-of-two, cache-aware (router default; per-engine token
+      prefix trees, LRU eviction), consistent-hash, rendezvous-hash, sticky-least-loaded, with the router's
+      defaults; in-flight counted until the stream ends. --router-* flags
+- [ ] vLLM Router kv-aware policy (needs the engines' KV events, GPU and CPU tier)
+- [ ] Async loop fix (2026-11-18) changes PD async timing too (KV-arrived reports now reach the scheduler at
+      once, not at the next unrelated event): rerun the PD async comparisons
 
 ## 5. Profiles
 - [ ] Profiling pipeline so new models / hardware can be added by whoever has a GPU
@@ -62,16 +101,18 @@ Order: top to bottom. Status: [ ] open, [~] in progress, [x] done.
       augur bench runs with no fork. --cost tables / auto
 - [x] Standalone for shipped profiles (1aa37c2): augur defaults to --cost auto; model config from the profile;
       26 of 36 tests run with no fork (the other 10 compare against it); offline-built wheel runs the benchmark
+- [x] augur bench without its tokenizer (offline, not cached): clear error with the way out (--tokenizer DIR or
+      a Hugging Face download) instead of a traceback (2026-11-18)
 - [ ] Standalone, remaining: the wheel was run unpacked, not pip-installed into a clean venv (needs a vLLM
-      download); augur bench needs the model's tokenizer from Hugging Face; scratch scripts that
-      relied on the old --cost fixed default
+      download: a run, waiting for a free machine); scratch scripts that relied on the old --cost fixed default
 - [ ] Tables for MoE (needs the 3-D expert surface; scipy Delaunay in the fork) and more shipped profiles
 - [x] TP>1 without the ASTRA binary (afa6a3b): closed form of the ring collectives in tables.py, identical to
       the fork on whole runs (8B TP2, 70B TP4, 4 x TP4); shipped 8B tp2, 70B tp4/tp8. Refuses settings where the
       form is not exact (2A > all-reduce step or 2B > last collective step)
-- [ ] TP follow-ups: H100 profiles have no default GPU memory bandwidth (need --npu-mem-bw or a cluster config);
-      the guard rests on ~300 probes, not a derivation; the inexact corner (large CPU-memory latency) is not
-      understood; 256-GPU scale run not yet redone with the table pricer; multi-node topologies out of scope
+- [x] H100 profiles default to 3,350 GB/s GPU memory bandwidth (H100 SXM, as the fork's H100 cluster configs)
+      when the profile has none (tables.NPU_MEM_BW_GBPS; 2026-11-18)
+- [ ] TP follow-ups: the guard rests on ~300 probes, not a derivation; the inexact corner (large CPU-memory
+      latency) is not understood; 256-GPU scale run not yet redone with the table pricer; multi-node out of scope
 - [ ] Waiting for a free GPU: real-GPU runs where the schedulers differ (preemption-heavy,
       spec decoding, agent sessions under async): augur vs LLMServingSim per request
 - [x] Front-end model (456dcac): constant 6.5 ms intake + 8 ms delivery as defaults; the load-dependent
@@ -79,7 +120,10 @@ Order: top to bottom. Status: [ ] open, [~] in progress, [x] done.
       TTFT -11.7% -> -1.2%. Trace client's 100-connection cap removed (untested on a server)
 - [ ] Front end: prompt-length dependence of the 6.5 ms (only 1,024-token text prompts measured); other hosts
 - [x] Run-to-run noise: covered by the +-1% sensitivity range in augur bench
-- [ ] Automatic KV size from memory accounting (now a manual --kv-reserve-gib)
+- [ ] Automatic KV size from memory accounting (now a manual --kv-reserve-gib). Looked at 2026-11-18: in the 7
+      real 4060 Ti logs (same model and config) vLLM's own reserve moves 0.65-0.97 GiB run to run (peak
+      activation alone 0.50-0.82), so one model/GPU cannot fit a formula. Better done in the profiling pipeline:
+      record weights / non-torch / peak activation / CUDA-graph memory when a GPU is profiled
 - [ ] Multi-GPU against real hardware (TP>1, PD): blocked on GPU 1's clock lock
 
 ## Also open

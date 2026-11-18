@@ -165,10 +165,33 @@ def test_guard_refuses_long_cpu_memory_access():
         TableCost(TP2, link_bw=1000, link_latency_ns=0, cpu_mem_latency_ns=40)
 
 
+def test_h100_tp_profile_defaults_to_h100_sxm_memory_bandwidth():
+    """The fork has no H100 hardware default, so the H100 profiles carry none; augur supplies 3,350 GB/s
+    (H100 SXM, the value the fork's H100 cluster configs use)."""
+    h100 = bundled_profile("H100", "meta-llama/Llama-3.1-70B", 4)
+    shape = StepShape(seqs=(SeqWork(1, 100, True), SeqWork(256, 0, False)))
+    default = TableCost(h100)
+    assert default.npu_mem_bw == 3350
+    assert default.step_ns(shape) == TableCost(h100, npu_mem_bw=3350).step_ns(shape)
+    assert TableCost(h100, npu_mem_bw=2000).npu_mem_bw == 2000
+
+
+def test_profile_hardware_entry_wins_over_augurs_default(tmp_path):
+    p = json.loads(gzip.decompress(TP2.read_bytes()))
+    q = dict(p, identity=dict(p["identity"], hardware="H100"))  # RTXPRO6000 data, relabelled
+    f = tmp_path / "relabelled.json.gz"
+    f.write_bytes(gzip.compress(json.dumps(q).encode()))
+    assert TableCost(f).npu_mem_bw == p["hardware"]["npu_mem_bw_gbps"]
+
+
 def test_tp_profile_needs_its_parameters(tmp_path):
+    p = json.loads(gzip.decompress(bundled_profile("H100", "meta-llama/Llama-3.1-70B", 4).read_bytes()))
+    q = dict(p, identity=dict(p["identity"], hardware="XPU"))  # no profile entry, no augur default
+    f = tmp_path / "unknown_hw.json.gz"
+    f.write_bytes(gzip.compress(json.dumps(q).encode()))
     with pytest.raises(ValueError, match="npu_mem_bw"):
-        TableCost(bundled_profile("H100", "meta-llama/Llama-3.1-70B", 4))
-    TableCost(bundled_profile("H100", "meta-llama/Llama-3.1-70B", 4), npu_mem_bw=3350)
+        TableCost(f)
+    TableCost(f, npu_mem_bw=3350)
     p = json.loads(gzip.decompress(TP2.read_bytes()))
     del p["collectives"]
     f = tmp_path / "nocoll.json.gz"

@@ -114,6 +114,9 @@ _SENS_NAMES = {"request_throughput": "Request throughput (req/s)", "mean_ttft_ms
 
 
 def main(argv=None) -> int:
+    if argv is None:
+        from augur.cli import pin_hash_seed
+        pin_hash_seed("augur.bench")
     from vllm.benchmarks import serve
     from vllm.benchmarks.datasets.datasets import get_samples
     from vllm.tokenizers import get_tokenizer
@@ -131,7 +134,14 @@ def main(argv=None) -> int:
     if not args.ignore_eos:
         print("augur bench: outputs always run to their requested length (as with --ignore-eos)", file=sys.stderr)
 
-    tokenizer = get_tokenizer(args.tokenizer or args.model, trust_remote_code=args.trust_remote_code)
+    name = args.tokenizer or args.model
+    try:
+        tokenizer = get_tokenizer(name, trust_remote_code=args.trust_remote_code)
+    except OSError as e:
+        print(f"augur bench: cannot load the tokenizer {name!r} ({str(e).splitlines()[0]}). The benchmark builds "
+              "its requests with the model's tokenizer, as vllm bench serve does: let Hugging Face download it "
+              "(unset HF_HUB_OFFLINE), or pass --tokenizer DIR with a local copy.", file=sys.stderr)
+        return 2
     random.seed(args.seed)
     np.random.seed(args.seed)
     requests = get_samples(args, tokenizer)
