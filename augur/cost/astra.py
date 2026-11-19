@@ -28,7 +28,8 @@ import tempfile
 
 
 class AstraOracle:
-    def __init__(self, fork_root: str, cluster_config: str, workdir: str | None = None):
+    def __init__(self, fork_root: str, cluster_config: str, workdir: str | None = None,
+                 first_instance_only: bool = False):
         self.fork_root = os.path.abspath(fork_root)
         self.run_dir = os.path.join(self.fork_root, "serving")
         if self.fork_root not in sys.path:
@@ -38,6 +39,8 @@ class AstraOracle:
         if workdir is None:
             atexit.register(self.close)
         cluster_config = os.path.abspath(cluster_config)
+        if first_instance_only:
+            cluster_config = self._first_instance_config(cluster_config)
         cwd = os.getcwd()
         os.chdir(self.run_dir)
         try:
@@ -61,6 +64,29 @@ class AstraOracle:
         self.cache: dict[tuple, int] = {}
         self.runs = 0
         self._event_wl = None
+
+    def _first_instance_config(self, path: str) -> str:
+        """A copy of a one-node cluster config that keeps only instance 0.
+
+        Single-engine pricing (no DP) only ever runs instance 0, so the other
+        instances' NPUs are never handed work. ASTRA-Sim still simulates them,
+        and with several TP>1 instances (16 NPUs) a query did not finish in
+        minutes, against ~2 s for the instance alone. Engines are then priced
+        as independent: no contention between instances (checked only for the
+        link: instances own disjoint NPUs; the shared CPU-memory device is not
+        contended by the other instances' reads). Other configs are used as given."""
+        import json
+        with open(path, encoding="utf-8") as f:
+            c = json.load(f)
+        nodes = c.get("nodes") or []
+        if len(nodes) != 1 or len(nodes[0].get("instances") or []) <= 1 or c.get("num_nodes", 1) != 1:
+            return path
+        c["nodes"][0]["instances"] = c["nodes"][0]["instances"][:1]
+        c["nodes"][0]["num_instances"] = 1
+        out = os.path.join(self.workdir, "cluster_instance0.json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(c, f)
+        return out
 
     @staticmethod
     def comm_key(rows) -> tuple:

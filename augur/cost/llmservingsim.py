@@ -76,7 +76,7 @@ class LLMServingSimCost:
             if cluster_config is None:
                 raise ValueError("tp/ep/dp > 1 needs an LLMServingSim cluster config for ASTRA-Sim (--lss-cluster-config)")
             from augur.cost.astra import AstraOracle
-            self.oracle = AstraOracle(self.fork_root, cluster_config)
+            self.oracle = AstraOracle(self.fork_root, cluster_config, first_instance_only=dp == 1)
         self._cache: dict[tuple, int] = {}
         self._batch_id = 0
 
