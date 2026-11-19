@@ -33,10 +33,11 @@ class LLMServingSimCost:
     def __init__(self, fork_root: str, hardware: str, model: str, tp: int = 1, ep: int = 1,
                  max_num_batched_tokens: int = 2048, dtype: str = "bfloat16",
                  cpu_mem_bw_gbps: float = 256.0, cpu_mem_latency_ns: int = 0,
-                 cluster_config: str | None = None, dp: int = 1):
+                 cluster_config: str | None = None, dp: int = 1,
+                 profile_variant: str | None = None):
         self.fork_root = os.path.abspath(fork_root)
         from augur.cost.profiles import check
-        check(self.fork_root, hardware, model, tp)
+        check(self.fork_root, hardware, model, tp, profile_variant)
         if self.fork_root not in sys.path:
             sys.path.insert(0, self.fork_root)
         self._run_dir = os.path.join(self.fork_root, "serving")
@@ -48,6 +49,9 @@ class LLMServingSimCost:
             from serving.core.config_builder import _mem_str
         finally:
             os.chdir(cwd)
+        if profile_variant:  # the fork's --profile-variant: every profile lookup reads perf/<hw>/<model>/<variant>/
+            tg.set_profile_variant_override(profile_variant)
+        self.profile_variant = profile_variant
         self._tg = tg
         self._Batch = Batch
         # The fork's default placement: weights and KV on the NPU, evictions to CPU.

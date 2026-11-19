@@ -47,17 +47,24 @@ def shipped() -> list[tuple[str, str, str, int]]:
     return out
 
 
-def check(fork_root: str, hardware: str, model: str, tp: int) -> None:
-    """Raise a clear error if no profile covers this hardware/model/TP."""
+def check(fork_root: str, hardware: str, model: str, tp: int, variant: str | None = None) -> None:
+    """Raise a clear error if no profile covers this hardware/model/TP.
+
+    With ``variant`` (a profile folder such as ``bf16-tp4proj``, what the fork's
+    ``--profile-variant`` pins), only that folder counts: the model and TP must
+    be present under it, whatever the other folders hold."""
     have = available(fork_root)
-    if any(h == hardware and m == model and t == tp for h, m, _, t in have):
+    if any(h == hardware and m == model and t == tp and (variant is None or d == variant)
+           for h, m, d, t in have):
         return
     if not have:
         raise FileNotFoundError(f"no profiles under {fork_root}/profiler/perf "
                                 "(set --fork or AUGUR_FORK to the LLMServingSim fork checkout)")
-    near = [f"  {h} {m} {d} tp{t}" for h, m, d, t in have if h == hardware or m == model] or \
-           [f"  {h} {m} {d} tp{t}" for h, m, d, t in have]
-    raise FileNotFoundError(f"no profile for {model} on {hardware} at tp{tp}. Available:\n" + "\n".join(near)
+    where = f" in profile variant {variant!r}" if variant else ""
+    pool = [r for r in have if variant is None or r[2] == variant]
+    near = [f"  {h} {m} {d} tp{t}" for h, m, d, t in pool if h == hardware or m == model] or \
+           [f"  {h} {m} {d} tp{t}" for h, m, d, t in pool or have]
+    raise FileNotFoundError(f"no profile for {model} on {hardware} at tp{tp}{where}. Available:\n" + "\n".join(near)
                             + "\n(python -m augur.cost.profiles lists all; the fork's profiler adds new ones)")
 
 

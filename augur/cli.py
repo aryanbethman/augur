@@ -227,6 +227,10 @@ def main(argv: list[str] | None = None) -> int:
                         "(see augur/cost/tables.py) is refused. "
                         "llmservingsim: the fork's profiles and ASTRA-Sim (MoE, TP>1, DP). "
                         "fixed: one constant step time (--fixed-step-ms, --fixed-per-token-us), no profile")
+    p.add_argument("--profile-variant", default=None, metavar="NAME",
+                   help="--cost llmservingsim: read the fork's profiles from the folder perf/<hardware>/<model>/NAME/ "
+                        "(e.g. bf16-tp4proj, a projected TP4 bundle) instead of the one the model's dtype names; "
+                        "the fork's --profile-variant. --cost auto then uses llmservingsim (tables do not know variants)")
     p.add_argument("--profile", default=None, help="profile file for --cost tables (default: the one shipped "
                                                    "for --hardware and --model; python -m augur.cost.profiles lists them)")
     p.add_argument("--fixed-step-ms", type=float, default=None, help="--cost fixed only: base step time (default 25)")
@@ -262,6 +266,14 @@ def main(argv: list[str] | None = None) -> int:
                         "(1 ms idle quantum, TP>1 same-instant admission); not vLLM behaviour")
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
+    if a.profile_variant and a.cost in ("tables", "fixed"):
+        print(f"augur: --profile-variant selects a profile folder of the fork: it needs --cost llmservingsim "
+              f"(or auto), not --cost {a.cost}", file=sys.stderr)
+        return 2
+    if a.profile_variant and a.profile:
+        print("augur: --profile (a --cost tables file) and --profile-variant (a fork folder) exclude each other",
+              file=sys.stderr)
+        return 2
 
     cpu_flags = (a.cpu_mem_bw, a.cpu_mem_latency_ns)
     a.cpu_mem_bw = 256.0 if a.cpu_mem_bw is None else a.cpu_mem_bw
@@ -303,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
         profile = None
         if a.cost in ("tables", "auto"):
             from augur.cost.tables import bundled_profile
-            plain = a.dp == 1 and not a.enable_expert_parallel
+            plain = a.dp == 1 and not a.enable_expert_parallel and not a.profile_variant
             if a.cost == "tables" or a.profile:
                 profile = a.profile or bundled_profile(a.hardware, a.model, a.tp)
             elif plain:
@@ -319,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.cost == "llmservingsim" and not a.replay_durations:
             from augur.cost.profiles import check, shipped
             try:
-                check(a.fork, a.hardware, a.model, a.tp)
+                check(a.fork, a.hardware, a.model, a.tp, a.profile_variant)
             except FileNotFoundError:
                 if not auto:
                     raise
@@ -370,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
         cost = LLMServingSimCost(fork_root=a.fork, hardware=a.hardware, model=a.model, tp=a.tp,
                                  max_num_batched_tokens=a.max_num_batched_tokens or 2048,
                                  cpu_mem_bw_gbps=a.cpu_mem_bw, cpu_mem_latency_ns=a.cpu_mem_latency_ns,
-                                 cluster_config=a.lss_cluster_config, dp=a.dp,
+                                 cluster_config=a.lss_cluster_config, dp=a.dp, profile_variant=a.profile_variant,
                                  ep=a.dp * a.tp if a.enable_expert_parallel else 1)
 
     spec = EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=kv_bytes,
