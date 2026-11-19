@@ -156,6 +156,8 @@ measured, is reliable.
 | --- | --- | --- | --- |
 | ShareGPT 300, sync | mean TTFT / TPOT / latency | −3.3 / −3.4 / −3.4% | +0.2 / −0.2 / 0.0% (−3.3 / −3.4 / −3.3% without the CPU term) |
 | ShareGPT 300, async | mean TTFT / TPOT / latency | +1.4 / +0.9 / +1.2% | +1.7 / +1.1 / +1.5% |
+| SWE-bench sessions (765 calls), sync | mean TTFT / TPOT / latency | −4.5 / −2.1 / −3.6% | +0.4 / 0.0 / +0.2% |
+| SWE-bench sessions, sync | session duration, median per-session error | 3.7% | 0.9% |
 | random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −1.2 / −1.9% |
 | random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −11.2 / −28.1%, −1.4% |
 | random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.4%, −2.1%, +2.0% |

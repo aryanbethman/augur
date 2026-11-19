@@ -139,3 +139,12 @@ command; PD and DP+async have tests. 151 tests pass. Not fixed: DP + async sched
 - [ ] 51.6 GB peak RSS at 256 NPUs not explained by the store at 16: rerun 256 to measure
 - [x] Commit the PROGRESS.md notes (speed explanation, crash fix)
 - [ ] Faster DP rounds; cheaper ASTRA cache key
+- [x] --profile-variant (2026-11-19): price from a named fork profile folder, e.g. the projected Qwen3-30B-A3B
+      RTXPRO6000 bf16-tp4proj (rebuilt in the vllm-sim fork's format from its measured tp1/tp2; not the a4053bc
+      bundle, which that fork cannot load)
+- [ ] Arrival study at 16 GPUs, Llama-3.1-70B H100 TP4, 7 arrival processes (2026-11-19; anjuna3
+      ~/hipc-results/augur-arrivals16-20261119/llama70b-COMPARISON.md): aggregates within 0-16% of LLMServingSim
+      (session-scale branch a4053bc), ~20x faster, but call for call with --lss-loop-compat 0/2000 identical and
+      TPOT 18% apart (median); augur's mean TPOT +8%. Find where step prices differ (profile CSVs are byte-identical)
+- [ ] Qwen3-30B-A3B TP4/EP4 on a 4-instance cluster config: ASTRA-Sim did not finish one query in minutes
+      (1-instance config: 1.9 s)
