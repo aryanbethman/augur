@@ -138,6 +138,8 @@ class Coordinator:
         # DP + async scheduling
         self._dpa = bool(self.dp_group) and self.dp_group[0].async_sched
         self._dpa_shapes: dict[int, dict] = {}  # round -> engine_id -> shape (None: empty)
+        self._dpa_ready: dict[int, int] = {}  # round -> when its slowest rank's CPU has the batch ready
+        self._dpa_wake_at: int | None = None
         self._dpa_next_form = 0
         self._dpa_running: int | None = None  # round on the GPU
         self._dpa_left: set = set()  # ranks still running that round
@@ -502,6 +504,10 @@ class Coordinator:
                 r = max(e.dp_next_round, self._dpa_next_form)
                 e.dp_next_round = r + 1
                 self._dpa_shapes.setdefault(r, {})[e.engine_id] = shape
+                if shape is not None:
+                    # As single-engine async: the CPU prepares the batch while the GPU runs the previous
+                    # one, so it only delays the round when the GPU would otherwise be waiting for it.
+                    self._dpa_ready[r] = max(self._dpa_ready.get(r, 0), self.now + e.ctx.last_cpu_ns)
                 e.dp_fifo.append(r)
             e.ctx.launches.clear()
             e.ctx.launch_shapes.clear()
@@ -529,6 +535,14 @@ class Coordinator:
         shapes = self._dpa_shapes.get(x, {})
         if not shapes:
             return False
+        ready = self._dpa_ready.get(x, 0)
+        if ready > self.now:
+            if self._dpa_wake_at != ready:
+                self._dpa_wake_at = ready
+                self._push(ready, ARRIVAL, "dpa_wake", None)
+            return False
+        self._dpa_ready.pop(x, None)
+        self._dpa_wake_at = None
         if all(s is None for s in shapes.values()):
             del self._dpa_shapes[x]
             self._dpa_next_form = x + 1
@@ -555,6 +569,10 @@ class Coordinator:
         self.dp_rounds += 1
         self._dpa_running = x
         self._dpa_left = {e.engine_id for e in g}
+        for e, sh, ns in zip(g, final, per_rank):
+            if e.step_log is not None:
+                e.step_log.append((self.now, ns, sh.total_tokens, sum(x.num_new for x in sh.seqs if not x.is_decode),
+                                   sh.num_decode, sh.num_prefill, sh.forward_tokens, int(sh.dummy)))
         self._dpa_next_form = x + 1
         del self._dpa_shapes[x]
         for e, ns in zip(g, per_rank):

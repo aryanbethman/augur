@@ -95,6 +95,30 @@ def test_sync_dp_round_pays_the_step_cpu_time(tmp_path, workload, cpu_ns):
     assert {row[1] for e in engines for row in e.step_log} == {8_000_000 + cpu_ns}
 
 
+def _span(engines):
+    return max(row[0] + row[1] for e in engines for row in e.step_log)
+
+
+def test_async_dp_round_hides_step_cpu_time_like_one_engine(tmp_path, workload):
+    """GPU round 8 ms. CPU time under it is hidden (async) except at the start of a busy period; above it,
+    the CPU is the bottleneck and every round is spaced by the CPU time. Sync pays it on every round."""
+    span = {}
+    for mode, cpu in [("a", 0), ("a", 2_000_000), ("a", 20_000_000), ("s", 0), ("s", 2_000_000)]:
+        coord, engines, rec = dp_run(tmp_path, workload, mode == "a", cpu)
+        assert len(rec.done) == 12
+        span[mode, cpu] = _span(engines)
+    assert span["a", 0] < span["a", 2_000_000] - 1_000_000 < span["s", 2_000_000] - 1_000_000
+    assert span["a", 2_000_000] - span["a", 0] < (span["s", 2_000_000] - span["s", 0]) / 3
+    assert span["a", 20_000_000] > span["a", 2_000_000] + 20_000_000
+
+
+def test_async_dp_first_round_waits_for_the_cpu_when_the_gpu_is_idle(tmp_path, workload):
+    _, engines, _ = dp_run(tmp_path, workload, True, 20_000_000)
+    first_arrival = min(row[0] for e in engines for row in e.step_log)
+    _, base, _ = dp_run(tmp_path, workload, True, 0)
+    assert first_arrival == min(row[0] for e in base for row in e.step_log) + 20_000_000
+
+
 def test_async_dp_run_finishes_every_call(tmp_path, workload):
     coord, _, rec = dp_run(tmp_path, workload, True)
     assert len(rec.done) == 12 and coord.dp_rounds > 0

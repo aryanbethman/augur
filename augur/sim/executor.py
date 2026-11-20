@@ -297,6 +297,8 @@ class SimWorker:
         if self.ctx.defer_cost:
             self.ctx.last_shape = StepShape(seqs=tuple(seqs))
             self.ctx.last_step_ns = 0
+            # DP: the round's GPU time comes later; the CPU time is known now.
+            self.ctx.last_cpu_ns = (self.ctx.cpu_fixed_ns + self.ctx.cpu_per_request_ns * len(seqs)) if seqs else 0
         else:
             num_tokens = sum(x.num_new for x in seqs)
             q = 1 + self.ctx.spec_k
