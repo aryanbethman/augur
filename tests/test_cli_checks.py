@@ -26,13 +26,6 @@ def test_pd_needs_both_engine_kinds(flags, capsys):
     assert "--prefill-engines and --decode-engines" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("flags", [["--engines", "2"], ["--dp", "2"],
-                                   ["--prefill-engines", "1", "--decode-engines", "1"]])
-def test_step_log_vllm_refuses_several_engines(flags, capsys):
-    assert main(["--model", MODEL, "--workload", "unused", "--step-log-vllm", "unused", *flags]) == 2
-    assert "--step-log-vllm" in capsys.readouterr().err
-
-
 def test_missing_result_folders_are_created(tmp_path, workload):
     out, steps = tmp_path / "a" / "b" / "run.csv", tmp_path / "c" / "steps.csv"
     r = augur("--workload", workload, "--num-entries", "2", "--output", str(out), "--step-log", str(steps))

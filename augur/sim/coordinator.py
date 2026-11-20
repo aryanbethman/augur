@@ -405,12 +405,13 @@ class Coordinator:
                 final.append(StepShape(seqs=(SeqWork(1, 1, True),), padded_tokens=p, dummy=True))
             else:
                 final.append(StepShape(seqs=s.seqs, padded_tokens=p))
-        per_rank = g[0].ctx.cost.round_ns(final, first_rank=first_rank)
-        per_rank = self._scaled(g, per_rank)
+        replay = self._replay_rounds(g)
+        per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final, first_rank=first_rank))
         # The ranks meet in the round's first collective, so the slowest rank's CPU time holds up all of them.
-        cpu_ns = max((e.ctx.cpu_fixed_ns + e.ctx.cpu_per_request_ns * len(s.seqs) + e.ctx.last_offload_wait_ns
-                      for e, s in zip(g, shapes) if s is not None), default=0)
+        cpu_ns = 0 if replay else max((e.ctx.cpu_fixed_ns + e.ctx.cpu_per_request_ns * len(s.seqs)
+                                       + e.ctx.last_offload_wait_ns for e, s in zip(g, shapes) if s is not None), default=0)
         per_rank = [ns + cpu_ns for ns in per_rank]
+        self._log_round(g, final, per_rank)
         for e, ns in zip(g, per_rank):
             if e.ctx.offload is not None:
                 e.ctx.offload.commit_loads(self.now + ns)  # the round's forward ends with the step
@@ -422,6 +423,22 @@ class Coordinator:
         for e, outputs, ns in zip(g, outs, per_rank):
             e.busy = True
             self._push(self.now + ns, STEP_DONE, "step_done", (e, outputs))
+
+    @staticmethod
+    def _replay_rounds(g) -> list[int] | None:
+        """Replay of a DP run: each rank's logged duration for its next round (the
+        logged round already holds padding, CPU time and offload waits)."""
+        if not hasattr(g[0].ctx.cost, "next_round_ns"):
+            return None
+        return [e.ctx.cost.next_round_ns() for e in g]
+
+    def _log_round(self, g, final, per_rank) -> None:
+        """Each rank's step log gets the round it took part in, dummy forwards included
+        (a real vLLM log has no such record; only augur's own DP logs carry it, for replay)."""
+        for e, sh, ns in zip(g, final, per_rank):
+            log = e.core.scheduler._logger() if hasattr(e.core.scheduler, "_logger") else None
+            if log:
+                log.write({"ev": "round", "t": self.now, "dur": ns, "dummy": bool(sh.dummy)})
 
     @staticmethod
     def _scaled(g, per_rank):
@@ -573,8 +590,9 @@ class Coordinator:
                 final.append(StepShape(seqs=(SeqWork(1, 1, True),), padded_tokens=p, dummy=True))
             else:
                 final.append(StepShape(seqs=s.seqs, padded_tokens=p))
-        per_rank = g[0].ctx.cost.round_ns(final)
-        per_rank = self._scaled(g, per_rank)
+        replay = self._replay_rounds(g)
+        per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final))
+        self._log_round(g, final, per_rank)
         self.dp_rounds += 1
         self._dpa_running = x
         self._dpa_left = {e.engine_id for e in g}

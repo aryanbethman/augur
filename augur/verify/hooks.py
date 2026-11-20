@@ -36,6 +36,11 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 CLOCK: Callable[[str], int] = lambda phase: time.monotonic_ns()
 
+# Several engines in one process (augur's multi-engine runs): the engine a scheduler
+# being built belongs to. Its log is <path>.e<id>.<pid>.jsonl; None (a single engine,
+# or a real vLLM server) keeps <path>.<pid>.jsonl. Set by SimEngine before it builds its core.
+NEXT_ENGINE_TAG: int | None = None
+
 
 class _StepLog:
     def __init__(self, path: str):
@@ -57,11 +62,16 @@ class _LoggingMixin:
     _k = 0
     _k_of: dict | None = None  # id(scheduler_output) -> step number
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._engine_tag = NEXT_ENGINE_TAG
+
     def _logger(self) -> _StepLog | None:
         if self._log is None:
             path = os.environ.get("AUGUR_STEP_LOG")
             if path:
-                self._log = _StepLog(path)
+                tag = getattr(self, "_engine_tag", None)
+                self._log = _StepLog(path if tag is None else f"{path}.e{tag}")
         return self._log
 
     def add_request(self, request) -> None:

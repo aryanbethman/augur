@@ -55,6 +55,7 @@ class EngineSpec:
     kv_offload_tiers: tuple[TierSpec, ...] = ()  # secondary tiers behind the CPU one, in order (vLLM tiering)
     hbm_gb: float | None = None  # simulated GPU memory: unset batch limits are `vllm serve`'s for this GPU
     hardware: str = ""  # simulated GPU's name, which vLLM's batch defaults also look at
+    step_log_tag: bool = False  # --step-log-vllm with several engines: this engine's log is <path>.e<id>.<pid>.jsonl
     kv_events: bool = False  # publish vLLM's KV cache events (BlockStored / BlockRemoved) to this engine's in-process queue
 
 
@@ -122,6 +123,8 @@ class SimEngine:
             args.get_batch_defaults = _simulated_gpu_batch_defaults(spec)
             usage_context = UsageContext.OPENAI_API_SERVER  # what `vllm serve` passes
         self.vllm_config = args.create_engine_config(usage_context=usage_context)
+        from augur.verify import hooks as vllm_hooks
+        vllm_hooks.NEXT_ENGINE_TAG = engine_id if spec.step_log_tag else None
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
                                log_stats=False)
         self.max_model_len = self.vllm_config.model_config.max_model_len

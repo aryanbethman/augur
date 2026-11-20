@@ -212,9 +212,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-recorded-outputs", action="store_true",
                    help="emit unique output ids instead of the trace's recorded outputs (as a real model does)")
     p.add_argument("--step-log-vllm", default=None,
-                   help="write vLLM-scheduler step events (augur.verify.hooks format) to <path>.<pid>.jsonl")
+                   help="write vLLM-scheduler step events (augur.verify.hooks format) to <path>.<pid>.jsonl; "
+                        "with several engines, one log each: <path>.e<engine id>.<pid>.jsonl")
     p.add_argument("--replay-durations", default=None,
-                   help="price step k with the duration recorded in this vLLM step log (see augur.verify.replay)")
+                   help="price step k with the duration recorded in this vLLM step log (see augur.verify.replay). "
+                        "With several engines: the --step-log-vllm prefix of the run, or one log per engine, "
+                        "comma separated in engine order")
     p.add_argument("--replay-arrivals", default=None,
                    help="requests reach the engine when this vLLM step log says, steps priced by --cost "
                         "(separates arrival timing from step pricing)")
@@ -286,10 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         print("augur: PD needs both --prefill-engines and --decode-engines", file=sys.stderr)
         return 2
     num_engines = a.dp if a.dp > 1 else (a.prefill_engines + a.decode_engines or a.engines)
-    if a.step_log_vllm and num_engines > 1:
-        print("augur: --step-log-vllm logs one engine (engines would share one file and their step numbers collide)",
-              file=sys.stderr)
-        return 2
+    a.num_engines = num_engines
     try:
         a.kv_offload_tiers = _offload_tiers(a)
     except ValueError as e:
@@ -353,9 +353,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"model weights ({weights / 2**30:.1f} GiB/GPU) do not fit in {a.hbm_gb} GB", file=sys.stderr)
             return 2
 
+    replay_costs = None
     if a.replay_durations:
-        from augur.verify.replay import ReplayCost
-        cost = ReplayCost.from_log(a.replay_durations)
+        from augur.verify.replay import ReplayCost, resolve_logs
+        try:
+            replay_logs = resolve_logs(a.replay_durations, a.num_engines)
+        except ValueError as e:
+            print(f"augur: {e}", file=sys.stderr)
+            return 2
+        replay_costs = ReplayCost.from_logs(replay_logs)
+        cost = replay_costs[0]
     elif a.cost == "fixed":
         step_ms = 25.0 if a.fixed_step_ms is None else a.fixed_step_ms
         cost = FixedCost(base_ns=int(step_ms * 1e6), per_token_ns=int((a.fixed_per_token_us or 0.0) * 1e3))
@@ -397,17 +404,20 @@ def main(argv: list[str] | None = None) -> int:
                       kv_offload_gib=a.kv_offload_gib,
                       kv_offload_link=_offload_link(a, *cpu_flags) if a.kv_offload_gib else None,
                       kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware,
-                      kv_events=a.router == "kv-aware")
+                      kv_events=a.router == "kv-aware",
+                      step_log_tag=bool(a.step_log_vllm) and a.num_engines > 1)
     import dataclasses
     if a.dp > 1:
         engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
-                                                    enable_expert_parallel=a.enable_expert_parallel), cost)
+                                                    enable_expert_parallel=a.enable_expert_parallel),
+                             replay_costs[i] if replay_costs else cost)
                    for i in range(a.dp)]
     elif a.prefill_engines:
         roles = ["kv_producer"] * a.prefill_engines + ["kv_consumer"] * a.decode_engines
-        engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), cost) for i, r in enumerate(roles)]
+        engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), replay_costs[i] if replay_costs else cost)
+                   for i, r in enumerate(roles)]
     else:
-        engines = [SimEngine(i, spec, cost) for i in range(a.engines)]
+        engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost) for i in range(a.engines)]
     if hasattr(cost, "max_num_batched_tokens"):  # the fork's traces are built for the engine's real budget
         cost.max_num_batched_tokens = engines[0].vllm_config.scheduler_config.max_num_batched_tokens
     if not a.replay_durations:  # a logged step's duration already holds its CPU time
@@ -424,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         from augur.verify.replay import ReplayWorkload
         workload = ReplayWorkload(a.workload, max_entries=a.num_entries,
                                   log_path=a.replay_durations or a.replay_arrivals,
+                                  log_paths=replay_logs if replay_costs and a.num_engines > 1 else None,
                                   recorded_outputs=not a.no_recorded_outputs, filler_vocab=a.filler_vocab)
     else:
         workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs,
@@ -433,10 +444,15 @@ def main(argv: list[str] | None = None) -> int:
                           balance_rel_threshold=a.router_balance_rel_threshold,
                           eviction_interval_s=a.router_eviction_interval_s, max_tree_size=a.router_max_tree_size,
                           session_expiry_s=a.router_session_expiry_s, session_ids=a.router_session_ids)
-    coord = Coordinator(engines, make_router(a.router, **router_options), workload,
+    entry_router = make_router(a.router, **router_options)
+    decode_router = make_router("least-loaded" if a.router == "kv-aware" else a.router, **router_options)
+    if replay_costs and a.num_engines > 1:
+        # Each call goes where its log says (the placing policy is not what is replayed).
+        from augur.verify.replay import ReplayRouter
+        entry_router, decode_router = ReplayRouter.from_logs(replay_logs)
+    coord = Coordinator(engines, entry_router, workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
-                        decode_router=make_router("least-loaded" if a.router == "kv-aware" else a.router,
-                                                  **router_options),
+                        decode_router=decode_router,
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
                         frontend_latency_ns=0 if replaying else int(a.frontend_latency_ms * 1e6),
                         delivery_latency_ns=0 if replaying else int(a.delivery_latency_ms * 1e6))
