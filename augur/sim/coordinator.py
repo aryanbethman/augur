@@ -259,6 +259,12 @@ class Coordinator:
     def _on_step_done(self, ev: _Event) -> None:
         eng, outputs = ev.payload
         eng.busy = False
+        if eng.spec.kv_events:
+            # vLLM published this step's KV events when it applied the outputs; the
+            # router hears of them when the step lands.
+            events = eng.take_kv_events()
+            if events and hasattr(self.router, "observe"):
+                self.router.observe(eng.engine_id, events)
         for eco in outputs.values():
             for o in eco.outputs:
                 cid = self._cid(o.request_id)
@@ -275,6 +281,8 @@ class Coordinator:
                         # The proxy forwards to decode once it has this response.
                         self._push(self.now, CAUSED_ARRIVAL, "decode_dispatch", (cid, o.kv_transfer_params))
                     continue
+                if not rec.token_times and o.new_token_ids and hasattr(self.router, "first_token"):
+                    self.router.first_token(self._calls[cid], self.now)
                 rec.token_times.extend([self.now + self.delivery_latency_ns] * len(o.new_token_ids))
                 if o.finish_reason is not None:
                     self._finish(cid, rec, eng)
@@ -327,7 +335,7 @@ class Coordinator:
             out.append(desc.num_tokens)
         return out
 
-    def _start_dp_round(self) -> None:
+    def _start_dp_round(self, retry: int = 4) -> None:
         """Lockstep steps of the DP group, as vLLM's DP engine loop runs them.
 
         A rank schedules its next step as soon as its own previous forward
@@ -342,17 +350,27 @@ class Coordinator:
         # matters only for who waits on the shared CPU-memory device.
         for e in sorted(g, key=lambda e: -e.engine_id):
             if not e.busy and e.engine_id not in self._dp_pending and e.core.scheduler.has_requests():
+                self._set_step_clock(e, gpu_free_ns=self.now)
                 outputs, executed, _ = e.step()
                 self._after_step(e)
+                self._poll_when_transfers_finish(e)
                 shape = e.ctx.last_shape if executed and e.ctx.last_shape is not None and e.ctx.last_shape.seqs else None
                 self._dp_pending[e.engine_id] = (outputs, shape)
         if not any(p[1] is not None or p[0] for p in self._dp_pending.values()):
             if self._dp_pending and all(not e.busy for e in g):
                 # Every rank stepped and nothing was scheduled anywhere: apply
                 # the outputs; the group waits for the next event.
+                delivered = False
                 for e in g:
                     outputs, _ = self._dp_pending.pop(e.engine_id, ({}, None))
+                    if e.ctx.offload is not None:
+                        e.ctx.offload.commit_loads(self.now)
+                    delivered = delivered or e.ctx.last_delivered
                     self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, outputs)))
+                if delivered and retry:
+                    # A rank only took delivery of finished KV (an offload load): vLLM
+                    # promotes that request at its next schedule, right away.
+                    self._start_dp_round(retry - 1)
             return
         for e in sorted(g, key=lambda e: -e.engine_id):
             if not e.busy and e.engine_id not in self._dp_pending:
@@ -390,9 +408,12 @@ class Coordinator:
         per_rank = g[0].ctx.cost.round_ns(final, first_rank=first_rank)
         per_rank = self._scaled(g, per_rank)
         # The ranks meet in the round's first collective, so the slowest rank's CPU time holds up all of them.
-        cpu_ns = max((e.ctx.cpu_fixed_ns + e.ctx.cpu_per_request_ns * len(s.seqs)
+        cpu_ns = max((e.ctx.cpu_fixed_ns + e.ctx.cpu_per_request_ns * len(s.seqs) + e.ctx.last_offload_wait_ns
                       for e, s in zip(g, shapes) if s is not None), default=0)
         per_rank = [ns + cpu_ns for ns in per_rank]
+        for e, ns in zip(g, per_rank):
+            if e.ctx.offload is not None:
+                e.ctx.offload.commit_loads(self.now + ns)  # the round's forward ends with the step
         self.dp_rounds += 1
         for e, sh, ns in zip(g, final, per_rank):
             if e.step_log is not None:
@@ -494,9 +515,11 @@ class Coordinator:
             if not e.core.scheduler.has_requests() and not e.dp_fifo:
                 return
             t0 = time.perf_counter()
+            self._set_step_clock(e, gpu_free_ns=self.now)
             outputs, executed = e.core.step_fn()
             e.sched_cpu_s += time.perf_counter() - t0
             e.steps += 1
+            self._poll_when_transfers_finish(e)
             launched = bool(e.ctx.launches)
             for shape in e.ctx.launch_shapes:
                 r = max(e.dp_next_round, self._dpa_next_form)

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from vllm.config.kv_events import KVEventsConfig
 from vllm.engine import arg_utils
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -54,6 +55,7 @@ class EngineSpec:
     kv_offload_tiers: tuple[TierSpec, ...] = ()  # secondary tiers behind the CPU one, in order (vLLM tiering)
     hbm_gb: float | None = None  # simulated GPU memory: unset batch limits are `vllm serve`'s for this GPU
     hardware: str = ""  # simulated GPU's name, which vLLM's batch defaults also look at
+    kv_events: bool = False  # publish vLLM's KV cache events (BlockStored / BlockRemoved) to this engine's in-process queue
 
 
 def _simulated_gpu_batch_defaults(spec: EngineSpec):
@@ -79,7 +81,9 @@ class SimEngine:
         # this engine's clock by key.
         clock_key = f"augur-{engine_id}-{id(self.ctx)}"
         register_clock(clock_key, self.ctx)
-        tiered = bool(spec.kv_offload_tiers)
+        # vLLM's --kv-offloading-size would replace the connector config, so with
+        # tiers or PD (a MultiConnector) augur builds the offload connector itself.
+        tiered = bool(spec.kv_offload_tiers) or (bool(spec.kv_offload_gib) and spec.kv_role is not None)
         args = EngineArgs(
             model=spec.model_dir,
             served_model_name=spec.model_name,
@@ -99,6 +103,8 @@ class SimEngine:
             distributed_executor_backend=make_sim_executor(self.ctx),
             tensor_parallel_size=spec.tensor_parallel_size,
             kv_transfer_config=self._kv_transfer_config(engine_id, spec, clock_key),
+            kv_events_config=(KVEventsConfig(enable_kv_cache_events=True, publisher="null")
+                              if spec.kv_events else None),
             data_parallel_size=spec.data_parallel_size,
             data_parallel_rank=spec.data_parallel_rank if spec.data_parallel_size > 1 else None,
             enable_expert_parallel=spec.enable_expert_parallel,
@@ -119,6 +125,12 @@ class SimEngine:
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
                                log_stats=False)
         self.max_model_len = self.vllm_config.model_config.max_model_len
+        self.kv_event_queue: list = []
+        if spec.kv_events:
+            # vLLM's scheduler publishes each step's events (its block pool's, and
+            # the offload connector's CPU-tier ones) to its publisher: take them
+            # in process instead of over ZeroMQ.
+            self.core.scheduler.kv_event_publisher = _QueuePublisher(self.kv_event_queue)
         if spec.kv_offload_gib:
             # The connector's scheduler half is vLLM's; this is its worker half.
             # kv_block_bytes was set while EngineCore sized the KV cache.
@@ -147,23 +159,59 @@ class SimEngine:
         self.wake_at: int | None = None
         self.step_log: list[tuple] | None = None  # (start_ns, dur_ns, total, prefill_tokens, n_decode, n_prefill)
 
+    def block_hasher(self, token_ids) -> list:
+        """The prompt's block hashes as this engine's KV events name them: vLLM's own request block hasher
+        (chained, over full blocks). Empty when prefix caching is off. Called by: router.KvAware."""
+        hasher = self.core.request_block_hasher
+        if hasher is None:
+            return []
+        from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+        req = SimpleNamespace(all_token_ids=list(token_ids), num_tokens=len(token_ids), block_hashes=[],
+                              mm_features=None, lora_request=None, cache_salt=None, prompt_embeds=None)
+        return [maybe_convert_block_hash(h) for h in hasher(req)]
+
+    def take_kv_events(self) -> list:
+        """The KV events vLLM published since the last call, in order. Called by: Coordinator._on_step_done."""
+        out = self.kv_event_queue[:]
+        self.kv_event_queue.clear()
+        return out
+
     @staticmethod
     def _kv_transfer_config(engine_id: int, spec: EngineSpec, clock_key: str):
         from vllm.config import KVTransferConfig
+        offload = None
         if spec.kv_offload_tiers:
             # vLLM's OffloadingConnector with its tiering spec (augur's variant:
             # no /dev/shm buffer) and augur's simulated secondary tiers.
             extra = {"cpu_bytes_to_use": int(spec.kv_offload_gib * GIB),
                      "spec_name": "SimTieringOffloadingSpec", "spec_module_path": "augur.sim.tiers",
                      "secondary_tiers": [t.tier_config(clock_key) for t in spec.kv_offload_tiers]}
-            return KVTransferConfig(kv_connector="OffloadingConnector", kv_role="kv_both",
-                                    kv_connector_extra_config=extra)
-        if spec.kv_role is None:
-            return None
+            offload = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
+        elif spec.kv_offload_gib and spec.kv_role is not None:
+            extra = {"cpu_bytes_to_use": int(spec.kv_offload_gib * GIB)}
+            offload = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
+        if offload is not None:
+            if spec.kv_events:
+                extra["self_describing_kv_events"] = True  # CPU-tier events carry every block hash
+            offload["kv_connector_extra_config"] = extra
         # vLLM's real NIXL connector; only its scheduler half is built (our
         # executor stands in for the worker half and never loads NIXL).
-        return KVTransferConfig(kv_connector="SimNixlConnector", kv_connector_module_path="augur.sim.nixl",
-                                kv_role=spec.kv_role, engine_id=f"augur-{engine_id}")
+        nixl = None
+        if spec.kv_role is not None:
+            nixl = {"kv_connector": "SimNixlConnector", "kv_connector_module_path": "augur.sim.nixl",
+                    "kv_role": spec.kv_role}
+        if offload is not None and nixl is not None:
+            # PD + offload: vLLM's MultiConnector runs both. It loads a request from the
+            # first connector that has its tokens (NIXL's remote KV, else the CPU tier)
+            # and saves to all.
+            return KVTransferConfig(kv_connector="MultiConnector", kv_role=spec.kv_role,
+                                    engine_id=f"augur-{engine_id}",
+                                    kv_connector_extra_config={"connectors": [nixl, offload]})
+        if offload is not None:
+            return KVTransferConfig(**offload)
+        if nixl is not None:
+            return KVTransferConfig(**nixl, engine_id=f"augur-{engine_id}")
+        return None
 
     @property
     def vllm_engine_id(self) -> str:
@@ -200,3 +248,19 @@ class SimEngine:
         self.sched_cpu_s += time.perf_counter() - t0
         self.steps += 1
         return outputs, executed, self.ctx.last_step_ns
+
+
+class _QueuePublisher:
+    """Stands in for vLLM's KV event publisher: each batch's events land in a list."""
+
+    def __init__(self, queue: list) -> None:
+        self.queue = queue
+
+    def publish(self, batch) -> None:
+        self.queue.extend(batch.events)
+
+    def shutdown(self) -> None:
+        return None
+
+    def get_publisher_config(self):
+        return None

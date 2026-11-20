@@ -118,6 +118,9 @@ def _kv_report(model_runner_output) -> dict:
         return {}
     rec = {}
     worker_meta = kvo.kv_connector_worker_meta
+    if hasattr(worker_meta, "metadata"):
+        # A MultiConnector wraps each connector's metadata: the offload connector's is the one that logs.
+        worker_meta = next((m for m in worker_meta.metadata if hasattr(m, "completed_jobs")), None)
     if getattr(worker_meta, "completed_jobs", None):
         rec["jobs"] = sorted(worker_meta.completed_jobs)
     if kvo.finished_recving:

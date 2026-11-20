@@ -86,6 +86,7 @@ class SimOffloadWorker:
         self._deferred_stores: list[tuple[int, TransferJob]] = []
         self._ends: dict[int, int] = {}  # submitted, unreported job -> end
         self._loads_submitted = False
+        self._uncommitted: OffloadingConnectorMetadata | None = None
 
     def pre_forward(self, meta: OffloadingConnectorMetadata, now_ns: int, gpu_free_ns: int) -> int:
         """Hooks before the forward (handle_preemptions, sync start_load_kv).
@@ -102,11 +103,18 @@ class SimOffloadWorker:
             ready = max([ready] + waits)
         return ready
 
-    def post_forward(self, meta: OffloadingConnectorMetadata, forward_end_ns: int, poll_ns: int):
+    def post_forward(self, meta: OffloadingConnectorMetadata, forward_end_ns: int | None, poll_ns: int):
         """Hooks after the forward (async start_load_kv, wait_for_save,
-        get_finished). Returns (finished_recving, worker metadata or None)."""
+        get_finished). Returns (finished_recving, worker metadata or None).
+        With forward_end_ns None (a data-parallel round, whose duration is
+        not known until every rank has stepped) the loads still to be
+        submitted wait for ``commit_loads``; what the poll reports does not
+        depend on them."""
         if not self._loads_submitted:
-            self._submit_loads(meta, forward_end_ns)
+            if forward_end_ns is None:
+                self._uncommitted = meta
+            else:
+                self._submit_loads(meta, forward_end_ns)
         flush = meta.jobs_to_flush or set()
         self._deferred_stores += [(jid, job) for jid, job in meta.store_jobs.items() if jid not in flush]
         done = self.stores.finished_by(poll_ns) + self.loads.finished_by(poll_ns) + self.sync_loads.finished_by(poll_ns)
@@ -122,6 +130,12 @@ class SimOffloadWorker:
             if t.req_id is not None:
                 finished_recving.add(t.req_id)
         return finished_recving, out
+
+    def commit_loads(self, forward_end_ns: int) -> None:
+        """Submit the loads post_forward held back, behind a forward ending at forward_end_ns."""
+        meta, self._uncommitted = self._uncommitted, None
+        if meta is not None:
+            self._submit_loads(meta, forward_end_ns)
 
     def next_end(self) -> int | None:
         """When the next submitted transfer finishes (the engine must poll then)."""

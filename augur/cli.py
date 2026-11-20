@@ -142,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="engine for each call (and, with PD, the decode engine): least-loaded (fewest requests in "
                         "the engine, as LLMServingSim) and round-robin, or a vLLM Router policy: random, "
                         "power-of-two, cache-aware (the vLLM Router's default), consistent-hash, rendezvous-hash, "
-                        "sticky-least-loaded (augur/sim/router.py)")
+                        "sticky-least-loaded, kv-aware (routes by the KV blocks each engine holds, from its KV events) (augur/sim/router.py)")
     p.add_argument("--router-seed", type=int, default=0, help="random, power-of-two: random seed")
     p.add_argument("--router-cache-threshold", type=float, default=0.3,
                    help="cache-aware: share of the prompt an engine must already hold to be preferred "
@@ -290,9 +290,6 @@ def main(argv: list[str] | None = None) -> int:
         print("augur: --step-log-vllm logs one engine (engines would share one file and their step numbers collide)",
               file=sys.stderr)
         return 2
-    if a.kv_offload_gib and (a.prefill_engines or a.dp > 1):
-        print("augur: --kv-offload-gib with PD or DP is not modeled yet", file=sys.stderr)
-        return 2
     try:
         a.kv_offload_tiers = _offload_tiers(a)
     except ValueError as e:
@@ -399,7 +396,8 @@ def main(argv: list[str] | None = None) -> int:
                       scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks,
                       kv_offload_gib=a.kv_offload_gib,
                       kv_offload_link=_offload_link(a, *cpu_flags) if a.kv_offload_gib else None,
-                      kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware)
+                      kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware,
+                      kv_events=a.router == "kv-aware")
     import dataclasses
     if a.dp > 1:
         engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
@@ -437,7 +435,8 @@ def main(argv: list[str] | None = None) -> int:
                           session_expiry_s=a.router_session_expiry_s, session_ids=a.router_session_ids)
     coord = Coordinator(engines, make_router(a.router, **router_options), workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
-                        decode_router=make_router(a.router, **router_options),
+                        decode_router=make_router("least-loaded" if a.router == "kv-aware" else a.router,
+                                                  **router_options),
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
                         frontend_latency_ns=0 if replaying else int(a.frontend_latency_ms * 1e6),
                         delivery_latency_ns=0 if replaying else int(a.delivery_latency_ms * 1e6))
