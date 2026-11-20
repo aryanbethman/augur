@@ -372,7 +372,7 @@ def _moe_section(cost, tg, db, config, names):
     return {"exact": table}
 
 
-def build_profile(fork, hardware, model, tp=1, cluster_config=None, variant=None) -> dict:
+def build_profile(fork, hardware, model, tp=1, cluster_config=None, variant=None, provenance=None) -> dict:
     fork = os.path.abspath(fork)
     cost, db, config, tables, tg = load_fork(fork, hardware, model, tp, cluster_config, variant)
     variant = db["variant"]
@@ -410,6 +410,7 @@ def build_profile(fork, hardware, model, tp=1, cluster_config=None, variant=None
     for key in ("vllm_version", "profiled_at", "gpu", "profiler_version"):
         if meta.get(key):
             prov[key] = meta[key]
+    prov.update(provenance or {})  # e.g. what augur.profile measured: environment, vLLM memory accounting
     extra = {}
     if tp > 1:
         stable = sorted(n for cat in ("dense", "per_sequence") for n in tables[cat]
@@ -637,12 +638,18 @@ def main(argv=None) -> int:
     ap.add_argument("--profile-variant", default=None,
                     help="the fork's profile folder (e.g. bf16-tp4proj); name the output <variant>-tp<N>.json.gz")
     ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--provenance-json", default=None,
+                    help="JSON object merged into the profile's provenance (augur.profile writes the measured "
+                         "environment and vLLM's memory accounting this way)")
     a = ap.parse_args(argv)
     fork = os.path.abspath(a.fork)
     if a.spot_checks is None:
         a.spot_checks = 2000 if a.tp == 1 else 200
     try:
-        profile = build_profile(fork, a.hardware, a.model, a.tp, a.cluster_config, a.profile_variant)
+        with open(a.provenance_json, encoding="utf-8") if a.provenance_json else open(os.devnull) as f:
+            extra_prov = json.load(f) if a.provenance_json else None
+        profile = build_profile(fork, a.hardware, a.model, a.tp, a.cluster_config, a.profile_variant,
+                                provenance=extra_prov)
     except Refused as e:
         print(f"convert: refused: {e}", file=sys.stderr)
         return 2
