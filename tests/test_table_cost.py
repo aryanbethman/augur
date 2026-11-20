@@ -264,3 +264,24 @@ def test_steps_beyond_the_profile_are_counted_and_warned(caplog):
     big_chunk = StepShape(seqs=(SeqWork(8192, 0, False),))  # more tokens than the dense tables hold
     cost.step_ns(big_chunk)
     assert cost.steps_beyond_profile == 3
+
+
+@needs_fork
+def test_astra_runs_in_a_private_directory(monkeypatch):
+    """ASTRA-Sim writes tmp__mem/remote_mem.json into its working directory, so concurrent runs sharing the
+    fork's serving/ could read each other's CPU-memory config (a few ns off, or a crash). Each query runs in the
+    oracle's own directory, and does not touch the fork's."""
+    import subprocess
+    from augur.cost.llmservingsim import LLMServingSimCost
+    cost = LLMServingSimCost(FORK, "RTXPRO6000", "meta-llama/Llama-3.1-8B", tp=2, cluster_config=TP2_CONFIG)
+    seen = []
+    real = subprocess.Popen
+
+    def spy(*a, **kw):
+        seen.append(kw.get("cwd"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    cost.step_ns(StepShape(seqs=(SeqWork(1, 100, True), SeqWork(64, 0, False))))
+    assert seen and all(c == cost.oracle.workdir for c in seen)
+    assert not os.path.exists(os.path.join(FORK, "serving", "tmp__mem", "remote_mem.json"))
