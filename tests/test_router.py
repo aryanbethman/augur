@@ -161,7 +161,7 @@ def test_sticky_least_loaded_stops_counting_a_session_idle_past_its_expiry():
 
 def test_every_policy_is_listed():
     assert set(ROUTERS) == {"round-robin", "least-loaded", "random", "power-of-two", "cache-aware",
-                            "consistent-hash", "rendezvous-hash", "sticky-least-loaded"}
+                            "consistent-hash", "rendezvous-hash", "sticky-least-loaded", "kv-aware"}
 
 
 # ---- whole runs: agent sessions on four engines ---------------------------------

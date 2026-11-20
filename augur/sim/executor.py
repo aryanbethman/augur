@@ -26,6 +26,10 @@ import zlib
 import torch
 
 from vllm.config import CUDAGraphMode
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiKVConnectorMetadata,
+    MultiKVConnectorWorkerMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import OffloadingConnectorMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.executor.abstract import Executor
@@ -92,6 +96,7 @@ class SimContext:
     offload: Any = None
     now_ns: int = 0
     gpu_free_ns: int = 0
+    last_offload_wait_ns: int = 0  # the step's wait for flushed stores / sync loads (DP rounds add it to the CPU term)
     last_kv_report: bool = False  # this step's output carries a KV connector report
     # Tiered offload (augur.sim.tiers): the engine's secondary tiers, and the
     # virtual time of the scheduler-side work running now (the step's start
@@ -164,17 +169,45 @@ class SimWorker:
         nxt = cost.toks[cost.k + 1] if cost.k + 1 < len(cost.toks) else {}
         return outs[cost.k], nxt
 
-    def _offload_output(self, meta, forward_ready: int, cpu_ns: int, gpu_ns: int) -> KVConnectorOutput | None:
+    def _offload_output(self, meta, forward_ready: int, cpu_ns: int, gpu_ns: int | None,
+                        kvo: KVConnectorOutput | None, slot: int | None) -> KVConnectorOutput | None:
         """Post-forward offload hooks: loads queue behind this forward, then the
-        worker polls (as vLLM, right after launching the forward)."""
+        worker polls (as vLLM, right after launching the forward). kvo is what
+        the NIXL side already reports this step (PD + offload), merged with
+        the offload worker's report; slot is the offload connector's place in a
+        MultiConnector's metadata (None when it is the only connector).
+        gpu_ns None: a DP round, priced later (see SimOffloadWorker.post_forward)."""
         ctx = self.ctx
-        launch = max(ctx.now_ns + cpu_ns, ctx.gpu_free_ns) if gpu_ns else max(forward_ready, ctx.gpu_free_ns)
-        finished_recving, worker_meta = ctx.offload.post_forward(meta, forward_end_ns=launch + gpu_ns,
+        if gpu_ns is None:
+            forward_end = None
+        else:
+            launch = max(ctx.now_ns + cpu_ns, ctx.gpu_free_ns) if gpu_ns else max(forward_ready, ctx.gpu_free_ns)
+            forward_end = launch + gpu_ns
+        finished_recving, worker_meta = ctx.offload.post_forward(meta, forward_end_ns=forward_end,
                                                                  poll_ns=forward_ready)
         ctx.last_delivered = ctx.last_delivered or bool(finished_recving)
         if not finished_recving and worker_meta is None:
-            return None
-        return KVConnectorOutput(finished_recving=finished_recving or None, kv_connector_worker_meta=worker_meta)
+            return kvo
+        if slot is not None and worker_meta is not None:
+            # MultiConnector hands each child its own slot of the worker metadata.
+            width = self._n_children
+            worker_meta = MultiKVConnectorWorkerMetadata(
+                metadata=tuple(worker_meta if i == slot else None for i in range(width)))
+        recv = set(finished_recving) | (set(kvo.finished_recving) if kvo is not None and kvo.finished_recving else set())
+        return KVConnectorOutput(finished_sending=kvo.finished_sending if kvo is not None else None,
+                                 finished_recving=recv or None, kv_connector_worker_meta=worker_meta)
+
+    @staticmethod
+    def _split_connector_meta(meta):
+        """(offload metadata or None, its slot in a MultiConnector's metadata or None, the metadata
+        of every connector). A single connector's metadata is not wrapped."""
+        if isinstance(meta, MultiKVConnectorMetadata):
+            kids = list(meta.metadata)
+            for i, m in enumerate(kids):
+                if isinstance(m, OffloadingConnectorMetadata):
+                    return m, i, kids
+            return None, None, kids
+        return (meta if isinstance(meta, OffloadingConnectorMetadata) else None), None, [meta]
 
     def take_draft_token_ids(self):
         out, self.ctx.pending_drafts = self.ctx.pending_drafts, None
@@ -191,14 +224,16 @@ class SimWorker:
         # KV connector: requests whose KV the worker starts pulling this step.
         self.ctx.new_recvs = []
         meta = so.kv_connector_metadata
-        for rid, rm in (getattr(meta, "reqs_to_recv", None) or {}).items():
-            n_local = sum(len(g) for g in rm.local_block_ids)
-            n_done = sum(rm.local_num_computed_blocks) if rm.local_num_computed_blocks else 0
-            r = rm.remote
-            self.ctx.new_recvs.append((rid, max(n_local - n_done, 0),
-                                       r.engine_id if r else None, r.request_id if r else None))
+        offload_meta, offload_slot, kids = self._split_connector_meta(meta)
+        self._n_children = len(kids)
+        for km in kids:
+            for rid, rm in (getattr(km, "reqs_to_recv", None) or {}).items():
+                n_local = sum(len(g) for g in rm.local_block_ids)
+                n_done = sum(rm.local_num_computed_blocks) if rm.local_num_computed_blocks else 0
+                r = rm.remote
+                self.ctx.new_recvs.append((rid, max(n_local - n_done, 0),
+                                           r.engine_id if r else None, r.request_id if r else None))
         kvo = None
-        offload_meta = meta if isinstance(meta, OffloadingConnectorMetadata) else None
         forward_ready = self.ctx.now_ns
         if offload_meta is not None:
             forward_ready = self.ctx.offload.pre_forward(offload_meta, self.ctx.now_ns, self.ctx.gpu_free_ns)
@@ -294,9 +329,15 @@ class SimWorker:
             self.ctx.pending_drafts = DraftTokenIds(req_ids=list(drafts_next),
                                                     draft_token_ids=list(drafts_next.values()))
 
+        self.ctx.last_offload_wait_ns = forward_ready - self.ctx.now_ns
         if self.ctx.defer_cost:
             self.ctx.last_shape = StepShape(seqs=tuple(seqs))
             self.ctx.last_step_ns = 0
+            if offload_meta is not None:
+                # A DP round is priced after every rank has stepped: the rank's
+                # loads are committed then (sync), or start at the launch (async).
+                kvo = self._offload_output(offload_meta, forward_ready, 0, None if not self.ctx.async_cpu else 0,
+                                           kvo, offload_slot)
         else:
             num_tokens = sum(x.num_new for x in seqs)
             q = 1 + self.ctx.spec_k
@@ -313,7 +354,7 @@ class SimWorker:
             self.ctx.last_cpu_ns = cpu
             self.ctx.last_step_ns = gpu + cpu if not self.ctx.async_cpu else gpu
             if offload_meta is not None:
-                kvo = self._offload_output(offload_meta, forward_ready, cpu, gpu)
+                kvo = self._offload_output(offload_meta, forward_ready, cpu, gpu, kvo, offload_slot)
         self.ctx.last_kv_report = kvo is not None
         # Sync: this step's outputs land when it ends. Async: the update that
         # follows is for the batch launched before, done when the GPU frees.
