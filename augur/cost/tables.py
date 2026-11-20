@@ -171,6 +171,10 @@ class _Attention:
         self.pairs = sorted(self.slices)
         self.pc_vals = sorted({pc for pc, _ in self.pairs})
         self.nd_vals = sorted({nd for _, nd in self.pairs})
+        # largest profiled value on each axis; a lookup above it extrapolates
+        self.limits = {"prefill chunk tokens": self.pc_vals[-1], "decodes": self.nd_vals[-1],
+                       "decode KV length": max(max(a) for a in axes),
+                       "prefill key length": max(max(kp) for kp, _ in self.slices.values())}
 
     def _slice(self, pc, nd, prefill_key, kv):
         found = self.slices.get((pc, nd))
@@ -282,6 +286,13 @@ class TableCost:
         self._out_bytes_per_seq = p["remote"]["output_bytes_per_seq"]
         self._warned: set = set()
         self._cache: dict[tuple, int] = {}
+        # Steps priced above the profile's largest value on some axis (linear extrapolation from the
+        # top two grid points, not a measurement): which axes, per step shape, and how many steps.
+        self._beyond: dict[tuple, tuple] = {}
+        self._limits = {"tokens": min(keys[-1] for keys, _ in self._dense.values()),
+                        "sequences": min(keys[-1] for keys, _ in self._per_seq.values())}
+        self.steps = 0
+        self.steps_beyond_profile = 0
         if self.tp > 1:
             self._comm_ns(1, 1)  # a setting outside the exact regime fails here, before a run starts
 
@@ -323,6 +334,35 @@ class TableCost:
         if alpha == 0.0 or t_max <= t_mean:  # dense kernels never saturate in key length
             return max(1, int(round(t_mean)))
         return max(1, int(round(t_mean + alpha * (t_max - t_mean))))
+
+    def _beyond_axes(self, pre, n_dec, kv_max, dq, tokens, rows):
+        """Axes on which this step is above the profile's largest value, as ((axis, value, limit), ...).
+
+        Above its last key a table is extended linearly from its top two points. That is the fork's rule
+        too, but it is a guess: a profile measured to 2,048 tokens of KV says little about a 20,000-token
+        decode, and LLMServingSim versions that extrapolate differently disagree there by tens of percent.
+        """
+        found = []
+        lim = self._limits
+        if tokens > lim["tokens"]:
+            found.append(("forward tokens", tokens, lim["tokens"]))
+        if rows > lim["sequences"]:
+            found.append(("sequences", rows, lim["sequences"]))
+        chunk = sum(q for q, _ in pre)
+        if chunk or n_dec:
+            tables = [self._attention_table(layer, dq) for layer in self._attn]
+            for axis, value in (("prefill chunk tokens", chunk), ("decodes", n_dec), ("decode KV length", kv_max),
+                                ("prefill key length", _prefill_key(pre) if chunk else 0)):
+                top = min(t.limits[axis] for t in tables)
+                if value > top:
+                    found.append((axis, value, top))
+        for axis, value, top in found:
+            if axis not in self._warned:
+                self._warned.add(axis)
+                log.warning("step priced beyond the profile: %s %s is above the profile's largest value %s; "
+                            "prices there are a linear extrapolation, not a measurement (augur counts such "
+                            "steps as steps_beyond_profile in its summary)", axis, value, top)
+        return tuple(found)
 
     # --- TP>1 communication ----------------------------------------------
 
@@ -408,7 +448,10 @@ class TableCost:
         rows = 0 if shape.dummy else len(shape.seqs)
         key = (pre, n_dec, dq, kv_mean, kv_max, tokens, rows)
         hit = self._cache.get(key)
+        self.steps += 1
         if hit is not None:
+            if key in self._beyond:
+                self.steps_beyond_profile += 1
             return hit
 
         comm = self._comm_ns(tokens, rows) if self.tp > 1 else None
@@ -430,6 +473,10 @@ class TableCost:
             keys, vals = self._dense[name]
             return max(1, int(_interp1d(keys, vals, t)))
 
+        beyond = self._beyond_axes(pre, n_dec, kv_max, dq, t, r)
+        if beyond:
+            self._beyond[key] = beyond
+            self.steps_beyond_profile += 1
         ns = sum(price(n) for n in self._prologue)
         ns += self._repeat * sum(count * price(n) for n, count in self._block.items())
         ns += sum(price(n) for n in self._head if rows > 0 or n not in self._per_seq)

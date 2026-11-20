@@ -485,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
         summary["dp_rounds"] = coord.dp_rounds
         summary["dp_dummy_forwards"] = coord.dp_dummy_forwards
     summary["async_scheduling"] = spec.async_scheduling
+    if hasattr(cost, "steps_beyond_profile"):
+        summary["steps_beyond_profile"] = cost.steps_beyond_profile
     summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
                     "vllm_step_cpu_ms_per_step": round(1e3 * cpu / max(steps, 1), 3),
                     "kv_cache_gib_per_engine": round(kv_bytes / 2**30, 2),

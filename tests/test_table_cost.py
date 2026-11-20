@@ -249,3 +249,45 @@ def test_no_fork_modules_and_cwd_unchanged(tmp_path):
     r = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, capture_output=True, text=True,
                        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)))
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr[-2000:]
+
+
+def test_steps_beyond_the_profile_are_counted_and_warned(caplog):
+    """The H100 Llama-3.1-70B profile stops at 2,048 tokens of KV; a longer decode extrapolates, and says so."""
+    cost = TableCost(bundled_profile("H100", "meta-llama/Llama-3.1-70B", tp=4), cpu_mem_bw=512,
+                     link_bw=900, link_latency_ns=0, npu_mem_bw=3350)
+    inside = StepShape(seqs=(SeqWork(1, 1500, True),))
+    beyond = StepShape(seqs=(SeqWork(1, 4552, True),))
+    with caplog.at_level("WARNING", logger="augur.cost.tables"):
+        a = cost.step_ns(inside)
+        assert (cost.steps, cost.steps_beyond_profile) == (1, 0) and not caplog.records
+        b = cost.step_ns(beyond)
+        cost.step_ns(beyond)  # a repeated shape (cache hit) still counts
+        cost.step_ns(inside)
+    assert (cost.steps, cost.steps_beyond_profile) == (4, 2)
+    assert [r.getMessage().split(" is above")[0] for r in caplog.records] == [
+        "step priced beyond the profile: decode KV length 4552"]
+    assert b > a
+    big_chunk = StepShape(seqs=(SeqWork(8192, 0, False),))  # more tokens than the dense tables hold
+    cost.step_ns(big_chunk)
+    assert cost.steps_beyond_profile == 3
+
+
+@needs_fork
+def test_astra_runs_in_a_private_directory(monkeypatch):
+    """ASTRA-Sim writes tmp__mem/remote_mem.json into its working directory, so concurrent runs sharing the
+    fork's serving/ could read each other's CPU-memory config (a few ns off, or a crash). Each query runs in the
+    oracle's own directory, and does not touch the fork's."""
+    import subprocess
+    from augur.cost.llmservingsim import LLMServingSimCost
+    cost = LLMServingSimCost(FORK, "RTXPRO6000", "meta-llama/Llama-3.1-8B", tp=2, cluster_config=TP2_CONFIG)
+    seen = []
+    real = subprocess.Popen
+
+    def spy(*a, **kw):
+        seen.append(kw.get("cwd"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    cost.step_ns(StepShape(seqs=(SeqWork(1, 100, True), SeqWork(64, 0, False))))
+    assert seen and all(c == cost.oracle.workdir for c in seen)
+    assert not os.path.exists(os.path.join(FORK, "serving", "tmp__mem", "remote_mem.json"))

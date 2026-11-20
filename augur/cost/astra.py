@@ -190,7 +190,11 @@ class AstraOracle:
             args.append("--end-npu-ids=" + self.cluster["end_npu_ids"])
         if os.environ.get("AUGUR_ASTRA_DEBUG"):
             print("ASTRA args:", " ".join(args), file=sys.stderr, flush=True)
-        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        # The binary writes and removes tmp__mem/remote_mem.json in its working directory to hand the
+        # CPU-memory config to its memory model. Run in the fork's serving/ (as LLMServingSim does) that
+        # directory is shared by every concurrent run, so one run could read another's file, or a half-written
+        # one: wrong CPU-memory prices of a few ns, or a crash. A private directory makes runs independent.
+        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=inputs)
         ctl = self._Controller(self.total_npu)
         given: dict[int, int] = {}  # npu -> cycle when our workload was handed over
         done: dict[int, int] = {}
