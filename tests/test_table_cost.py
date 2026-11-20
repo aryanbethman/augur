@@ -78,7 +78,13 @@ def test_live_against_fork(name):
     ref = LLMServingSimCost(FORK, d["hardware"], d["model"])
     cost = TableCost(bundled_profile(d["hardware"], d["model"]))
     shapes = list(random_shapes(random.Random(987654321), 3000))
-    bad = [(s, ref.step_ns(s), cost.step_ns(s)) for s in shapes]
+
+    def price(c, s):  # a MoE step beyond the fork's component tables (2048 tokens): the fork raises, the table refuses
+        try:
+            return c.step_ns(s)
+        except (ValueError, OutsideRegime):
+            return "refused"
+    bad = [(s, price(ref, s), price(cost, s)) for s in shapes]
     bad = [b for b in bad if b[1] != b[2]]
     assert bad == []
 

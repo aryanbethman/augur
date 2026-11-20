@@ -63,18 +63,20 @@ def main():
     a = ap.parse_args()
     fork = os.path.abspath(os.path.expanduser(a.fork))
     tp = a.tp
+    from augur.cost.tables import OutsideRegime, TableCost
     if tp > 1:
-        from augur.cost.tables import OutsideRegime, TableCost
         ref = LLMServingSimCost(fork, a.hardware, a.model, tp=tp, cluster_config=os.path.abspath(a.cluster_config))
         mine = TableCost(a.profile, **cluster_params(a.cluster_config))
-        def accepts(s):
-            try:
-                mine.step_ns(s); return True
-            except OutsideRegime:
-                return False
     else:
         ref = LLMServingSimCost(fork, a.hardware, a.model)
         ref2 = LLMServingSimCost(fork, a.hardware, a.model, cpu_mem_bw_gbps=3.7, cpu_mem_latency_ns=123)
+        mine = TableCost(a.profile)
+
+    def accepts(s):  # shapes TableCost refuses (outside the guard's regime; MoE token counts the fork's tables lack)
+        try:
+            mine.step_ns(s); return True
+        except OutsideRegime:
+            return False
     price = lambda c, row: c.step_ns(shape_from_row(row))
     runs, seen, workload = [], set(), []
     for path in a.workload_json:
@@ -89,14 +91,14 @@ def main():
     if total > a.workload_sample:
         workload.sort(key=lambda r: json.dumps(r[:5]))
         workload = [workload[i * total // a.workload_sample] for i in range(a.workload_sample)]
+    bad = [r for r in workload if not accepts(shape_from_row(r))]
+    assert not bad, f"{len(bad)} workload shapes are outside TableCost's regime"
     if tp > 1:
         rnd = [r + [price(ref, r)] for r in capped_random(a.seed, a.random, a.random_pairs, accepts)]
-        bad = [r for r in workload if not accepts(shape_from_row(r))]
-        assert not bad, f"{len(bad)} workload shapes are outside TableCost's regime"
         cpu = []
     else:
-        rnd = [r + [price(ref, r)] for r in distinct_random(a.seed, a.random)]
-        cpu = [r + [price(ref2, r)] for r in distinct_random(a.seed + 7, 600)]
+        rnd = [r + [price(ref, r)] for r in capped_random(a.seed, a.random, 0, accepts)]
+        cpu = [r + [price(ref2, r)] for r in capped_random(a.seed + 7, 600, 0, accepts)]
     out = {"format": 1, "profile_sha256": hashlib.sha256(gzip.decompress(open(a.profile, "rb").read())).hexdigest(),
            "hardware": a.hardware, "model": a.model,
            "fork_commit": subprocess.run(["git", "-C", fork, "rev-parse", "HEAD"], capture_output=True, text=True,

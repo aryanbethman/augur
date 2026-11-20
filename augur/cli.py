@@ -338,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
                 have = "\n".join(f"  {h} {m} {d} tp{t}" for h, m, d, t in shipped())
                 raise FileNotFoundError(
                     f"no step-time profile for {a.model} on {a.hardware} (tp={a.tp}, dp={a.dp}). "
-                    f"Profiles shipped with augur (dense, TP=1):\n{have}\n"
+                    f"Profiles shipped with augur (--cost tables, DP=1 and no expert parallelism):\n{have}\n"
                     "For another model or GPU, point augur at an LLMServingSim fork that has the profile "
                     "(--fork DIR or AUGUR_FORK=DIR; python -m augur.cost.profiles --fork DIR lists them), "
                     "or use --cost fixed (a constant step time, no profile).") from None

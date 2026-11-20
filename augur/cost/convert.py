@@ -6,7 +6,14 @@ The only module allowed to import the LLMServingSim fork.  Table values are
 taken from the fork's own loaded tables (so the stored integers are exactly what
 the fork computes with), written as deterministic gzip JSON, reloaded and
 compared value by value, and spot-checked against ``LLMServingSimCost`` on random
-shapes.  MoE profiles are refused.
+shapes.
+
+MoE models: the MoE block of a decoder layer is a function of the forward token count only (the fork's
+balanced gate is deterministic in it), so with native component tables (TP=1) the profile stores the
+fork's own price at every token count 1..N (the fork builds it from a scipy Delaunay surface; this
+module reads it back from the fork's traces, so TableCost needs no scipy), and for the legacy whole-block
+table (TP>1) the ep=1 rows and the closed form of the balanced gate.  Every token count is then compared
+with the fork's trace.
 
 At TP = N > 1 the profile holds the tables the fork uses at that TP (``tp_stable`` layers resolved as the
 fork does), the collective coefficients (derived from the fork's traces at several (T, R), which must be
@@ -185,8 +192,8 @@ def _probe(cost, tokens, seqs, dummy=False):
     return [r for r in cost.trace_rows(shape) if len(r) == 11 and r[0] not in ("kv_load", "kv_evict")]
 
 
-def _layers_and_remote(cost, config):
-    """Layer order and the REMOTE byte rule, read from traces the fork generates."""
+def _layers_and_remote(cost, config, tmax=None):
+    """Layer order and the REMOTE byte rule, read from traces the fork generates (token counts up to ``tmax``)."""
     layers = config["num_hidden_layers"]
     mixed = lambda t, r: ([SeqWork(1, 50 + i, True) for i in range(r - 1)] + [SeqWork(t - (r - 1), 10, False)])
     rows = _probe(cost, 0, mixed(37, 3))
@@ -198,6 +205,8 @@ def _layers_and_remote(cost, config):
     if len(mid) % layers or mid != block * layers:
         raise Refused("decoder layers do not repeat one block")
     for t, r in ((1, 1), (37, 3), (300, 17), (2048, 128), (5000, 2)):
+        if tmax is not None and t > tmax:
+            continue
         rows = _probe(cost, 0, mixed(t, r))
         if [x[0] for x in rows] != names:
             raise Refused("layer sequence depends on the batch")
@@ -260,20 +269,18 @@ def _resolved(tg, db, tp, tables):
     return out
 
 
-def load_fork(fork, hardware, model, tp, cluster_config=None):
+def load_fork(fork, hardware, model, tp, cluster_config=None, variant=None):
     """(LLMServingSimCost, perf_db, config) for the profile, refusing out-of-scope ones."""
     from augur.cost.llmservingsim import LLMServingSimCost
     if tp > 1 and not cluster_config:
         raise Refused(f"tp={tp} needs --cluster-config (the fork's cost model is built with it)")
-    cost = LLMServingSimCost(fork, hardware, model, tp=tp, cluster_config=cluster_config)
+    cost = LLMServingSimCost(fork, hardware, model, tp=tp, cluster_config=cluster_config, profile_variant=variant)
     cost.trace_rows(StepShape(seqs=(SeqWork(1, 10, True),)))  # loads the profile into the fork's cache (no ASTRA run)
     tg = cost._tg
     config = tg.get_config(model)
-    if tg.utils_num_experts(config):
-        raise Refused(f"{model} is a MoE model: TableCost prices dense models only")
     db = tg._perf_db_cache[(hardware, model, tg.resolve_variant(config))]
     tables = tg._tp_tables(db, tp)
-    extra = set(tables) - {"dense", "per_sequence", "attention_by_layer"}
+    extra = set(tables) - {"dense", "per_sequence", "attention_by_layer"} - ({"moe"} if tg.utils_num_experts(config) else set())
     if extra:
         raise Refused(f"profile has tables TableCost does not price: {sorted(extra)}")
     if db["architecture"].get("component_layouts") or db["component_sizes"].get(tp) or "TPU" in hardware:
@@ -285,12 +292,14 @@ def load_fork(fork, hardware, model, tp, cluster_config=None):
     return cost, db, config, _resolved(tg, db, tp, tables), tg
 
 
-def _collectives(cost, layers):
+def _collectives(cost, layers, tmax=None):
     """(all-reduce count, bytes per forward token, all-gather bytes per sequence) read from the fork's traces;
     every sample must agree exactly (linear in T and R, no all-gather without sequences)."""
     mixed = lambda t, r: [SeqWork(1, 50 + i, True) for i in range(r - 1)] + [SeqWork(t - (r - 1), 10, False)]
     seen = set()
     for t, r in ((1, 1), (37, 3), (300, 17), (2048, 128), (5000, 2), (64, 64), (4096, 1), (9, 9)):
+        if tmax is not None and t > tmax:
+            continue
         rows = _probe(cost, 0, mixed(t, r))
         kinds = [(x[8], int(x[9])) for x in rows if x[8] != "NONE"]
         if any(k not in ("ALLREDUCE", "ALLGATHER") for k, _ in kinds):
@@ -321,17 +330,65 @@ def _npu_mem_bw_default(fork, hardware):
     return entry["value"] if isinstance(entry, dict) and "value" in entry else None
 
 
-def build_profile(fork, hardware, model, tp=1, cluster_config=None) -> dict:
+MOE_LAYERS = {"moe_gate_routing", "moe_experts", "expert"}
+MOE_TOKEN_LIMIT = 1 << 16
+
+
+def _moe_prices(cost, tokens, names):
+    """{name: ns} of the MoE layers in the fork's trace for one prefill of ``tokens`` tokens; every decoder
+    layer must carry the same value (the fork emits the block once and copies it)."""
+    rows = cost.trace_rows(StepShape(seqs=(SeqWork(tokens, 0, False),)))
+    out = {}
+    for r in rows:
+        if len(r) == 11 and r[0] in names:
+            if out.setdefault(r[0], int(r[1])) != int(r[1]):
+                raise Refused(f"MoE layers differ within one step at T={tokens}")
+    return out
+
+
+def _moe_section(cost, tg, db, config, names):
+    """The profile's ``moe`` tables (see ``augur.cost.tables``)."""
+    if names == {"expert"}:  # legacy whole-block table (TP>1 bundles without native components)
+        by_ep = tg._tp_tables(db, 1 if 1 in db["available_tps"] else db["available_tps"][0]).get("moe")
+        if not by_ep or 1 not in by_ep:
+            raise Refused("legacy MoE table has no ep=1 rows")
+        tbl = by_ep[1]
+        return {"balanced": {"expert": {
+            "experts": tg.utils_num_experts(config), "top_k": tg._stack_module().expert_top_k(config),
+            "activated": list(tbl["activated_experts_vals"]),
+            "rows": [{"keys": list(r["keys"]), "ns": list(r["values"])} for r in tbl["rows"]]}}}
+    table = {n: [] for n in names}
+    for t in range(1, MOE_TOKEN_LIMIT + 1):
+        try:
+            prices = _moe_prices(cost, t, names)
+        except Exception as e:  # the fork's MoeCoverageError: the component tables stop here
+            if type(e).__name__ != "MoeCoverageError":
+                raise
+            break
+        for n in names:
+            table[n].append(prices[n])
+    if len(table[next(iter(names))]) in (0, MOE_TOKEN_LIMIT):
+        raise Refused("MoE component tables: no usable token range")
+    return {"exact": table}
+
+
+def build_profile(fork, hardware, model, tp=1, cluster_config=None, variant=None) -> dict:
     fork = os.path.abspath(fork)
-    cost, db, config, tables, tg = load_fork(fork, hardware, model, tp, cluster_config)
+    cost, db, config, tables, tg = load_fork(fork, hardware, model, tp, cluster_config, variant)
     variant = db["variant"]
-    seq = _layers_and_remote(cost, config)
+    is_moe = bool(tg.utils_num_experts(config))
+    seq = _layers_and_remote(cost, config, tmax=1000 if is_moe else None)
     used = set(seq["prologue"] + seq["block"] + seq["head"])
     attn_names = {n for n in used if n in tables["attention_by_layer"]}
     per_seq = {n: t for n, t in tables["per_sequence"].items() if n in used}
     dense = {n: t for n, t in tables["dense"].items() if n in used}
-    if used != attn_names | set(per_seq) | set(dense) or len(attn_names) + len(per_seq) + len(dense) != len(used):
+    moe_names = (used & MOE_LAYERS) if is_moe else set()
+    if used != attn_names | set(per_seq) | set(dense) | moe_names or \
+            len(attn_names) + len(per_seq) + len(dense) + len(moe_names) != len(used):
         raise Refused("layer names are not covered by exactly one table each")
+    if is_moe and (moe_names not in ({"moe_gate_routing", "moe_experts"}, {"expert"}) or
+                   seq["block"].count("expert") + seq["block"].count("moe_experts") != 1):
+        raise Refused(f"unexpected MoE layers {sorted(moe_names)}")
     rel = os.path.join("profiler", "perf", hardware, model, variant, f"tp{tp}")
     cfg_rel = os.path.join("configs", "model", model + ".json")
     sources = {}
@@ -339,6 +396,11 @@ def build_profile(fork, hardware, model, tp=1, cluster_config=None) -> dict:
         path = os.path.join(fork, rel, name)
         if os.path.isfile(path):
             sources[name] = _sha256(path)
+    rel1 = os.path.join("profiler", "perf", hardware, model, variant, "tp1")
+    for name in ("moe.csv", os.path.join("moe_components", "dp1_ep1_rank0_sp0", "components.csv")):
+        path = os.path.join(fork, rel1 if is_moe else rel, name)
+        if is_moe and os.path.isfile(path):
+            sources[os.path.join("tp1", name)] = _sha256(path)
     with open(os.path.join(fork, cfg_rel), encoding="utf-8") as f:
         model_config = json.load(f)
     meta = db["meta"]
@@ -353,13 +415,19 @@ def build_profile(fork, hardware, model, tp=1, cluster_config=None) -> dict:
         stable = sorted(n for cat in ("dense", "per_sequence") for n in tables[cat]
                         if 1 in db["available_tps"] and tg._effective_tp(db, cat, n, tp) == 1)
         prov["tables_from_tp1"] = stable
-        extra["collectives"] = _collectives(cost, seq)
+        extra["collectives"] = _collectives(cost, seq, tmax=1000 if is_moe else None)
+        if is_moe:  # decoder layers whose collective-free MoE block ASTRA-Sim prices 1 ns short (see tables.py)
+            extra["collectives"]["moe_layers"] = seq["repeat"] * (seq["block"].count("expert")
+                                                                  + seq["block"].count("moe_experts"))
         bw = _npu_mem_bw_default(fork, hardware)
         if bw is not None:
             extra["hardware"] = {"npu_mem_bw_gbps": bw}
+    if is_moe:
+        extra["moe"] = _moe_section(cost, tg, db, config, moe_names)
     return {**extra, **{
         "format_version": 1,
-        "identity": {"hardware": hardware, "model": model, "variant": variant, "tp": tp, "kind": "dense",
+        "identity": {"hardware": hardware, "model": model, "variant": variant, "tp": tp,
+                     "kind": "moe" if is_moe else "dense",
                      "architecture": meta.get("architecture")},
         "provenance": prov,
         "layers": seq,
@@ -452,6 +520,39 @@ def compare_tables(path, db, tables, cost_tg) -> list[str]:
     return bad
 
 
+def compare_moe(path, cost, cluster_config=None, seed=7):
+    """Every token count of the MoE layers, stored table against the fork's trace: all of 1..N for tables
+    (N+2 for the legacy closed form, plus random counts far above), and T = 0 where the fork prices it."""
+    from augur.cost.tables import OutsideRegime, TableCost
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        p = json.load(f)
+    moe = p.get("moe")
+    if not moe:
+        return []
+    mine = TableCost(path, **(cluster_params(cluster_config) if p["identity"]["tp"] > 1 else {}))
+    names = set(moe.get("exact", {})) | set(moe.get("balanced", {}))
+    if "exact" in moe:
+        top = len(next(iter(moe["exact"].values())))
+        counts = list(range(1, top + 1))
+    else:
+        rng = random.Random(seed)
+        counts = list(range(1, 4200)) + sorted(rng.sample(range(4200, 200000), 600))
+    bad = []
+    for t in counts:
+        want = _moe_prices(cost, t, names)
+        got = {n: mine._moe_ns(n, t) for n in names}
+        if want != got:
+            bad.append((t, want, got))
+    if "exact" in moe:
+        for t in (0, top + 1, top + 2000):
+            try:
+                mine._moe_ns(next(iter(names)), t)
+            except OutsideRegime:
+                continue
+            bad.append((t, "table priced a count the fork refuses", None))
+    return bad[:10]
+
+
 TEMPLATE_SYSTEM = {"scheduling-policy": "LIFO", "endpoint-delay": 10, "active-chunks-per-dimension": 1,
                    "preferred-dataset-splits": 1, "all-reduce-implementation": ["ring"],
                    "all-gather-implementation": ["ring"], "reduce-scatter-implementation": ["ring"],
@@ -470,12 +571,12 @@ def cluster_params(path, default_npu_bw=None):
                 cpu_mem_bw=node["cpu_mem"]["mem_bw"], cpu_mem_latency_ns=node["cpu_mem"]["mem_latency"])
 
 
-def spot_check_tp(path, fork, hardware, model, tp, cluster_config, n, seed):
+def spot_check_tp(path, fork, hardware, model, tp, cluster_config, n, seed, variant=None):
     """Random shapes: TableCost against LLMServingSimCost (ASTRA-Sim) with the same cluster config.
     Returns (mismatches, refused by the guard, distinct ASTRA runs)."""
     from augur.cost.llmservingsim import LLMServingSimCost
     from augur.cost.tables import OutsideRegime, TableCost
-    ref = LLMServingSimCost(fork, hardware, model, tp=tp, cluster_config=cluster_config)
+    ref = LLMServingSimCost(fork, hardware, model, tp=tp, cluster_config=cluster_config, profile_variant=variant)
     with open(ref.oracle.cluster["system_config_path"], encoding="utf-8") as f:
         system = json.load(f)
     if {k: v for k, v in system.items() if k != "local-mem-bw"} != TEMPLATE_SYSTEM:
@@ -488,23 +589,34 @@ def spot_check_tp(path, fork, hardware, model, tp, cluster_config, n, seed):
         except OutsideRegime:
             refused += 1
             continue
-        want = ref.step_ns(s)
+        try:
+            want = ref.step_ns(s)
+        except ValueError:  # the fork refuses it too
+            bad.append((s, "fork refuses", got))
+            continue
         if want != got:
             bad.append((s, want, got))
     return bad, refused, ref.oracle.runs
 
 
-def spot_check(path, fork, hardware, model, n, seed, **cpu):
+def spot_check(path, fork, hardware, model, n, seed, variant=None, **cpu):
     from augur.cost.llmservingsim import LLMServingSimCost
     from augur.cost.tables import TableCost
     ref = LLMServingSimCost(fork, hardware, model, cpu_mem_bw_gbps=cpu.get("bw", 256.0),
-                            cpu_mem_latency_ns=cpu.get("lat", 0))
+                            cpu_mem_latency_ns=cpu.get("lat", 0), profile_variant=variant)
     mine = TableCost(path, cpu_mem_bw=cpu.get("bw", 256.0), cpu_mem_latency_ns=cpu.get("lat", 0))
+    from augur.cost.tables import OutsideRegime
     shapes = list(random_shapes(random.Random(seed), n))
+
+    def price(c, s):  # a step either side refuses (the MoE component tables stop at 2048 tokens) is compared as a refusal
+        try:
+            return c.step_ns(s)
+        except (ValueError, OutsideRegime) as e:
+            return "refused"
     t0 = time.perf_counter()
-    want = [ref.step_ns(s) for s in shapes]
+    want = [price(ref, s) for s in shapes]
     t1 = time.perf_counter()
-    got = [mine.step_ns(s) for s in shapes]
+    got = [price(mine, s) for s in shapes]
     t2 = time.perf_counter()
     bad = [(s, w, g) for s, w, g in zip(shapes, want, got) if w != g]
     return bad, (t1 - t0) / n, (t2 - t1) / n
@@ -522,29 +634,37 @@ def main(argv=None) -> int:
     ap.add_argument("--spot-checks", type=int, default=None,
                     help="random shapes priced against the fork (default 2000 at TP=1; 200 at TP>1, where each "
                          "distinct (tokens, sequences) pair costs one ASTRA-Sim binary run)")
+    ap.add_argument("--profile-variant", default=None,
+                    help="the fork's profile folder (e.g. bf16-tp4proj); name the output <variant>-tp<N>.json.gz")
     ap.add_argument("--seed", type=int, default=12345)
     a = ap.parse_args(argv)
     fork = os.path.abspath(a.fork)
     if a.spot_checks is None:
         a.spot_checks = 2000 if a.tp == 1 else 200
     try:
-        profile = build_profile(fork, a.hardware, a.model, a.tp, a.cluster_config)
+        profile = build_profile(fork, a.hardware, a.model, a.tp, a.cluster_config, a.profile_variant)
     except Refused as e:
         print(f"convert: refused: {e}", file=sys.stderr)
         return 2
     raw, packed = write_profile(profile, a.out)
     print(f"wrote {a.out}: {raw} bytes JSON, {packed} bytes gzip")
 
-    cost, db, config, tables, tg = load_fork(fork, a.hardware, a.model, a.tp, a.cluster_config)
+    cost, db, config, tables, tg = load_fork(fork, a.hardware, a.model, a.tp, a.cluster_config, a.profile_variant)
     bad = compare_tables(a.out, db, tables, tg)
     print(f"table comparison: {'OK' if not bad else 'MISMATCH'}")
     for m in bad[:10]:
         print("  ", m)
     failures = len(bad)
+    mbad = compare_moe(a.out, cost, a.cluster_config)
+    if json.loads(gzip.open(a.out, "rt").read()).get("moe"):
+        print(f"MoE block, every token count against the fork's trace: {'OK' if not mbad else 'MISMATCH'}")
+        for m in mbad[:5]:
+            print("  ", m)
+    failures += len(mbad)
     if a.tp > 1:
         try:
             mism, refused, runs = spot_check_tp(a.out, fork, a.hardware, a.model, a.tp, a.cluster_config,
-                                                a.spot_checks, a.seed)
+                                                a.spot_checks, a.seed, a.profile_variant)
         except Refused as e:
             print(f"convert: refused: {e}", file=sys.stderr)
             return 2
@@ -556,7 +676,7 @@ def main(argv=None) -> int:
         return 1 if failures + len(mism) else 0
     for label, cpu in (("default CPU memory", {}), ("bw=3.7 latency=123", {"bw": 3.7, "lat": 123})):
         n = a.spot_checks if not cpu else max(500, a.spot_checks // 4)
-        mism, t_ref, t_mine = spot_check(a.out, fork, a.hardware, a.model, n, a.seed, **cpu)
+        mism, t_ref, t_mine = spot_check(a.out, fork, a.hardware, a.model, n, a.seed, a.profile_variant, **cpu)
         print(f"spot check ({label}): {n} shapes, {len(mism)} mismatches; "
               f"fork {t_ref * 1e6:.0f} us/shape, TableCost {t_mine * 1e6:.0f} us/shape")
         for s, w, g in mism[:3]:

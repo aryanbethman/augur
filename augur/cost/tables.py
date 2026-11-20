@@ -34,7 +34,28 @@ The layer order, ``L`` and the table values are read from the profile file.
   longest KV and ``alpha`` comes from a calibrated bucket table (decode count,
   prefill chunk and relative gap ``(t_max - t_mean) / t_mean``).
 
-Tensor parallelism (TP = N > 1, one node, dense models; ASTRA-Sim FullyConnected topology, ring
+Mixture-of-experts models (``kind: "moe"``).  Every layer outside the MoE block is priced as above.  The MoE
+block of a decoder layer costs a function of the forward token count ``T`` only (the fork's balanced gate
+is deterministic in ``T``), so the profile stores it as a table of ``T`` and ``L`` copies are summed:
+
+* TP=1, native components (``moe.exact``: ``moe_gate_routing`` and ``moe_experts``): one integer ns per
+  ``T`` = 1..N, N the largest token count the fork's component tables measured (2048).  The fork builds
+  these from a 3-D (tokens, activated experts, local assignments) surface; the converter evaluated its
+  own code at every ``T``, so no triangulation (scipy) is needed at run time.  ``T`` = 0 and ``T`` > N
+  are refused, as the fork refuses them.
+* TP>1 without native components (``moe.balanced``: ``expert``): the fork's legacy whole-block table on
+  the activated-expert count of its closed-form balanced gate::
+
+      active(T) = min(E, max(1, round(E * (1 - ((E - k) / E) ** T))))
+      expert(T) = interpolation over (active, T) of the ep=1 rows, as in ``_lookup_moe``
+
+  The block is absent (0 ns) when ``T`` = 0.  Unlike the other tables it is not scaled by TP.
+  This path has no collective of its own, but it changes what ASTRA-Sim charges for the others: the
+  per-step communication above is lower by ``max(0, min(M, A, max(M, A) - B))`` ns, M = the number of MoE
+  layers (``collectives.moe_layers``), found by fitting ASTRA-Sim runs and checked on random shapes.
+  It was fitted at TP2 only (at TP4 the residual has another form): a MoE profile at TP>2 is refused.
+
+Tensor parallelism (TP = N > 1, one node, dense and MoE models; ASTRA-Sim FullyConnected topology, ring
 collectives).  Compute is priced exactly as above, on the profile's tpN tables.  The fork prices the
 rest by running ASTRA-Sim; for a dense step it has this closed form (``_comm_ns``, with the ASTRA-Sim
 source of each term in the comments there)::
@@ -203,7 +224,7 @@ class OutsideRegime(ValueError):
 
 
 class TableCost:
-    """``step_ns(shape)`` for a dense model at TP=N, priced from a profile file.
+    """``step_ns(shape)`` for a dense or MoE model at TP=N, priced from a profile file.
 
     ``cpu_mem_bw`` (GB/s = bytes/ns) and ``cpu_mem_latency_ns`` price the two
     tensors that live in CPU memory, as in ``LLMServingSimCost``.  At TP>1 the
@@ -219,10 +240,16 @@ class TableCost:
         if p.get("format_version") != FORMAT_VERSION:
             raise ValueError(f"{profile_path}: profile format {p.get('format_version')!r}, expected {FORMAT_VERSION}")
         ident = p["identity"]
-        if ident.get("kind") != "dense":
-            raise NotImplementedError(f"TableCost prices dense models only; profile kind is {ident.get('kind')!r}")
+        if ident.get("kind") not in ("dense", "moe"):
+            raise NotImplementedError(f"TableCost prices dense and MoE models; profile kind is {ident.get('kind')!r}")
+        moe = p.get("moe")
+        if ident["kind"] == "moe" and not moe:
+            raise NotImplementedError("a MoE profile needs its 'moe' tables (python -m augur.cost.convert)")
         self.identity = ident
         self.tp = ident["tp"]
+        if self.tp > 2 and moe:
+            raise NotImplementedError(f"MoE at tp={self.tp}: the MoE communication correction was fitted at TP2 only "
+                                      "(use --cost llmservingsim)")
         if self.tp > 1:
             coll = p.get("collectives")
             if not coll or any(not isinstance(coll.get(k), int) for k in
@@ -244,6 +271,8 @@ class TableCost:
         self._attn = {layer: {int(q): _Attention(spec) for q, spec in by_q.items()}
                       for layer, by_q in p["attention"].items()}
         self._skew = p["skew"]
+        self._moe_exact = (moe or {}).get("exact", {})
+        self._moe_balanced = (moe or {}).get("balanced", {})
         lay = p["layers"]
         self._prologue, self._head, self._repeat = lay["prologue"], lay["head"], lay["repeat"]
         self._block = {}
@@ -318,9 +347,50 @@ class TableCost:
         # MemBus + endpoint delay (10 ns, system.json) once per step and once for the first packet
         ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
         total = n * max(a, b) + min(a, b) + c["all_reduce_count"] * ar   # CPU memory: one FIFO queue per node
+        m = c.get("moe_layers", 0)
+        if m:  # see the MoE note in the module docstring
+            total -= max(0, min(m, a, max(m, a) - b))
         if rows:  # all-gather of the per-rank logits chunk, N-1 steps (Ring.cc)
             total += (n - 1) * ag_hop + 10 * n
         return total
+
+    # --- MoE block, TP>1 legacy path ---------------------------------------
+
+    def _moe_ns(self, name, tokens):
+        """Latency of MoE layer ``name`` at ``tokens`` forward tokens; None when ``name`` is not a MoE layer."""
+        table = self._moe_exact.get(name)
+        if table is not None:
+            if tokens < 1 or tokens > len(table):
+                raise OutsideRegime(f"the MoE block is profiled for 1..{len(table)} forward tokens, this step has "
+                                    f"{tokens} (the fork's component tables stop there too)")
+            return table[tokens - 1]
+        spec = self._moe_balanced.get(name)
+        return None if spec is None else self._moe_balanced_ns(spec, tokens)
+
+    @staticmethod
+    def _moe_balanced_ns(spec, tokens):
+        """The fork's ``_balanced_route_ep`` (one rank) followed by ``_lookup_moe``, operation for operation."""
+        if tokens <= 0:
+            return 0
+        e, k = max(1, spec["experts"]), spec["top_k"]
+        miss = ((e - min(k, e)) / e) ** tokens
+        active = max(min(e, max(1, int(round(e * (1.0 - miss))))), 1)
+        ae, rows = spec["activated"], spec["rows"]
+        t = max(int(tokens), 1)
+        idx = bisect.bisect_right(ae, active)
+        if idx == 0 or (idx >= len(ae) and len(ae) < 2):
+            lo = hi = 0
+        elif idx >= len(ae):
+            lo, hi = len(ae) - 2, len(ae) - 1
+        else:
+            lo, hi = idx - 1, idx
+        val_lo = _interp1d(rows[lo]["keys"], rows[lo]["ns"], t)
+        if lo == hi:
+            return max(1, int(val_lo))
+        val_hi = _interp1d(rows[hi]["keys"], rows[hi]["ns"], t)
+        x0, x1 = ae[lo], ae[hi]
+        out = val_lo if x1 == x0 else val_lo + (active - x0) / (x1 - x0) * (val_hi - val_lo)
+        return max(1, int(out))
 
     # --- step ------------------------------------------------------------
 
@@ -346,6 +416,9 @@ class TableCost:
         r = max(int(rows), 1)
 
         def price(name):
+            moe = self._moe_ns(name, tokens)
+            if moe is not None:
+                return moe
             if name in self._attn:
                 chunk = sum(q for q, _ in pre)
                 if chunk == 0 and n_dec == 0:  # no attention kernel is launched (fork: _emit_npu_attention)
