@@ -43,7 +43,7 @@ sync, async and speculative runs.
 ## 2. Step times: the profile
 
 Profile: Qwen3-1.7B TP1, RTX 4060 Ti, with the attention skew sweep (fork
-4bbee2f). `python -m augur.verify.stepcheck` rebuilds every real step's batch
+2a2321d). `python -m augur.verify.stepcheck` rebuilds every real step's batch
 from the step log, pads it with vLLM's CUDA-graph dispatcher, prices it and
 compares with the measured step:
 

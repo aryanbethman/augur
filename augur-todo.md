@@ -35,9 +35,9 @@ command; PD and DP+async have tests. 151 tests pass. Not fixed: DP + async sched
 - [x] On GPU, async scheduling (vLLM's default): 3,250/3,250 steps (f03a7f5)
 
 ## 1. Timing accuracy against real vLLM on GPUs
-- [x] Profile Qwen3-1.7B on the RTX 4060 Ti (GPU 0; fork 4e1e890). GPU 1 of the
+- [x] Profile Qwen3-1.7B on the RTX 4060 Ti (GPU 0; fork 8bf9682). GPU 1 of the
       test host is clock-locked at 510 MHz (needs root to fix)
-- [x] Skew sweep (fork 4bbee2f): step ratio 0.951→0.965 ShareGPT, 0.950→0.973 SWE; e2e unchanged
+- [x] Skew sweep (fork 2a2321d): step ratio 0.951→0.965 ShareGPT, 0.950→0.973 SWE; e2e unchanged
 - [x] Knee TTFT diagnosed (d954e4a): real run replays 778/778; with real arrivals, 1% step bias -> 23% median TTFT (backlog). Real run-to-run noise 8%
 - [x] Sub-1% step pricing: not reachable (see section 6); the profile's sign flips between runs
 - [x] Load-dependent front-end delay: it is the engine loop's wait, already simulated (section 6)
@@ -135,7 +135,7 @@ command; PD and DP+async have tests. 151 tests pass. Not fixed: DP + async sched
       ngram self-test found + fixed a replay preemption bug (52e39e0)
 - [x] LLMServingSim comparison is a pytest test with its reference data in the repo (ccae81a); 23 tests pass from a fresh clone
 - [x] LLMServingSim 256-GPU run on the current branch: matches augur; 2h11m vs 44 s
-- [x] LLMServingSim template store bounded (fork 41d4b94); identical output at 16 NPUs
+- [x] LLMServingSim template store bounded (fork 879b69d); identical output at 16 NPUs
 - [ ] 51.6 GB peak RSS at 256 NPUs not explained by the store at 16: rerun 256 to measure
 - [x] Commit the PROGRESS.md notes (speed explanation, crash fix)
 - [ ] Faster DP rounds; cheaper ASTRA cache key
