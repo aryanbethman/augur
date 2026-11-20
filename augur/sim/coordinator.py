@@ -108,6 +108,16 @@ class _Event:
     payload: object = field(compare=False)
 
 
+def _empty(sch) -> bool:
+    """True when the scheduler holds nothing, so ``has_requests()`` is False without asking.
+
+    ``_start_steps`` polls every engine after every event, and at 64 engines the idle ones dominate its cost
+    (has_requests is four calls deep in vLLM).  has_requests() is False if there are no live requests, no
+    finished ids awaiting the next schedule, and no connector (which could report pending work).
+    """
+    return not sch.requests and not sch.finished_req_ids and sch.connector is None and sch.ec_connector is None
+
+
 class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
@@ -585,14 +595,15 @@ class Coordinator:
         for eng in self.engines:
             if eng.busy or eng.spec.data_parallel_size > 1:
                 continue
+            sch = eng.core.scheduler
             if eng.async_sched:
-                if eng.core.scheduler.has_requests() or eng.batch_finish:
+                if not _empty(sch) and sch.has_requests() or eng.batch_finish:
                     self._step_async(eng)
                     self._poll_when_transfers_finish(eng)
                     self._replay_spin(eng)
                 continue
             pending_kv = bool(eng.ctx.deliver_recving or eng.ctx.deliver_sending)
-            if not eng.core.scheduler.has_requests() and not pending_kv:
+            if (_empty(sch) or not sch.has_requests()) and not pending_kv:
                 if eng.idle_since is None:
                     eng.idle_since = self.now
                 continue
