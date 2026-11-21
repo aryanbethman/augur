@@ -77,6 +77,10 @@ class SimContext:
     # this rate each; drafts handed to vLLM's scheduler via take_draft_token_ids.
     spec_k: int = 0
     spec_accept_rate: float = 0.0
+    # Per request verified with drafts, beyond the profile's price: rejection sampling and draft bookkeeping (real
+    # ngram runs: ~100-200 us per request per step after attention is priced at the multi-token query length).
+    # Added to the step's GPU time, so async scheduling does not hide it; not used when replaying logged durations.
+    spec_ns_per_request: int = 0
     pending_drafts: object = None
     drafter: Any = None  # EAGLE / MTP: augur.sim.draft.DraftCost, the drafter's time added to each step
     # Async scheduling: every execute_model call is a launch onto the GPU
@@ -380,6 +384,8 @@ class SimWorker:
                 gpu += self.ctx.drafter.step_ns(shape, len(drafts_next))
             if self.ctx.step_time_scale != 1.0:
                 gpu = round(gpu * self.ctx.step_time_scale)
+            if self.ctx.spec_ns_per_request and not hasattr(self.ctx.cost, "durations"):
+                gpu += self.ctx.spec_ns_per_request * sum(1 for x in seqs if x.is_decode and x.num_new > 1)
             if self.ctx.hbm_interference and self.ctx.net is not None and not hasattr(self.ctx.cost, "durations"):
                 gpu = round(gpu * self.ctx.interference_factor())
             cpu = (self.ctx.cpu_fixed_ns + self.ctx.cpu_per_request_ns * len(seqs)) if seqs else 0

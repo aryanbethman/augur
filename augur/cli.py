@@ -134,6 +134,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="drafter: ngram (prompt lookup, no draft cost), eagle / eagle3 (a head derived from the "
                         "target's config, priced as one target layer per pass), mtp (the target's own MTP layers; "
                         "models that define them)")
+    p.add_argument("--spec-us-per-request", type=float, default=100.0,
+                   help="speculative decoding: extra step time per request verified with drafts (rejection sampling, "
+                        "draft bookkeeping), on top of the profile; 100 us (step fits say 160-210, whole-run fits 0-100) on an RTX 4060 Ti "
+                        "(vLLM 0.33), after attention is priced at the multi-token query length (needs a profile made "
+                        "with --attention-decode-q-lens, else attention is priced as a one-token decode). Ignored "
+                        "with --replay-durations")
     p.add_argument("--spec-accept-rate", type=float, default=0.7,
                    help="probability each draft token is accepted (content decides this on a GPU)")
     p.add_argument("--dp", type=int, default=1, help="DP ranks in one lockstep group (vLLM data_parallel_size)")
@@ -506,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
         for e in engines:
             e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
             e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
+            e.ctx.spec_ns_per_request = int(a.spec_us_per_request * 1e3)
             e.ctx.step_time_scale = a.step_time_scale
     if a.step_log:
         for e in engines:

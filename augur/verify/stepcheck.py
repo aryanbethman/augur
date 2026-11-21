@@ -27,22 +27,30 @@ from augur.cost.profiles import default_fork
 from augur.verify.replay import is_async, read_log, steps
 
 
+MAX_DRAFTS = 8  # a decode step carries at most this many draft tokens (num_speculative_tokens)
+
+
 def real_steps(events):
     """[(shape without padding, measured ns)] for a step log."""
     # Async runs overlap scheduling with the GPU: a batch runs from when it was
     # scheduled or the previous batch finished, whichever is later, to its update.
     async_run = is_async(events)
     computed: dict[str, int] = {}
+    prompt = {e["rid"]: e["prompt"] for e in events if e["ev"] == "add"}
     out = []
     prev_finish = None
     for s, u in steps(events):
         seqs = []
+        emitted = u["out"]
         for rid, n in s["tok"].items():
             if rid in s["new"]:
                 computed[rid] = s["new"][rid]
             before = computed.get(rid, 0)
-            seqs.append(SeqWork(num_new=n, num_computed_before=before, is_decode=n == 1))
-            computed[rid] = before + n
+            # A decode step is a request past its prompt: 1 token, or 1 + drafts under speculative decoding (where
+            # only the emitted tokens, accepted drafts + 1, enter the KV cache; rejected drafts do not).
+            decode = before >= prompt.get(rid, 0) and emitted.get(rid, 0) >= 1 and (n == 1 or n <= 1 + MAX_DRAFTS)
+            seqs.append(SeqWork(num_new=n, num_computed_before=before, is_decode=decode or n == 1))
+            computed[rid] = before + (emitted[rid] if decode and n > 1 else n)
         for rid in s["pre"]:
             computed[rid] = 0
         start = max(s["t"], prev_finish) if async_run and prev_finish is not None else s["t"]

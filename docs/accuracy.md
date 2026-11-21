@@ -172,11 +172,23 @@ directions to 24 GB/s (−33%). Offload on a host busy with memory-bound CPU
 work, or through a chipset slot, should not be priced at the single-GPU rate.
 Measured with other users' jobs on the host (load 9-15); this host only.
 
-**Speculative decoding timing.** ngram k=3, ShareGPT 300, rerun on GPU 0
-(host load 33-41): both simulators are far too fast. Mean TPOT error: augur
-−32% async and −35% sync, LLMServingSim −26% and −29%. Real steps take about
-2.3x the priced time, about 1 ms per request per step more. Neither simulator
-prices the drafter or verification overhead; decisions still replay exactly.
+**Speculative decoding timing** (ngram k=3, ShareGPT 300, RTX 4060 Ti,
+GPU 0; acceptance from the real log: 1.25 drafts accepted per step, augur's
+per-position `--spec-accept-rate` 0.62). With the shipped profile, which holds
+attention only at query length 1, a verification step is priced as a
+one-token decode, and augur comes out 24-29% too fast (mean TTFT / TPOT /
+latency async −24 / −26 / −25%, sync −28 / −29 / −28%). The gap grows with
+context and with the number of requests, not per step: FlashAttention with
+1 + k queries per request costs 1.4-1.9x a one-token decode at the same
+context (0.35-0.5 us per context token), while vLLM's ngram proposer takes only
+0.1-0.25 ms per step on the CPU, and async does not hide the gap. Pricing
+attention from a profile made with `--decode-q-lens 1,4` (a 19-minute
+`augur.profile` run) brings step totals to 0.92 (async) and 0.87 (sync) of the
+measured, and the runs to +1.9 / −5.8 / −1.3% (async) and −3.7 / −9.6 / −6.1%
+(sync). A further 160-210 us per request per step remains (rejection sampling,
+bookkeeping); `--spec-us-per-request` (default 100) adds it: +10.4 / +0.7 /
++6.3% async, +3.6 / −3.8 / +0.6% sync. Decisions replay exactly (1,760 / 1,760
+and 1,653 / 1,653 steps). The shipped profile does not yet have the q=4 table.
 
 **Knee TTFT** is the hardest metric. With the real engine arrivals held fixed
 (`--replay-arrivals`), median TTFT is 1,111 ms with the real step times and
@@ -214,13 +226,14 @@ measured, is reliable.
 | SWE-bench sessions, sync | session duration, median per-session error | 3.7% | 0.9% |
 | SWE-bench sessions, async | mean TTFT / TPOT / latency | −0.4 / −0.6 / −0.4% | −0.8 / +0.1 / −0.6% |
 | SWE-bench sessions, async | median per-call TTFT / TPOT / latency (absolute) | 8.7 / 8.2 / 6.1% | 9.1 / 7.0 / 6.1% |
-| ShareGPT 300, ngram k=3, async | mean TPOT | −25.5% | −32.0% |
+| ShareGPT 300, ngram k=3, async (shipped profile) | mean TPOT | −25.5% | −26.3% |
 | random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −1.2 / −1.9% |
 | random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −11.2 / −28.1%, −1.4% |
 | random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.4%, −2.1%, +2.0% |
 
 At 0.2 sessions/s the async SWE-bench engine is rarely saturated and the two
-schedulers agree. Neither simulator prices ngram drafting (section 3).
+schedulers agree. With speculation both price verification steps as
+one-token decodes (section 3).
 On sync runs and at light load augur is closer: LLMServingSim has no term for
 vLLM's CPU time, the API server or the client. On loaded async runs the two
 are equally close. LLMServingSim's async runs come out
