@@ -158,6 +158,20 @@ agree: stores that finished in the same step as a load ran 15% slower (10.4 vs
 5% of the run, so contention costs under 0.5% of step time here; it matters
 when transfers are active most of the time, or when GPUs share a host.
 
+**Two GPUs offloading at once** (`scripts/contention_bench.py --two-gpu`).
+The test host has two RTX 4060 Ti on one PCIe host bridge with no switch: GPU0
+on the CPU's root port, GPU1 behind the chipset, at about half GPU0's copy
+rate (6.6 GB/s each way; its clock lock does not affect copies). With the host
+otherwise idle, the two GPUs do not slow each other in any combination of
+directions: each keeps its single-GPU rate within 1%, 35.8 GB/s in total with
+all four directions active. The only slowdown is the single-GPU one (a
+GPU-to-host copy beside a host-to-GPU copy on the same GPU loses 15-17%). With
+four processes streaming host memory, they contend: both GPUs copying the same
+way fall to 14 GB/s in total (GPU1 −56%, GPU0 −11 to −13%), and all four
+directions to 24 GB/s (−33%). Offload on a host busy with memory-bound CPU
+work, or through a chipset slot, should not be priced at the single-GPU rate.
+Measured with other users' jobs on the host (load 9-15); this host only.
+
 **Speculative decoding timing.** ngram k=3, ShareGPT 300, rerun on GPU 0
 (host load 33-41): both simulators are far too fast. Mean TPOT error: augur
 −32% async and −35% sync, LLMServingSim −26% and −29%. Real steps take about

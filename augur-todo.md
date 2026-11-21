@@ -77,6 +77,8 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
 - [ ] Model ngram speculation step cost: real steps ~2.3x the profile's price in both simulators (about 1 ms per
       request per step); re-measure on a quiet host first (host load was 33-41)
 - [ ] Offload: GPU-to-CPU copies lose 15% when a load overlaps; decode is 7% slower during a copy (contention work)
+- [ ] Multi-GPU offload: two GPUs do not contend on an idle host, but under memory-bound CPU load aggregate copy
+      bandwidth falls 25-33% (2026-11-21, two-GPU benchmark): model it in the contention work
 - [x] Tiered KV offload (2026-11-18): vLLM's TieringOffloadingManager unmodified (cascade CPU -> tiers,
       promotion tier -> CPU -> GPU), augur/sim/tiers.py SimMemoryTier as the tier (capacity, LRU, FIFO
       write/read lanes, latency + bytes/bw on the virtual clock), CPU tier buffer anonymous (no /dev/shm).
