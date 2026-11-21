@@ -128,6 +128,13 @@ class SimEngine:
         self.core = EngineCore(self.vllm_config, executor_class=self.vllm_config.parallel_config.distributed_executor_backend,
                                log_stats=False)
         self.max_model_len = self.vllm_config.model_config.max_model_len
+        sc = self.vllm_config.speculative_config
+        if sc is not None and sc.method in ("eagle", "eagle3", "mtp") and not hasattr(cost, "durations"):
+            # A replayed run's step durations already hold the drafter's time.
+            from augur.sim.draft import DraftCost, draft_layer_count
+            pc, mc = self.vllm_config.parallel_config, self.vllm_config.model_config
+            self.ctx.drafter = DraftCost(cost, sc.method, int(sc.num_speculative_tokens),
+                                         draft_layer_count(self.vllm_config), mc.get_num_layers(pc))
         self.kv_event_queue: list = []
         if spec.kv_events:
             # vLLM's scheduler publishes each step's events (its block pool's, and

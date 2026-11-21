@@ -129,7 +129,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=True,
                    help="vLLM async scheduling, on by default as in vLLM 0.33: schedule step k+1 while step k runs")
     p.add_argument("--num-speculative-tokens", type=int, default=0,
-                   help="speculative decoding (ngram method): draft tokens per step")
+                   help="speculative decoding: draft tokens per step")
+    p.add_argument("--speculative-method", choices=["ngram", "eagle", "eagle3", "mtp"], default="ngram",
+                   help="drafter: ngram (prompt lookup, no draft cost), eagle / eagle3 (a head derived from the "
+                        "target's config, priced as one target layer per pass), mtp (the target's own MTP layers; "
+                        "models that define them)")
     p.add_argument("--spec-accept-rate", type=float, default=0.7,
                    help="probability each draft token is accepted (content decides this on a GPU)")
     p.add_argument("--dp", type=int, default=1, help="DP ranks in one lockstep group (vLLM data_parallel_size)")
@@ -355,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ep = a.dp * a.tp if a.enable_expert_parallel else 1
         weights = estimate_weight_bytes(os.path.join(mdir, "config.json"), tp=a.tp, ep=ep)
+        if a.num_speculative_tokens and a.speculative_method != "ngram":
+            from augur.sim.draft import draft_weight_bytes
+            weights += draft_weight_bytes(os.path.join(mdir, "config.json"), a.speculative_method, tp=a.tp)
         kv_bytes = int(a.hbm_gb * 2**30 * a.mem_util) - weights - int(a.kv_reserve_gib * 2**30)
         if kv_bytes <= 0:
             print(f"model weights ({weights / 2**30:.1f} GiB/GPU) do not fit in {a.hbm_gb} GB", file=sys.stderr)
@@ -396,6 +403,17 @@ def main(argv: list[str] | None = None) -> int:
                                  cluster_config=a.lss_cluster_config, dp=a.dp, profile_variant=a.profile_variant,
                                  ep=a.dp * a.tp if a.enable_expert_parallel else 1)
 
+    speculative = None
+    if a.num_speculative_tokens:
+        from augur.sim.draft import speculative_config
+        try:
+            speculative = speculative_config(a.speculative_method, a.num_speculative_tokens, mdir, cache_root)
+        except ValueError as e:
+            print(f"augur: {e}", file=sys.stderr)
+            return 2
+        if a.speculative_method != "ngram" and a.dp > 1:
+            print("augur: eagle / eagle3 / mtp are not priced with --dp yet", file=sys.stderr)
+            return 2
     spec = EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=kv_bytes,
                       max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
                       max_num_seqs=a.max_num_seqs, block_size=a.block_size,
@@ -403,9 +421,7 @@ def main(argv: list[str] | None = None) -> int:
                       enable_chunked_prefill=not a.no_chunked_prefill, tensor_parallel_size=a.tp,
                       enforce_eager=a.enforce_eager,
                       async_scheduling=a.async_scheduling,
-                      speculative=({"method": "ngram", "num_speculative_tokens": a.num_speculative_tokens,
-                                    "prompt_lookup_max": 4, "prompt_lookup_min": 2}
-                                   if a.num_speculative_tokens else None),
+                      speculative=speculative,
                       spec_accept_rate=a.spec_accept_rate,
                       scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks,
                       kv_offload_gib=a.kv_offload_gib,
