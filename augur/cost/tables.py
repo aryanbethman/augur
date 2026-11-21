@@ -432,6 +432,66 @@ class TableCost:
         out = val_lo if x1 == x0 else val_lo + (active - x0) / (x1 - x0) * (val_hi - val_lo)
         return max(1, int(out))
 
+    # --- drafter passes (EAGLE / MTP) -----------------------------------------
+
+    def _draft_comm_ns(self, tokens: int, rows: int, layers: int) -> int:
+        """Collectives of ``layers`` decoder layers plus the logits all-gather at TP>1: the formula of
+        ``_comm_ns`` without its CPU-memory terms (the drafter's token ids never leave the GPU) and with two
+        all-reduces per layer."""
+        n, lat, c = self.tp, self.link_latency_ns, self._coll
+        bw = self.link_bw * (1 << 30) / 1000000000
+        local = int(self.npu_mem_bw) * 1000000000
+        msg = (c["all_reduce_bytes_per_token"] * tokens) // n
+        hop = int(lat + msg / bw)
+        ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
+        total = 2 * layers * ar
+        if rows:
+            ag_hop = int(lat + c["all_gather_bytes_per_seq"] * rows / bw)
+            total += (n - 1) * ag_hop + 10 * n
+        return total
+
+    def draft_pass_ns(self, shape: StepShape, layers: int = 1, rows: int | None = None, proj: int = 0) -> int:
+        """One forward pass of a drafter, priced from this model's own per-layer tables.
+
+        ``layers`` decoder layers (the profile's layer block, attention included, at ``shape``), ``proj`` times the
+        ``o_proj`` price for the drafter's input projection (EAGLE ``fc``, MTP ``eh_proj``; an approximation),
+        then the final norm, ``lm_head`` and sampler for ``rows`` sequences (default: the shape's).  No embedding
+        (the drafter reads the target's), no CPU-memory terms.  Used by ``augur.sim.draft.DraftCost``."""
+        pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
+        dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
+        n_dec = len(dec)
+        dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1) or 1
+        kv_mean = sum(dec) // n_dec if n_dec else 0
+        kv_max = max(dec, default=0)
+        tokens = shape.forward_tokens
+        rows = len(shape.seqs) if rows is None else rows
+        key = ("draft", pre, n_dec, dq, kv_mean, kv_max, tokens, rows, layers, proj)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        t, r = max(int(tokens), 1), max(int(rows), 1)
+
+        def price(name):
+            if name in self._attn:
+                chunk = sum(q for q, _ in pre)
+                if chunk == 0 and n_dec == 0:
+                    return 0
+                return self._attention_ns(name, chunk, _prefill_key(pre), n_dec, kv_mean, kv_max, dq)
+            if name in self._per_seq:
+                keys, vals = self._per_seq[name]
+                return max(1, int(_interp1d(keys, vals, r)))
+            keys, vals = self._dense[name]
+            return max(1, int(_interp1d(keys, vals, t)))
+
+        ns = layers * sum(count * price(n) for n, count in self._block.items())
+        if proj and "o_proj" in self._dense:
+            ns += proj * price("o_proj")
+        ns += sum(price(n) for n in self._head if rows > 0 or n not in self._per_seq)
+        if self.tp > 1:
+            ns += self._draft_comm_ns(tokens, rows, layers)
+        self._cache[key] = ns
+        return ns
+
     # --- step ------------------------------------------------------------
 
     def round_ns(self, shapes, first_rank: int = 0):

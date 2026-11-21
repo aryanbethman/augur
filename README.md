@@ -47,7 +47,10 @@ consistent-hash, rendezvous-hash, sticky-least-loaded and kv-aware policies; kv-
 routes by the KV blocks each engine announces in vLLM's own KV events, GPU and CPU
 tier), prefill/decode
 (`--prefill-engines/--decode-engines`), DP+EP MoE (`--dp`,
-`--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33), KV
+`--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33), speculative decoding
+(`--speculative-method ngram|eagle|eagle3|mtp --num-speculative-tokens k
+--spec-accept-rate p`; EAGLE and MTP run vLLM's drafter path without weights,
+the drafter priced from the target's per-layer profile), KV
 offload to CPU memory (`--kv-offload-gib`, vLLM's `--kv-offloading-size`;
 transfer cost from `--kv-offload-gbps` / `--kv-offload-latency-ns`, by default
 the CPU memory's, as LLMServingSim prices KV loads), and secondary tiers behind

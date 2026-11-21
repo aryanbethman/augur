@@ -162,3 +162,11 @@ def test_converts_an_existing_fork_profile_with_provenance(tmp_path, monkeypatch
     assert P.main(["--model", "meta-llama/Llama-3.1-70B", "--hardware", "H100", "--tp", "4", "--stages", "convert",
                    "--no-skew", "--fork", FORK, "--work-dir", str(work), "--out", str(out)]) == 0
     assert not out.exists()
+
+
+def test_decode_q_lens_reach_the_profiler():
+    a = args("--decode-q-lens", "1,4")
+    a.max_model_len = 100
+    cmd = P.profiler_command(a)
+    assert cmd[cmd.index("--attention-decode-q-lens") + 1] == "1,4"
+    assert "--attention-decode-q-lens" not in P.profiler_command(args())

@@ -217,6 +217,8 @@ def profiler_command(a, only_skew: bool = False) -> list[str]:
            "--gpu-memory-utilization", str(a.gpu_memory_utilization)]
     if a.block_size:
         cmd += ["--block-size", str(a.block_size)]
+    if a.decode_q_lens:
+        cmd += ["--attention-decode-q-lens", a.decode_q_lens]
     if a.dtype:
         cmd += ["--dtype", a.dtype]
     if a.variant:
@@ -352,6 +354,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default=None, help="vLLM dtype; default: the checkpoint's")
     p.add_argument("--variant", default=None, help="profile folder name; default: the profiler's (e.g. bf16)")
     p.add_argument("--no-skew", action="store_true", help="leave out the skew sweep (hours)")
+    p.add_argument("--decode-q-lens", default=None, metavar="LIST",
+                   help="query tokens per decode sequence to profile, e.g. 1,4 for speculative decoding with 3 draft "
+                        "tokens (verification steps run 1 + k queries per request; unprofiled lengths are priced "
+                        "as 1). Each adds a decode grid: more hours")
     p.add_argument("--profiler-arg", action="append", default=[], metavar="ARG",
                    help="extra argument for `python -m profiler profile` (repeatable)")
     p.add_argument("--fork", default=default_fork(), help="LLMServingSim fork checkout (AUGUR_FORK)")
