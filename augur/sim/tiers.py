@@ -53,9 +53,24 @@ def register_clock(key: str, clock: Any) -> None:
     _clocks[key] = clock
 
 
+# Named tier presets: ``--kv-offload-tier NAME:GIB`` takes (GB/s, latency ns) from here.
+# "cxl" is LLMServingSim's CXL memory (cluster config key cxl_mem), per device:
+#   configs/cluster/single_node_cxl_instance.json   "cxl_mem": {"mem_size": 1024, "mem_latency": 250,
+#                                                              "mem_bw": 60, "num_devices": 4}
+#   docs/docs/examples/memory-tiers/cxl-memory.mdx  documents mem_bw as GB/s per device and mem_latency as ns
+# (the fork's config_builder defaults num_devices to 1; its example uses 4, which adds up to 240 GB/s, so give
+# that as --kv-offload-tier cxl:GIB:240:250). Those are the fork's example values, not a measured CXL device.
+TIER_PRESETS = {"cxl": (60.0, 250)}
+
+
+class _NoPreset(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class TierSpec:
-    """One simulated secondary tier, as ``--kv-offload-tier NAME:GIB:GBPS[:LATENCY_NS]`` gives it."""
+    """One simulated secondary tier, as ``--kv-offload-tier NAME:GIB[:GBPS[:LATENCY_NS]]`` gives it
+    (NAME:GIB alone needs NAME in TIER_PRESETS)."""
 
     name: str
     capacity_bytes: int
@@ -67,15 +82,25 @@ class TierSpec:
         """Called by: cli.main."""
         parts = text.split(":")
         try:
-            if len(parts) not in (3, 4) or not parts[0]:
+            if len(parts) not in (2, 3, 4) or not parts[0]:
                 raise ValueError
-            gib, gbps = float(parts[1]), float(parts[2])
-            latency = int(parts[3]) if len(parts) == 4 else 0
+            if len(parts) == 2:
+                if parts[0] not in TIER_PRESETS:
+                    raise _NoPreset
+                gib = float(parts[1])
+                gbps, latency = TIER_PRESETS[parts[0]]
+            else:
+                gib, gbps = float(parts[1]), float(parts[2])
+                latency = int(parts[3]) if len(parts) == 4 else 0
             if gib <= 0 or gbps <= 0 or latency < 0:
                 raise ValueError
+        except _NoPreset:
+            raise ValueError(f"tier {text!r}: {parts[0]!r} has no preset (presets: {', '.join(TIER_PRESETS)}); "
+                             "give NAME:GIB:GBPS[:LATENCY_NS]") from None
         except ValueError:
-            raise ValueError(f"tier {text!r}: expected NAME:GIB:GBPS[:LATENCY_NS] (name, capacity in GiB > 0, "
-                             "bandwidth in GB/s > 0, latency in ns >= 0)") from None
+            raise ValueError(f"tier {text!r}: expected NAME:GIB[:GBPS[:LATENCY_NS]] (name, capacity in GiB > 0, "
+                             "bandwidth in GB/s > 0, latency in ns >= 0; GBPS and LATENCY_NS only "
+                             "for a name without a preset)") from None
         return cls(parts[0], int(gib * GIB), gbps, latency)
 
     def tier_config(self, clock_key: str) -> dict:

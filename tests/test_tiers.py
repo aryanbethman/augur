@@ -16,7 +16,8 @@ import pytest
 from vllm.v1.kv_offload.base import LookupResult, ReqContext
 from vllm.v1.kv_offload.tiering.base import TransferJob
 
-from augur.sim.tiers import SimMemoryTier, TierSpec, register_clock
+from augur.cost.profiles import default_fork
+from augur.sim.tiers import TIER_PRESETS, SimMemoryTier, TierSpec, register_clock
 
 CHUNK = 1_000_000  # bytes per chunk (the primary view's row)
 NS = 10.0  # GB/s = bytes per ns: one chunk in 100 us
@@ -162,15 +163,31 @@ def test_drain_finishes_every_job_now():
 @pytest.mark.parametrize("text, spec", [
     ("cxl:64:30", TierSpec("cxl", 64 * 2**30, 30.0, 0)),
     ("pool:0.5:12.5:250", TierSpec("pool", 2**29, 12.5, 250)),
+    ("cxl:64", TierSpec("cxl", 64 * 2**30, 60.0, 250)),  # LLMServingSim's cxl_mem: 60 GB/s, 250 ns
+    ("cxl:64:30", TierSpec("cxl", 64 * 2**30, 30.0, 0)),  # explicit values keep working, latency 0 as before
+    ("cxl:64:240:300", TierSpec("cxl", 64 * 2**30, 240.0, 300)),
 ])
 def test_tier_spec_parses_name_gib_gbps_and_latency(text, spec):
     assert TierSpec.parse(text) == spec
 
 
-@pytest.mark.parametrize("text", ["cxl", "cxl:64", "cxl:x:30", "cxl:0:30", "cxl:64:0", "cxl:64:30:-1",
+def test_tier_name_without_a_preset_needs_bandwidth():
+    with pytest.raises(ValueError, match="no preset"):
+        TierSpec.parse("pool:64")
+
+
+def test_cxl_preset_is_the_forks_cxl_mem_config():
+    fork = os.path.join(default_fork(), "configs", "cluster", "single_node_cxl_instance.json")
+    if not os.path.exists(fork):
+        pytest.skip("LLMServingSim fork not found")
+    cxl = json.load(open(fork))["cxl_mem"]
+    assert TIER_PRESETS["cxl"] == (cxl["mem_bw"], cxl["mem_latency"])
+
+
+@pytest.mark.parametrize("text", ["cxl", "cxl:x", "cxl:0", "cxl:x:30", "cxl:0:30", "cxl:64:0", "cxl:64:30:-1",
                                   ":64:30", "cxl:64:30:1:2"])
 def test_tier_spec_rejects_malformed_text(text):
-    with pytest.raises(ValueError, match="NAME:GIB:GBPS"):
+    with pytest.raises(ValueError, match="NAME:GIB"):
         TierSpec.parse(text)
 
 
@@ -233,6 +250,12 @@ def test_a_cxl_tier_brings_back_chunks_the_small_cpu_tier_evicted(tmp_path, sess
     assert cached(tiered) > 1.5 * cached(cpu_only)
 
 
+def test_cxl_by_name_runs_as_the_forks_cxl_numbers(tmp_path, sessions):
+    named = run(tmp_path, sessions, "named", *SMALL_CPU, "--kv-offload-tier", "cxl:2")
+    explicit = run(tmp_path, sessions, "explicit", *SMALL_CPU, "--kv-offload-tier", "cxl:2:60:250")
+    assert named == explicit
+
+
 def test_a_slower_tier_makes_calls_slower(tmp_path, sessions):
     fast = run(tmp_path, sessions, "fast", *SMALL_CPU, "--kv-offload-tier", "cxl:2:100")
     slow = run(tmp_path, sessions, "slow", *SMALL_CPU, "--kv-offload-tier", "cxl:2:0.05")
@@ -283,7 +306,8 @@ def test_an_engine_that_stops_scheduling_is_reported_not_left_spinning(sessions)
 
 @pytest.mark.parametrize("args, message", [
     (["--kv-offload-tier", "cxl:2:30"], "--kv-offload-tier needs --kv-offload-gib"),
-    (SMALL_CPU + ["--kv-offload-tier", "cxl:2"], "NAME:GIB:GBPS"),
+    (SMALL_CPU + ["--kv-offload-tier", "pool:2"], "no preset"),
+    (SMALL_CPU + ["--kv-offload-tier", "cxl:2:x"], "NAME:GIB"),
     (SMALL_CPU + ["--kv-offload-tier", "cxl:2:30", "--kv-offload-tier", "cxl:4:10"], "named twice"),
 ])
 def test_bad_tier_flags_are_refused_before_a_run(sessions, args, message):

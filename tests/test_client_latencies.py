@@ -1,5 +1,6 @@
-"""--frontend-latency-ms delays when the engine sees a request, --delivery-latency-ms when the client
-gets each token; both count in the calls times, which stay measured from the clients send.
+"""--frontend-latency-ms (plus --frontend-us-per-token per prompt token) delays when the engine sees a request,
+--delivery-latency-ms when the client gets each token; all count in the calls times, which stay measured from
+the clients send.
 
 Same small configuration as test_step_time_scale.py, on the synthetic workload (conftest.py).
 """
@@ -16,11 +17,12 @@ BASE = ["--model", "Qwen/Qwen3-1.7B", "--cost", "fixed",
         "--no-recorded-outputs", "--no-async-scheduling", "--step-cpu-us", "0", "--quiet"]
 
 
-def augur(tmp_path, workload, name, n, frontend_ms, delivery_ms):
+def augur(tmp_path, workload, name, n, frontend_ms, delivery_ms, us_per_token=0):
     env = dict(os.environ, VLLM_LOGGING_LEVEL="WARNING")
     out = tmp_path / f"{name}.csv"
     subprocess.run([sys.executable, "-m", "augur.cli", *BASE, "--workload", workload, "--num-entries", str(n), "--output", str(out),
-                    "--frontend-latency-ms", str(frontend_ms), "--delivery-latency-ms", str(delivery_ms)],
+                    "--frontend-latency-ms", str(frontend_ms), "--delivery-latency-ms", str(delivery_ms),
+                    "--frontend-us-per-token", str(us_per_token)],
                    check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with open(out) as f:
         return list(csv.DictReader(f))
@@ -44,6 +46,15 @@ def test_one_request(tmp_path, workload):
         assert ints(rows, "TTFT")[0] == ints(base, "TTFT")[0] + ns
         assert ints(rows, "latency")[0] == ints(base, "latency")[0] + ns
         assert itls(rows) == itls(base)
+
+
+def test_frontend_delay_grows_with_the_prompt_length(tmp_path, workload):
+    base = augur(tmp_path, workload, "base", 1, 0, 0)
+    per_token = augur(tmp_path, workload, "tok", 1, 2, 0, us_per_token=3.0)
+    ns = 2_000_000 + 3000 * int(base[0]["input"])
+    assert ints(per_token, "arrival") == ints(base, "arrival")
+    assert ints(per_token, "TTFT")[0] == ints(base, "TTFT")[0] + ns
+    assert ints(per_token, "latency")[0] == ints(base, "latency")[0] + ns
 
 
 def test_delivery_shifts_every_call_by_exactly_the_delay(tmp_path, workload):

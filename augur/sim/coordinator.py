@@ -122,13 +122,19 @@ class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
                  pd_link: PDLink | None = None, frontend_latency_ns: int = 0, delivery_latency_ns: int = 0,
-                 topology=None):
+                 frontend_ns_per_token: float = 0.0, topology=None):
         self.engines = engines
         # --contention on (augur.sim.fabric): every transfer is a flow through shared resources.
         self.topology = topology
         self.fabric = topology.fabric if topology is not None else None
         self._fabric_wake: int | None = None
         self.frontend_latency_ns = frontend_latency_ns
+        # Replay of a real log: call id -> the engine request id the real run logged. Same strings, same hashes, so
+        # the sets vLLM iterates (finished ids, ...) come out in the real order, which the CPU tier's eviction order
+        # follows with KV offload (the real ids carry a random suffix per run, so only a replay can reuse them).
+        self.request_ids: dict[str, str] = {}
+        self._call_of_rid: dict[str, str] = {}
+        self.frontend_ns_per_token = frontend_ns_per_token  # added per prompt token (tokenization, request parsing)
         self.delivery_latency_ns = delivery_latency_ns  # engine emits a token -> the client has it
         # PD disaggregation: the coordinator plays vLLM's PD proxy. A call goes
         # to a prefill engine with max_tokens=1 and do_remote_decode; the
@@ -153,6 +159,8 @@ class Coordinator:
         # DP + async scheduling
         self._dpa = bool(self.dp_group) and self.dp_group[0].async_sched
         self._dpa_shapes: dict[int, dict] = {}  # round -> engine_id -> shape (None: empty)
+        self._dpa_ready: dict[int, int] = {}  # round -> when its slowest rank's CPU has the batch ready
+        self._dpa_wake_at: int | None = None
         self._dpa_next_form = 0
         self._dpa_running: int | None = None  # round on the GPU
         self._dpa_left: set = set()  # ranks still running that round
@@ -201,9 +209,8 @@ class Coordinator:
         prio = CAUSED_ARRIVAL if getattr(e, "after_step_start", False) else ARRIVAL
         self._push(t, prio, "entry", e)
 
-    @staticmethod
-    def _cid(request_id: str) -> str:
-        return strip_pd_suffix(request_id)
+    def _cid(self, request_id: str) -> str:
+        return self._call_of_rid.get(request_id) or strip_pd_suffix(request_id)
 
     def _pick(self, router: Router, call: Call, engines: list[SimEngine]) -> SimEngine:
         eid = router.route(call, engines, self.now)
@@ -222,12 +229,13 @@ class Coordinator:
         self._records[call.call_id] = rec
         self._calls[call.call_id] = call
         self._call_engine[call.call_id] = eng
-        if self.frontend_latency_ns:
+        delay = self.frontend_latency_ns + int(self.frontend_ns_per_token * len(call.prompt_ids))
+        if delay:
             # The API server's work before the engine sees the request (HTTP,
             # tokenization, hand-off); the call's times stay measured from
             # when the client sent it.
             eng.admitting += 1
-            self._push(self.now + self.frontend_latency_ns, ARRIVAL, "admit", (eng, call))
+            self._push(self.now + delay, ARRIVAL, "admit", (eng, call))
         else:
             self._admit(eng, call)
 
@@ -236,7 +244,10 @@ class Coordinator:
             eng.add(call, self.now, request_id=call.call_id + "@p", max_tokens=1,
                     kv_transfer_params={"do_remote_decode": True})
         else:
-            eng.add(call, self.now)
+            rid = self.request_ids.get(call.call_id)
+            if rid is not None:
+                self._call_of_rid[rid] = call.call_id
+            eng.add(call, self.now, request_id=rid)
 
     def _on_arrival(self, ev: _Event) -> None:
         p = ev.payload
@@ -315,7 +326,9 @@ class Coordinator:
         (self.decode_router if self.pd else self.router).release(call, done_ns)
         del self._records[call_id]
         self._call_engine.pop(call_id, None)
-        eng.ctx.output_ids.pop(call_id + "@d" if self.pd else call_id, None)
+        rid = self.request_ids.get(call_id, call_id)
+        self._call_of_rid.pop(rid, None)
+        eng.ctx.output_ids.pop(call_id + "@d" if self.pd else rid, None)
         if call.session_id is not None:
             s = self._sessions[call.session_id]
             if s.next_index < len(s.sub_requests):
@@ -560,6 +573,10 @@ class Coordinator:
                 r = max(e.dp_next_round, self._dpa_next_form)
                 e.dp_next_round = r + 1
                 self._dpa_shapes.setdefault(r, {})[e.engine_id] = shape
+                if shape is not None:
+                    # As single-engine async: the CPU prepares the batch while the GPU runs the previous
+                    # one, so it only delays the round when the GPU would otherwise be waiting for it.
+                    self._dpa_ready[r] = max(self._dpa_ready.get(r, 0), self.now + e.ctx.last_cpu_ns)
                 e.dp_fifo.append(r)
             e.ctx.launches.clear()
             e.ctx.launch_shapes.clear()
@@ -587,6 +604,14 @@ class Coordinator:
         shapes = self._dpa_shapes.get(x, {})
         if not shapes:
             return False
+        ready = self._dpa_ready.get(x, 0)
+        if ready > self.now:
+            if self._dpa_wake_at != ready:
+                self._dpa_wake_at = ready
+                self._push(ready, ARRIVAL, "dpa_wake", None)
+            return False
+        self._dpa_ready.pop(x, None)
+        self._dpa_wake_at = None
         if all(s is None for s in shapes.values()):
             del self._dpa_shapes[x]
             self._dpa_next_form = x + 1
@@ -614,6 +639,10 @@ class Coordinator:
         self.dp_rounds += 1
         self._dpa_running = x
         self._dpa_left = {e.engine_id for e in g}
+        for e, sh, ns in zip(g, final, per_rank):
+            if e.step_log is not None:
+                e.step_log.append((self.now, ns, sh.total_tokens, sum(x.num_new for x in sh.seqs if not x.is_decode),
+                                   sh.num_decode, sh.num_prefill, sh.forward_tokens, int(sh.dummy)))
         self._dpa_next_form = x + 1
         del self._dpa_shapes[x]
         for e, ns in zip(g, per_rank):
