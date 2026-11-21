@@ -43,14 +43,25 @@ Multi-GPU engines (`--tp`; link and memory settings from `--tp-link-bw`,
 `--tp-link-latency-ns`, `--npu-mem-bw` or an LLMServingSim cluster config,
 `--lss-cluster-config`), many engines (`--engines`, `--router`: least-loaded,
 round-robin, or the vLLM Router's random, power-of-two, cache-aware,
-consistent-hash, rendezvous-hash and sticky-least-loaded policies), prefill/decode
+consistent-hash, rendezvous-hash, sticky-least-loaded and kv-aware policies; kv-aware
+routes by the KV blocks each engine announces in vLLM's own KV events, GPU and CPU
+tier), prefill/decode
 (`--prefill-engines/--decode-engines`), DP+EP MoE (`--dp`,
 `--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33), KV
 offload to CPU memory (`--kv-offload-gib`, vLLM's `--kv-offloading-size`;
 transfer cost from `--kv-offload-gbps` / `--kv-offload-latency-ns`, by default
 the CPU memory's, as LLMServingSim prices KV loads), and secondary tiers behind
 the CPU one through vLLM's offload tiering (`--kv-offload-tier
-NAME:GIB:GBPS[:LATENCY_NS]`, e.g. CXL memory `cxl:64:30:250`; repeatable).
+NAME:GIB:GBPS[:LATENCY_NS]`, repeatable; `cxl:GIB` takes LLMServingSim's CXL
+numbers, 60 GB/s and 250 ns). KV offload also runs with prefill/decode (vLLM's
+MultiConnector of NIXL and the OffloadingConnector) and with DP.
+
+`--step-log-vllm PREFIX` writes vLLM's step log (one file per engine when there
+are several), and `--replay-durations PREFIX` replays it: single engines,
+round-robin engines, prefill/decode and DP, with and without offload, must make
+the same decisions step for step. When a run goes beyond the range its profile
+measured (KV length, tokens per step), augur warns and counts the steps
+(`steps_beyond_profile` in the summary): their prices are extrapolated.
 
 augur pins `PYTHONHASHSEED` (0 unless set): with KV offload, vLLM's CPU-tier
 eviction order follows Python's hash order. Give a real server the same value
@@ -88,6 +99,7 @@ augur/
     llmservingsim.py   through the LLMServingSim fork: MoE, DP/EP
     astra.py           collectives and DP rounds through ASTRA-Sim
     profiles.py        which GPU profiles exist
+  profile.py           `python -m augur.profile`: profile a GPU and model, convert, record provenance
   profiles/            shipped profiles: <hardware>/<org>--<model>/<dtype>-tp<N>.json.gz
   trace/               workloads in (fork JSONL), per-call results out (fork CSV)
   verify/              checking against real vLLM (table above)
@@ -103,7 +115,7 @@ augur-todo.md          open work, in priority order
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[test]"
-.venv/bin/python -m pytest      # 115 tests, 10 of which need the LLMServingSim fork
+.venv/bin/python -m pytest      # about 215 tests; those comparing with LLMServingSim need its fork
 ```
 
 That is all for the GPUs and models augur ships profiles for
@@ -119,9 +131,16 @@ form of ASTRA-Sim's ring all-reduce and all-gather on one node, also identical
 to the fork; a setting outside the range where that form is exact (CPU-memory
 access longer than half a ring step) is refused, not approximated.
 
-MoE models, DP/EP and other profiles go through a checkout of the fork
+Qwen3-30B-A3B (MoE) is shipped for the RTX PRO 6000 at TP1 and TP2, priced
+from tables as well. DP/EP, MoE at TP > 2 and other profiles go through a checkout of the fork
 (`--fork` or `AUGUR_FORK`, default `~/llmss-vllm-sim-20261114`; install the
 `llmservingsim` extra): its profiles, model configs and ASTRA-Sim.
 `python -m augur.cost.convert` turns one of its dense profiles into a shipped
 one. `--model-config` takes any Hugging Face `config.json`, and
 `--cost fixed` runs any model with a constant step time.
+
+To add a GPU or model, run `python -m augur.profile --model M --hardware NAME
+--tp N` on that GPU: it profiles with the LLMServingSim fork's profiler (KV up
+to `--max-kv` tokens, `--max-batch-tokens` per step), records vLLM's memory
+accounting, converts the result into `augur/profiles/` and prints what to
+commit. `--dry-run` shows the commands first.

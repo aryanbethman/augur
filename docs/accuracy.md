@@ -194,27 +194,50 @@ Where they differ, LLMServingSim departs from vLLM:
   request starts at k+2. LLMServingSim admits it at k+1.
 - **PD disaggregation.** LLMServingSim's TTFT is the prefill finishing. In vLLM
   the first token comes from the decode engine after the KV pull and a
-  one-token recompute (2.7x longer here). LLMServingSim's decode instance also
+  one-token recompute: mean TTFT 152 ms sync and 207 ms async against
+  LLMServingSim's 56 ms (2.7x and 3.7x; 1 prefill + 1 decode engine,
+  Llama-3.1-8B, max_num_seqs 1024). augur's prefill finishes at 56.2 ms, as
+  LLMServingSim's does. The async-loop fix of 2026-11-18 moved async PD by 0.5%
+  mean TTFT and left sync PD identical. LLMServingSim's decode instance also
   ignores `max_num_seqs`.
+- **Profile range.** LLMServingSim's session-scale branch (a4053bc) prices
+  Llama-3.1-70B H100 attention from the bundle's v0 surfaces; the fork and
+  augur read attention.csv from the same bundle. Inside the profiled range
+  (KV up to 2,048 tokens) the two agree to 0.2% median TPOT; beyond it they
+  extrapolate differently, by tens of percent per lookup. On sessions with
+  contexts up to 33k, call-for-call TPOT is 18% apart (median) with identical
+  scheduling. Neither extrapolation has been measured; augur now warns and
+  reports `steps_beyond_profile` when a run leaves the profile's range.
 
 ## 5. Speed
 
 Wall time simulating Llama-3.1-70B TP4 on H100s (ShareGPT 750
 requests at 10 req/s, 89 s simulated):
 
-| GPUs | augur | LLMServingSim |
-| --- | --- | --- |
-| 16 (4 × TP4) | 27 s | 8 min 06 s |
-| 256 (64 × TP4) | 44 s | 2 h 11 min |
+| GPUs | augur (shipped tables) | augur (ASTRA-Sim pricing) | LLMServingSim |
+| --- | --- | --- | --- |
+| 16 (4 × TP4) | 10.6 s, 1.2 GB | 27 s | 8 min 06 s |
+| 256 (64 × TP4) | 20 s, 1.5 GB | 44 s | 2 h 11 min |
 
-Both agree on this run (TPOT 750/750 identical at 256). Those augur times are
-with ASTRA-Sim pricing each new pattern of collectives; LLMServingSim runs
-every step through ASTRA-Sim. augur now prices the collectives of a dense
-model on one node itself (a closed form of ASTRA-Sim's ring all-reduce and
-all-gather, identical to the binary to the ns on every tested configuration),
-so those runs need no ASTRA-Sim: Llama-3.1-70B TP4 with 300 ShareGPT requests
-takes 11 s against 26 s, 4 engines 9 s against 27 s, with byte-identical
-results.
+Both simulators agree on this run (TPOT 750/750 identical at 256).
+LLMServingSim runs every step through ASTRA-Sim. augur prices the collectives
+of a dense model on one node itself (a closed form of ASTRA-Sim's ring
+all-reduce and all-gather, identical to the binary to the ns on every tested
+configuration), so these runs need no ASTRA-Sim and give byte-identical output
+to the ASTRA-priced ones. At 256 GPUs about 80% of the time is vLLM's own
+scheduler, KV-cache manager and output processing, 10% pricing and 13%
+augur's event loop; about 6 s of the 20 s is start-up (building 64 engines).
+Wall times are on a shared host (load 5-12).
+
+ASTRA-priced runs are byte-identical to the table pricer and to each other,
+including when several run at once: each augur process runs ASTRA-Sim in its
+own directory. Before 2026-11-21 they shared the fork's serving/ folder through
+ASTRA-Sim's tmp__mem file, which could shift concurrent runs by a few ns or
+crash them. MoE (Qwen3-30B-A3B, TP1 and TP2) is priced from tables too:
+byte-identical to the fork on the SWE-bench runs, 8.7 s against 14.1 s (TP1)
+and 8.6 s against 19.4 s (TP2) per whole run. A DP round still costs about
+25 ms through the fork (chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace
+generation 4 ms).
 
 Multi-GPU timing has not been compared with real hardware: the collective
 model is ASTRA-Sim's (ring over point-to-point links), not a measurement. On the 4060 Ti
@@ -236,20 +259,37 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   `SimMemoryTier` stands in for the tier itself: capacity with LRU eviction,
   a write lane and a read lane, each FIFO at latency + bytes / bandwidth on
   the virtual clock. Checked against augur's own logs (exact replay, sync and
-  async). Nothing real to compare with yet; parameters for CXL memory come
-  from its spec sheet or LLMServingSim's cluster config.
+  async). Nothing real to compare with yet. `--kv-offload-tier cxl:GIB` takes
+  LLMServingSim's cxl_mem defaults, 60 GB/s and 250 ns per device (the fork's
+  example values, not a measured device).
 - **vLLM Router policies** (`--router`). Ported from the router's source
   (src/policies, main of 2026-11-18): random, power-of-two, cache-aware
   (its default; per-engine token prefix trees), consistent-hash,
   rendezvous-hash, sticky-least-loaded. Its hash function is replaced by
   BLAKE2b (engine URLs are synthetic, so placement is statistically, not
   bit-for-bit, the same); every engine is healthy.
+- **kv-aware router** (`--router kv-aware`). Scoring ported from the vLLM
+  Router's kv_aware.rs (only part of its source was read): cost = (new prefill
+  + active prefill) x (batch + 1), GPU blocks credited 1.0 and CPU-tier blocks
+  0.8, the last token never credited. The index is fed by vLLM's own KV events
+  (block pool and offload connector) when each step lands, with no transport
+  delay. Ties go to the lowest engine id (the router picks at random). Block
+  hashes are vLLM's own; the router's hashing was not checked. With PD only
+  prefill placement uses it.
+- **KV offload with PD and DP.** vLLM's MultiConnector of NIXL and the
+  OffloadingConnector (NIXL first: remote KV wins, else the CPU tier). DP ranks
+  run the offload worker: sync rounds commit loads when the round is priced;
+  async rounds start loads at launch and ignore store-flush waits (both
+  approximations). Checked by exact replay of augur's own logs (every engine,
+  sync and async), not against hardware.
 
 ## Not modeled yet
 
 - EAGLE/MTP drafter cost (ngram speculation is modeled).
-- Pipeline parallelism; LMCache; KV offload with PD or DP; storage tiers (files,
-  object stores) as anything but a slower memory tier.
-- The vLLM Router's kv-aware policy (needs the engines' KV events).
+- Pipeline parallelism; LMCache; storage tiers (files, object stores) as
+  anything but a slower memory tier.
 - API-server time as a function of prompt length (one constant now).
-- DP rounds are one full ASTRA-Sim run each (slow at large DP).
+- MoE at TP > 2 and DP + EP on the shipped tables (they use the fork).
+- Bandwidth contention between transfers (offload lanes, tiers, PD pulls on
+  shared PCIe, host memory or NICs) and between transfers and compute: in
+  progress (feature/contention-20261121).
