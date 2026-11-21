@@ -350,12 +350,35 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   is priced at query length 1 unless the profile has longer decode queries.
   Not checked against a real EAGLE head.
 
+- **Transfer contention** (`--contention on`, off by default). Every KV
+  transfer (offload stores and loads, tier writes and reads, PD pulls) is a
+  flow through shared resources: each GPU's PCIe link per direction, the host's
+  PCIe root, host memory, each tier and each GPU's NIC, shared max-min fairly
+  (augur/sim/fabric.py); offload lanes stay FIFO streams, and completion times
+  reach vLLM's connectors as before, so its scheduler reacts. One flow alone
+  costs what the uncontended model charges, and a single shared link
+  reproduces the PD link model to the ns. Calibrated on the RTX 4060 Ti host
+  (section 3): 12.7 / 13.15 GB/s per direction, GPU-to-host 15% slower while
+  host-to-GPU runs (`--d2h-duplex-penalty`), two GPUs independent on an idle
+  host, host memory shared under CPU load (`--host-mem-background-gbps`;
+  aggregates of 14 and 24 GB/s reproduced, the per-GPU asymmetry is not). A
+  step beside transfers takes t x (1 + 1.4 x PCIe rate / GPU memory
+  bandwidth), sampled at its start (`--hbm-interference`; measured +7%, +5%,
+  +11-12%). With contention off, outputs and the real-GPU replays are
+  unchanged; with it on, own-log replay is exact.
+
+  What it changes, on SWE-bench sessions compressed 500x on 8 engines per
+  host (Qwen3-1.7B, 16 GiB CPU tier each): with 100 GB/s of host memory and
+  PCIe root, about 5% of scheduling steps differ and latency moves 0.1%; with
+  host memory busy (6 GB/s free) offload transfers take 3-5x longer, half the
+  steps differ and mean TTFT rises 3.2%; with prefill/decode (4+4) and KV
+  pulls sharing NICs at 12.5 GB/s, 82% of steps differ and p99 TPOT rises from
+  27.4 to 29.8 ms. Wall time +2 to +7%. Not checked against contended real
+  runs at 8 GPUs per host.
+
 ## Not modeled yet
 
 - Pipeline parallelism; LMCache; storage tiers (files, object stores) as
   anything but a slower memory tier.
 - API-server time as a function of prompt length (one constant now).
 - MoE at TP > 2 and DP + EP on the shipped tables (they use the fork).
-- Bandwidth contention between transfers (offload lanes, tiers, PD pulls on
-  shared PCIe, host memory or NICs) and between transfers and compute: in
-  progress (feature/contention-20261121).

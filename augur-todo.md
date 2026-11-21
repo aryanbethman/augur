@@ -15,7 +15,7 @@ and `steps_beyond_profile` when a run leaves the profile's range; ASTRA-Sim runs
 run); ~10% faster step loop at 256 GPUs. Earlier: vLLM Router policies, KV offload to CPU and tiers (2026-11-18),
 audit fixes (2026-11-18), --profile-variant (2026-11-19).
 
-Next: contention-aware co-simulation (design doc), on branch feature/contention-20261121.
+Contention-aware co-simulation (design doc) is built on branch feature/contention-20261121, not merged.
 
 ## Verification runs, once the GPUs and CPUs are free
 1. [x] Rerun the PD async comparisons after the async loop fix: async PD moved 0.5% mean TTFT; sync identical
@@ -30,7 +30,7 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
    study; a short pilot on the RTX 4060 Ti first to shake out the memory probe
 
 ## Next features (proposed order, no runs needed)
-1. Contention-aware co-simulation (in progress)  2. ngram speculation step cost  3. MoE TP4 and DP+EP on the tables
+1. Contention: validate against real contended runs  2. ngram speculation step cost  3. MoE TP4 and DP+EP on the tables
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
@@ -81,6 +81,13 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
 - [ ] Model ngram speculation step cost: real steps ~2.3x the profile's price in both simulators (about 1 ms per
       request per step); re-measure on a quiet host first (host load was 33-41)
 - [ ] Offload: GPU-to-CPU copies lose 15% when a load overlaps; decode is 7% slower during a copy (contention work)
+- [x] Contention-aware co-simulation (2026-11-21, feature/contention-20261121): augur/sim/fabric.py, `--contention
+      on`, `--fabric`, `--host-mem-gbps`, `--host-mem-background-gbps`, `--pcie-root-gbps`, `--d2h-duplex-penalty`,
+      `--hbm-interference`. Off by default and byte-identical (six real-GPU replays exact); own-log replay exact
+      with it on. Matters little on an idle host; strongly for PD pulls on shared NICs and for a busy host memory
+- [ ] Contention: calibrate --hbm-interference (1.4, one 4060 Ti) and host memory on more hosts; two-socket hosts;
+      real contended offload/PD runs at several GPUs per host; poll-time waits use projected flow ends; host memory
+      shares fairly and does not reproduce the measured per-GPU asymmetry
 - [ ] Multi-GPU offload: two GPUs do not contend on an idle host, but under memory-bound CPU load aggregate copy
       bandwidth falls 25-33% (2026-11-21, two-GPU benchmark): model it in the contention work
 - [x] Tiered KV offload (2026-11-18): vLLM's TieringOffloadingManager unmodified (cascade CPU -> tiers,

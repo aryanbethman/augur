@@ -59,6 +59,13 @@ NAME:GIB:GBPS[:LATENCY_NS]`, repeatable; `cxl:GIB` takes LLMServingSim's CXL
 numbers, 60 GB/s and 250 ns). KV offload also runs with prefill/decode (vLLM's
 MultiConnector of NIXL and the OffloadingConnector) and with DP.
 
+`--contention on` turns every KV transfer (offload, tiers, prefill/decode
+pulls) into a flow through shared resources (PCIe links, the host's PCIe root
+and memory, tiers, NICs) with max-min fair sharing, the PCIe duplex loss and
+GPU-memory interference with the step beside it; vLLM's scheduler sees the
+resulting completion times. `--fabric FILE` describes the hardware; flags set
+its bandwidths.
+
 `--step-log-vllm PREFIX` writes vLLM's step log (one file per engine when there
 are several), and `--replay-durations PREFIX` replays it: single engines,
 round-robin engines, prefill/decode and DP, with and without offload, must make
