@@ -8,11 +8,19 @@
 
 All timings use CUDA events; medians of repeats after warmups. Output: a table on stdout and --out JSON.
 usage: CUDA_VISIBLE_DEVICES=0 python scripts/contention_bench.py [--model Qwen/Qwen3-1.7B] [--out out/contention.json]
+
+Two-GPU mode (--two-gpu, needs both GPUs visible; copies only, no kernels): do two GPUs copying at once contend on the
+shared host side? One thread per (GPU, direction) with its own pinned host buffer and stream, started together after a
+barrier; cases: each GPU alone, both H2D, both D2H, GPU0 H2D + GPU1 D2H, all four directions, optionally with
+--host-load N processes streaming memcpy on the host (host-memory contention). Prints per-GPU and aggregate GB/s.
+usage: python scripts/contention_bench.py --two-gpu [--host-load 4] [--out out/contention_2gpu.json]
 """
 import argparse
 import json
 import statistics
 import sys
+import threading
+import time
 
 import torch
 
@@ -98,13 +106,92 @@ def kernel_fns(hidden, inter, batch):
     return run, 28 * layer_bytes
 
 
+def _host_load(n, stop):
+    import multiprocessing as mp
+    import numpy as np
+
+    def burn(ev):
+        a = np.ones(1 << 28, dtype=np.uint8); b = np.empty_like(a)  # 256 MB each: far beyond the caches
+        while not ev.is_set():
+            np.copyto(b, a)
+    evs = [mp.Event() for _ in range(n)]
+    ps = [mp.Process(target=burn, args=(e,), daemon=True) for e in evs]
+    for p in ps:
+        p.start()
+    stop.extend(evs)
+    return ps
+
+
+def two_gpu(a):
+    """Concurrent copy cases over GPU 0 and GPU 1; see the module docstring."""
+    n_gpu = torch.cuda.device_count()
+    if n_gpu < 2:
+        sys.exit("--two-gpu needs two visible GPUs")
+    R = {"devices": [torch.cuda.get_device_name(i) for i in (0, 1)], "cases": {}}
+    cases = [("g0 H2D alone", [(0, "h2d")]), ("g0 D2H alone", [(0, "d2h")]), ("g1 H2D alone", [(1, "h2d")]),
+             ("g1 D2H alone", [(1, "d2h")]), ("both H2D", [(0, "h2d"), (1, "h2d")]),
+             ("both D2H", [(0, "d2h"), (1, "d2h")]), ("g0 H2D + g1 D2H", [(0, "h2d"), (1, "d2h")]),
+             ("g0 D2H + g1 H2D", [(0, "d2h"), (1, "h2d")]),
+             ("all four", [(0, "h2d"), (0, "d2h"), (1, "h2d"), (1, "d2h")])]
+    stop, procs = [], []
+    for load in ([0, a.host_load] if a.host_load else [0]):
+        if load:
+            procs = _host_load(load, stop)
+            time.sleep(1.0)
+        print(f"\nhost memcpy load: {load} processes  (uptime: {open('/proc/loadavg').read().split()[0]} load avg)")
+        print(f"{'chunk':>9}  {'case':<18}{'per-stream GB/s':<34}{'sum GB/s':>10}")
+        for cname, nb in (("1.84MB", kv_block_bytes(a.model)), ("64MB", 64 << 20)):
+            n_per = max(4, (64 << 20) // nb)
+            for case, streams in cases:
+                bufs = []
+                for g, d in streams:
+                    with torch.cuda.device(g):
+                        bufs.append((g, d, torch.cuda.Stream(g), torch.empty(nb, dtype=torch.uint8, pin_memory=True),
+                                     torch.empty(nb, dtype=torch.uint8, device=f"cuda:{g}")))
+                reps = []
+                for it in range(a.reps + 2):
+                    bar = threading.Barrier(len(bufs)); t = [None] * len(bufs)
+
+                    def work(i):
+                        g, d, s, h, dev = bufs[i]
+                        with torch.cuda.device(g), torch.cuda.stream(s):
+                            for _ in range(2):  # warm this stream's path
+                                dev.copy_(h, non_blocking=True) if d == "h2d" else h.copy_(dev, non_blocking=True)
+                            s.synchronize(); bar.wait(); t0 = time.perf_counter(); done = 0
+                            while time.perf_counter() - t0 < 1.0:  # fixed window: every stream overlaps all the others
+                                for _ in range(n_per):
+                                    dev.copy_(h, non_blocking=True) if d == "h2d" else h.copy_(dev, non_blocking=True)
+                                s.synchronize(); done += n_per
+                            t[i] = (done * nb, time.perf_counter() - t0)
+                    th = [threading.Thread(target=work, args=(i,)) for i in range(len(bufs))]
+                    [x.start() for x in th]; [x.join() for x in th]
+                    if it >= 2:
+                        rates = [b / e / 1e9 for b, e in t]
+                        reps.append((rates, sum(rates)))
+                per = [statistics.median(r[0][i] for r in reps) for i in range(len(bufs))]
+                agg = statistics.median(r[1] for r in reps)
+                lab = ", ".join(f"g{g} {d} {v:.2f}" for (g, d, *_), v in zip(bufs, per))
+                print(f"{cname:>9}  {case:<18}{lab:<34}{agg:>10.2f}")
+                R["cases"][f"{load}load/{cname}/{case}"] = {"per_stream": per, "aggregate": agg}
+        if load:
+            for e in stop:
+                e.set()
+    with open(a.out, "w") as f:
+        json.dump(R, f, indent=1)
+    print("wrote", a.out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
     ap.add_argument("--out", default="out/contention.json")
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--bulk-mb", type=int, default=512)
+    ap.add_argument("--two-gpu", action="store_true", help="two-GPU copy contention mode (see module docstring)")
+    ap.add_argument("--host-load", type=int, default=0, help="two-GPU mode: also run with N host memcpy processes")
     a = ap.parse_args()
+    if a.two_gpu:
+        return two_gpu(a)
     torch.cuda.init()
     print("device:", torch.cuda.get_device_name(0), file=sys.stderr)
     blk = kv_block_bytes(a.model)
