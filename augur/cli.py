@@ -257,11 +257,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kv-offload-latency-ns", type=int, default=None,
                    help="per GPU <-> CPU transfer (default: --cpu-mem-latency-ns or the cluster config's "
                         "cpu_mem.mem_latency)")
-    p.add_argument("--kv-offload-tier", action="append", default=None, metavar="NAME:GIB:GBPS[:LATENCY_NS]",
-                   help="a secondary KV tier behind the CPU one (e.g. CXL memory: cxl:64:30:250), as vLLM's "
+    p.add_argument("--kv-offload-tier", action="append", default=None, metavar="NAME:GIB[:GBPS[:LATENCY_NS]]",
+                   help="a secondary KV tier behind the CPU one (e.g. CXL memory: cxl:64 or cxl:64:60:250), as vLLM's "
                         "offload tiering runs it: stores cascade to it, hits in it are promoted to the CPU "
                         "tier, then loaded to the GPU. Capacity in GiB, bandwidth in GB/s each way, latency per "
-                        "transfer. Repeat for more tiers (in order); needs --kv-offload-gib")
+                        "transfer. 'cxl:64' alone takes 60 GB/s and 250 ns from LLMServingSim's cxl_mem. "
+                        "Repeat for more tiers (in order); needs --kv-offload-gib")
     p.add_argument("--output", default=None, help="request CSV (fork format)")
     p.add_argument("--step-log", default=None, help="per-step CSV: start, duration, batch shape")
     p.add_argument("--lss-loop-compat", action="store_true",
