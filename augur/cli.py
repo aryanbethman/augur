@@ -187,11 +187,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
-    p.add_argument("--frontend-latency-ms", type=float, default=6.5,
-                   help="API-server time before the engine sees a request (HTTP, tokenization, hand-off); "
-                        "counted in TTFT and latency. Default measured with vLLM 0.33 on an i7-12700 for "
-                        "1,024-token text prompts; the further wait for the engine's next loop iteration is "
+    p.add_argument("--frontend-latency-ms", type=float, default=3.4,
+                   help="API-server time before the engine sees a request (HTTP, hand-off), independent of prompt "
+                        "length; counted in TTFT and latency. Plus --frontend-us-per-token per prompt token. "
+                        "Defaults measured with vLLM 0.33 on an i7-12700 with text prompts of 256 to 4,096 tokens "
+                        "(6.5 ms at 1,024); the further wait for the engine's next loop iteration is "
                         "simulated, not part of this. Ignored with --replay-durations and --replay-arrivals")
+    p.add_argument("--frontend-us-per-token", type=float, default=3.0,
+                   help="API-server time per prompt token (tokenization, request parsing), added to "
+                        "--frontend-latency-ms: 3.0 us fits 256, 1,024 and 4,096-token prompts at light load "
+                        "(vLLM 0.33, i7-12700; intake 3.5 / 5.9 / 14 ms, median). Ignored with --replay-durations "
+                        "and --replay-arrivals")
     p.add_argument("--delivery-latency-ms", type=float, default=8.0,
                    help="the client receives each token this long after the engine emits it (output "
                         "processing, detokenization, streaming, client parse): token times, TTFT, end time "
@@ -440,7 +446,10 @@ def main(argv: list[str] | None = None) -> int:
                         decode_router=make_router(a.router, **router_options),
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
                         frontend_latency_ns=0 if replaying else int(a.frontend_latency_ms * 1e6),
+                        frontend_ns_per_token=0.0 if replaying else a.frontend_us_per_token * 1e3,
                         delivery_latency_ns=0 if replaying else int(a.delivery_latency_ms * 1e6))
+    if a.replay_durations and not (a.prefill_engines or a.decode_engines):
+        coord.request_ids = cost.rids  # the logged engine's request ids: see Coordinator.request_ids
     if a.step_log_vllm:
         from augur.sim.coordinator import install_step_log_clock
         install_step_log_clock(coord)

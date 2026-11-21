@@ -86,6 +86,8 @@ class ReplayCost:
     # empty step can still matter (it hands a KV connector new requests).
     sched_times: list[int] = field(default_factory=list)
     k: int = 0
+    # call id -> the request id the logged engine used (augur.sim.coordinator.Coordinator.request_ids)
+    rids: dict[str, str] = field(default_factory=dict)
 
     def next_schedule_ns(self, now_ns: int) -> int | None:
         """The first logged schedule at or after now_ns."""
@@ -102,6 +104,7 @@ class ReplayCost:
         sched_t = {e["k"]: e["t"] for e in ev if e["ev"] == "sched"}
         kv_done = {jid: sched_t[e["k"]] - t0 for e in ev if e["ev"] == "upd" for jid in e.get("jobs", ())}
         sched_times = sorted(t - t0 for t in sched_t.values())
+        rids = {call_id(e["rid"]): e["rid"] for e in ev if e["ev"] == "add"}
         if is_async(ev):
             # The GPU runs batches back to back: batch k starts when it was
             # scheduled or when batch k-1 finished, whichever is later, and
@@ -115,14 +118,14 @@ class ReplayCost:
             # like the last one.
             for _ in range(_unlogged_tail(ev) if d else 0):
                 d.append(d[-1])
-            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times)
+            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rids=rids)
         d = []
         for i, (s, u) in enumerate(st):
             if u["left"] > 0 and i + 1 < len(st):
                 d.append(st[i + 1][0]["t"] - s["t"])
             else:
                 d.append(u["t"] - s["t"])
-        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times)
+        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rids=rids)
 
     def step_ns(self, shape: StepShape) -> int:
         if self.k >= len(self.durations):
