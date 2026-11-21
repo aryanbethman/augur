@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 
 from augur.cost import CostModel, SeqWork, StepShape
+from augur.sim.draft import draft_kv_spec
 from augur.trace.workload import call_id
 
 SYNTHETIC_TOKEN = 0  # emitted when the workload recorded no output IDs
@@ -81,6 +82,7 @@ class SimContext:
     # Added to the step's GPU time, so async scheduling does not hide it; not used when replaying logged durations.
     spec_ns_per_request: int = 0
     pending_drafts: object = None
+    drafter: Any = None  # EAGLE / MTP: augur.sim.draft.DraftCost, the drafter's time added to each step
     # Async scheduling: every execute_model call is a launch onto the GPU
     # stream; the coordinator drains these durations (0 for an empty batch).
     launches: list = field(default_factory=list)
@@ -127,7 +129,15 @@ class SimWorker:
         # padded, as in the GPU model runner (uniform decode: one token per request).
         self.cudagraph = CudagraphDispatcher(vllm_config)
         mode = vllm_config.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
-        self.cudagraph.initialize_cudagraph_keys(mode, uniform_decode_query_len=1 + ctx.spec_k)
+        q = 1 + ctx.spec_k
+        try:
+            self.cudagraph.initialize_cudagraph_keys(mode, uniform_decode_query_len=q)
+        except AssertionError:
+            # A query length that does not divide the capture sizes (k = 2, 4, 5 ...): vLLM's v1 runner rounds the
+            # sizes up to multiples of it (CompilationConfig.adjust_cudagraph_sizes_for_spec_decode).
+            vllm_config.compilation_config.adjust_cudagraph_sizes_for_spec_decode(q)
+            self.cudagraph = CudagraphDispatcher(vllm_config)
+            self.cudagraph.initialize_cudagraph_keys(mode, uniform_decode_query_len=q)
         self._step = 0
 
     # ---- start-up -------------------------------------------------------
@@ -147,7 +157,13 @@ class SimWorker:
             dtype=torch_dtype,
         )
         self.ctx.kv_block_bytes = spec.page_size_bytes * num_layers
-        return {f"model.layers.{i}.self_attn.attn": spec for i in range(num_layers)}
+        layers = {f"model.layers.{i}.self_attn.attn": spec for i in range(num_layers)}
+        draft = draft_kv_spec(self.vllm_config, spec)  # EAGLE / MTP layers take KV next to the target's
+        if draft is not None:
+            draft_spec, n_draft = draft
+            self.ctx.kv_block_bytes += draft_spec.page_size_bytes * n_draft
+            layers.update({f"draft.layers.{i}.self_attn.attn": draft_spec for i in range(n_draft)})
+        return layers
 
     def get_supported_kv_cache_layouts(self) -> list[str]:
         return ["NHD"]
@@ -352,6 +368,8 @@ class SimWorker:
             shape = StepShape(seqs=tuple(seqs), padded_tokens=desc.num_tokens)
             self.ctx.last_shape = shape
             gpu = self.ctx.cost.step_ns(shape) if seqs else 0
+            if seqs and self.ctx.drafter is not None:
+                gpu += self.ctx.drafter.step_ns(shape, len(drafts_next))
             if self.ctx.step_time_scale != 1.0:
                 gpu = round(gpu * self.ctx.step_time_scale)
             if self.ctx.spec_ns_per_request and not hasattr(self.ctx.cost, "durations"):

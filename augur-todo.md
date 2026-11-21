@@ -30,7 +30,7 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
    study; a short pilot on the RTX 4060 Ti first to shake out the memory probe
 
 ## Next features (proposed order, no runs needed)
-1. Contention-aware co-simulation (in progress)  2. EAGLE/MTP drafter cost  3. MoE TP4 and DP+EP on the tables
+1. Contention-aware co-simulation (in progress)  2. ngram speculation step cost  3. MoE TP4 and DP+EP on the tables
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
@@ -64,9 +64,13 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
 - [x] Speculative decoding with async scheduling (runs; not checked against real async yet)
 - [x] Real-GPU replay of an ngram run (sync): 1,880/1,880 after drafter fix (e0f0a18)
 - [x] Real-GPU replay of an async ngram run: 1,722/1,722 (818a204)
-- [ ] Speculative decoding: EAGLE/MTP drafter cost. Medium: vLLM needs a draft-model config (a synthetic one must
-      pass its checks; EAGLE also changes KV allocation through lookahead tokens), and both cost models price
-      whole-model steps only, so the drafter needs per-layer pricing. No EAGLE head cached to check against
+- [x] Speculative decoding: EAGLE / EAGLE-3 / MTP (2026-11-21, 7aa5e3c): --speculative-method eagle|eagle3|mtp runs
+      vLLM's own path with a synthetic draft config (one target-width layer; MTP from the target's own layers), the
+      draft layers in the KV cache, and k drafter passes priced from the target's layer tables. Own-log replay exact.
+      Approximate: acceptance is a rate; the drafter is a target layer plus 2x/3x o_proj; verification attention is
+      priced at query length 1 unless profiled (augur.profile --decode-q-lens). Also fixed: k with 1+k not in
+      {2, 4, 8} crashed the CUDA-graph dispatcher (ngram too)
+- [ ] EAGLE: profile a real EAGLE head; MoE MTP pricing (needs per-layer MoE); eagle with DP
 - [x] KV offload to CPU (2026-11-18, branch feature/router-offload-20261118): vLLM's OffloadingConnector
       unmodified, augur/sim/offload.py as its GPU worker (store/load/sync-load FIFO lanes, latency + bytes/bw,
       default the CPU memory's as LLMServingSim); --kv-offload-gib/-gbps/-latency-ns; step log records offload

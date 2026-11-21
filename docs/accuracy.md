@@ -342,9 +342,16 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   approximations). Checked by exact replay of augur's own logs (every engine,
   sync and async), not against hardware.
 
+- **EAGLE / EAGLE-3 / MTP** (`--speculative-method`). vLLM's scheduling,
+  lookahead slots and KV for the draft layers are vLLM's own, driven by a
+  synthetic draft config (no weights). The drafter's time is an approximation:
+  k passes priced as one target decoder layer plus 2-3x o_proj, final norm,
+  lm_head and sampler. Acceptance is a rate parameter. Verification attention
+  is priced at query length 1 unless the profile has longer decode queries.
+  Not checked against a real EAGLE head.
+
 ## Not modeled yet
 
-- EAGLE/MTP drafter cost (ngram speculation is modeled).
 - Pipeline parallelism; LMCache; storage tiers (files, object stores) as
   anything but a slower memory tier.
 - API-server time as a function of prompt length (one constant now).
