@@ -121,8 +121,13 @@ def _empty(sch) -> bool:
 class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
-                 pd_link: PDLink | None = None, frontend_latency_ns: int = 0, delivery_latency_ns: int = 0):
+                 pd_link: PDLink | None = None, frontend_latency_ns: int = 0, delivery_latency_ns: int = 0,
+                 topology=None):
         self.engines = engines
+        # --contention on (augur.sim.fabric): every transfer is a flow through shared resources.
+        self.topology = topology
+        self.fabric = topology.fabric if topology is not None else None
+        self._fabric_wake: int | None = None
         self.frontend_latency_ns = frontend_latency_ns
         self.delivery_latency_ns = delivery_latency_ns  # engine emits a token -> the client has it
         # PD disaggregation: the coordinator plays vLLM's PD proxy. A call goes
@@ -453,7 +458,10 @@ class Coordinator:
     @staticmethod
     def _scaled(g, per_rank):
         f = g[0].ctx.step_time_scale
-        return per_rank if f == 1.0 else [round(ns * f) for ns in per_rank]
+        per_rank = per_rank if f == 1.0 else [round(ns * f) for ns in per_rank]
+        if any(e.ctx.hbm_interference for e in g):  # a rank's PCIe traffic slows its own forward
+            per_rank = [round(ns * e.ctx.interference_factor()) for e, ns in zip(g, per_rank)]
+        return per_rank
 
     def _after_step(self, eng: SimEngine) -> None:
         self._start_transfers(eng)
@@ -745,6 +753,8 @@ class Coordinator:
         before an engine step: now, and when the GPU work queued before it is done."""
         eng.ctx.now_ns = eng.ctx.tier_clock_ns = self.now
         eng.ctx.gpu_free_ns = gpu_free_ns
+        if self.fabric is not None:
+            self.fabric.advance(self.now)  # flows other engines started at this instant count in this step
 
     @staticmethod
     def _transfer_sources(eng: SimEngine) -> list:
@@ -759,6 +769,8 @@ class Coordinator:
     def _poll_when_transfers_finish(self, eng: SimEngine) -> None:
         """vLLM keeps stepping while offload transfers are pending; the step
         that matters is the first after one finishes. Queue it."""
+        if self.fabric is not None:
+            self.fabric.advance(self.now)
         t = min((e for src in self._transfer_sources(eng) if (e := src.next_end()) is not None), default=None)
         if t is not None and t > self.now and eng.xfer_wake_at != t:
             eng.xfer_wake_at = t
@@ -775,7 +787,17 @@ class Coordinator:
             self._xfers_started.add(rid)
             payload = (eng, rid, self._by_vllm_id.get(remote_engine), remote_rid)
             nbytes = blocks * eng.ctx.kv_block_bytes
-            if self.pd_link.contention == "decode":
+            if self.fabric is not None:
+                # GPU-direct RDMA: the pull leaves the source GPU's NIC and enters the destination's, through
+                # the network (or, topology "decode-link", one link per decode engine), sharing them with every
+                # other pull.
+                src = payload[2]
+                path = (self.topology.pd_path(src.engine_id, eng.engine_id) if src is not None
+                        else [f"gpu{self.topology.gpu_of[eng.engine_id]}.nic"])
+                self.fabric.submit(("pd", rid), None, path, nbytes, self.now, self.pd_link.latency_ns,
+                                   payload=payload, notify=True,
+                                   rounding="ceil" if self.pd_link.contention == "decode" else "floor")
+            elif self.pd_link.contention == "decode":
                 # Pay the link latency, then join the decode engine's shared link.
                 self._push(self.now + self.pd_link.latency_ns, TRANSFER_DONE, "kv_join", (nbytes, payload))
             else:
@@ -813,11 +835,34 @@ class Coordinator:
             self._on_transfer_done(_Event(self.now, TRANSFER_DONE, 0, "kv_pull", payload))
         self._reschedule(eng, link)
 
+    def _advance_fabric(self) -> None:
+        """Run the fabric to now; the PD pulls it finished are delivered (as a TRANSFER_DONE event would)."""
+        self.fabric.advance(self.now)
+        for _, _, payload in self.fabric.pop_completed():
+            self._on_transfer_done(_Event(self.now, TRANSFER_DONE, 0, "kv_pull", payload))
+
+    def _arm_fabric(self) -> None:
+        """Wake at the fabric's next event: a transfer ending frees bandwidth for the ones beside it."""
+        self.fabric.advance(self.now)
+        t = self.fabric.next_event()
+        if t is not None and t != self._fabric_wake:
+            self._fabric_wake = t
+            self._push(max(t, self.now), TRANSFER_DONE, "fabric", None)
+
+    def _on_fabric_event(self) -> None:
+        """Some flow started, got going or ended: engines polling for their transfers re-time their wake-up."""
+        self._fabric_wake = None
+        for e in self.engines:
+            if e.ctx.offload is not None or e.ctx.tiers:
+                self._poll_when_transfers_finish(e)
+
     def run(self) -> Recorder:
         t0 = time.perf_counter()
         self._pull_entry()
         while self._q:
             self.now = self._q[0].t
+            if self.fabric is not None:
+                self._advance_fabric()
             while self._q and self._q[0].t == self.now and self._q[0].prio < CAUSED_ARRIVAL:
                 ev = heapq.heappop(self._q)
                 if ev.prio == ARRIVAL:
@@ -825,7 +870,9 @@ class Coordinator:
                 elif ev.kind == "dpa_done":
                     self._dpa_done(ev)
                 elif ev.prio == TRANSFER_DONE:
-                    if ev.kind in ("kv_join", "kv_link"):
+                    if ev.kind == "fabric":
+                        self._on_fabric_event()
+                    elif ev.kind in ("kv_join", "kv_link"):
                         self._on_link_event(ev)
                     else:
                         self._on_transfer_done(ev)
@@ -838,6 +885,8 @@ class Coordinator:
                 caused = True
             if caused:
                 self._start_steps()  # an idle engine picks the call up at once
+            if self.fabric is not None:
+                self._arm_fabric()
         if self._records:
             raise RuntimeError(f"{len(self._records)} calls never finished (e.g. {next(iter(self._records))})")
         self.wall_s = time.perf_counter() - t0

@@ -66,6 +66,8 @@ class Fabric:
             if gbps <= 0:
                 raise ValueError(f"fabric resource {name}: bandwidth must be > 0 (got {gbps})")
         self.cap: dict[str, float] = dict(resources)
+        # (trigger, victim, penalty): while any flow uses ``trigger``, ``victim``'s capacity is (1 - penalty) of its own
+        self.couplings: list[tuple[str, str, float]] = []
         self.time = 0
         self.flows: dict = {}  # key -> _Flow, every flow not yet done, in submission order
         self.streams: dict = {}  # stream -> deque of keys, in order
@@ -75,6 +77,15 @@ class Fabric:
         self.epoch = 0
         self._proj: tuple | None = None
         self.recomputes = 0  # diagnostic: rate recomputations
+
+    def couple(self, trigger: str, victim: str, penalty: float) -> None:
+        """Capacity of ``victim`` drops by ``penalty`` (a fraction) while a flow uses ``trigger``. Used for
+        the PCIe duplex loss: measured on an RTX 4060 Ti, D2H falls 13.2 -> 11.1 GB/s (-15%) while an H2D copy
+        runs on the same GPU, H2D about 1%."""
+        if trigger not in self.cap or victim not in self.cap or not 0 <= penalty < 1:
+            raise ValueError(f"coupling {trigger} -> {victim} ({penalty}) is not valid")
+        self.couplings.append((trigger, victim, penalty))
+        self.epoch += 1
 
     # ---- flows ------------------------------------------------------------
     def start(self, key, path, nbytes: int, now: int, latency_ns: int = 0, payload=None, notify: bool = False,
@@ -117,6 +128,14 @@ class Fabric:
     def rate(self, key) -> float:
         f = self.flows.get(key)
         return f.rnum / f.rden if f is not None and f.state == ACTIVE else 0.0
+
+    def capacity_now(self, resource: str) -> float:
+        """A resource's capacity at present (reduced while a coupled flow is running)."""
+        c = self.cap[resource]
+        for trigger, victim, penalty in self.couplings:
+            if victim == resource and any(f.state == ACTIVE and trigger in f.path for f in self.flows.values()):
+                c *= 1.0 - penalty
+        return c
 
     def rates_through(self, resource: str) -> float:
         """Sum of the rates of the flows using bandwidth on a resource now."""
@@ -249,6 +268,11 @@ class Fabric:
         for f in active:
             for r in f.path:
                 left.setdefault(r, self.cap[r])
+        if self.couplings:
+            used = {r for f in active for r in f.path}
+            for trigger, victim, penalty in self.couplings:
+                if trigger in used and victim in left:
+                    left[victim] *= 1.0 - penalty
         new: dict = {}
         unfixed = list(active)
         while unfixed:
@@ -301,6 +325,7 @@ class Fabric:
         sim.flows = {k: copy.copy(f) for k, f in self.flows.items()}
         sim.streams = {s: deque(q) for s, q in self.streams.items()}
         sim.stream_free = dict(self.stream_free)
+        # (couplings and capacities are shared: a projection never changes them)
         sim.done = {}
         sim.completed = []
         sim._proj = None
@@ -358,16 +383,28 @@ class Topology:
     def build(cls, engine_tps: list[tuple[int, int]], gpus_per_host: int = 8, h2d_gbps: float = 25.0,
               d2h_gbps: float | None = None, root_gbps: float | None = None, mem_gbps: float = 256.0,
               tiers: dict[str, float] | None = None, nic_gbps: float = 16.0, net_gbps: float | None = None,
-              pd_mode: str = "nic", overrides: dict[str, float] | None = None) -> "Topology":
+              pd_mode: str = "nic", overrides: dict[str, float] | None = None,
+              d2h_duplex_penalty: float = 0.15, host_mem_background_gbps: float = 0.0) -> "Topology":
         """Per host: ``gpu{i}.h2d`` / ``.d2h`` (PCIe, one per direction), ``host{h}.pcie_root`` (default two GPUs'
-        links), ``host{h}.mem``, ``host{h}.tier.{name}`` for each secondary tier; per GPU ``gpu{i}.nic``
+        links in both directions), ``host{h}.mem``, ``host{h}.tier.{name}`` for each secondary tier; per GPU ``gpu{i}.nic``
         and one ``net`` for PD pulls (GPU-direct RDMA, GPU to GPU: nothing on the host is used) whose
         default is every GPU's NIC at once (non-blocking). With pd_mode "decode-link" every engine
         instead has one link ``pd.{engine}`` of nic_gbps its pulls share (what --pd-contention decode
         models). Engines are packed onto GPUs in order by TP size; an engine's transfers use its first
-        GPU's links. ``overrides`` replaces or adds resources by name."""
+        GPU's links. ``overrides`` replaces or adds resources by name.
+
+        Calibration (RTX 4060 Ti host, scripts/contention_bench.py, 2026-11-21): one GPU moves 12.7 GB/s H2D and
+        13.1-13.2 GB/s D2H whatever the size (one KV block to 64 MB); with both directions at once D2H falls 13.2 ->
+        11.1 (-15%, ``d2h_duplex_penalty``) and H2D about 1%; two H2D streams on one GPU split the link evenly; two
+        GPUs with an idle host do not slow each other, so ``pcie_root`` and ``mem`` must not bind below about
+        40 GB/s for two GPUs (the defaults assume an idle host). With four host processes streaming memory,
+        same-direction copies on two GPUs fell to 14 GB/s in all and four directions to 24 GB/s: host memory is
+        the resource they share under CPU load; ``host_mem_background_gbps`` is what other work takes of it."""
+        if host_mem_background_gbps >= mem_gbps:
+            raise ValueError("host memory background load must be below the host memory bandwidth")
+        mem_gbps = mem_gbps - host_mem_background_gbps
         d2h = h2d_gbps if d2h_gbps is None else d2h_gbps
-        root = 2 * max(h2d_gbps, d2h) if root_gbps is None else root_gbps
+        root = 2 * (h2d_gbps + d2h) if root_gbps is None else root_gbps  # two GPUs, both directions
         gpu_of, g = {}, 0
         for eid, tp in engine_tps:
             gpu_of[eid] = g
@@ -388,7 +425,11 @@ class Topology:
             for eid, _ in engine_tps:
                 res[f"pd.{eid}"] = nic_gbps
         res.update(overrides or {})
-        return cls(Fabric(res), gpu_of, gpus_per_host, pd_mode)
+        fabric = Fabric(res)
+        if d2h_duplex_penalty:
+            for i in range(n_gpus):
+                fabric.couple(f"gpu{i}.h2d", f"gpu{i}.d2h", d2h_duplex_penalty)
+        return cls(fabric, gpu_of, gpus_per_host, pd_mode)
 
     @classmethod
     def from_file(cls, path: str, engine_tps: list[tuple[int, int]], **defaults) -> "Topology":

@@ -66,9 +66,9 @@ class _Lane:
         self.queue: deque[_Transfer] = deque()
         self.free_ns = 0
 
-    def finished_by(self, t: int) -> list[_Transfer]:
+    def finished_by(self, t: int, times=None) -> list[_Transfer]:
         out = []
-        while self.queue and self.queue[0].end_ns <= t:
+        while self.queue and (times(self.queue[0])[1] if times else self.queue[0].end_ns) <= t:
             out.append(self.queue.popleft())
         return out
 
@@ -78,14 +78,19 @@ class SimOffloadWorker:
     Called by: SimWorker.execute_model (pre_forward, post_forward),
     Coordinator (next_end, deliverable). Calls: OffloadLink."""
 
-    def __init__(self, link: OffloadLink, block_bytes: int, replay_done_ns: dict[int, int] | None = None):
+    def __init__(self, link: OffloadLink, block_bytes: int, replay_done_ns: dict[int, int] | None = None, net=None):
         self.link = link
         self.block_bytes = block_bytes
         self.replay_done_ns = replay_done_ns or {}
+        # With --contention on, ``net`` (augur.sim.fabric.Net) carries the transfers: each lane is a FIFO
+        # stream of flows through the engine's PCIe links, root complex and host memory, sharing their
+        # bandwidth with every other flow there. Without it a transfer takes link.transfer_ns alone.
+        self.net = net
         self.stores, self.loads, self.sync_loads = _Lane(), _Lane(), _Lane()
         self._deferred_stores: list[tuple[int, TransferJob]] = []
-        self._ends: dict[int, int] = {}  # submitted, unreported job -> end
+        self._inflight: dict[int, _Transfer] = {}  # submitted, unreported job -> transfer
         self._loads_submitted = False
+        self.job_ns: list[tuple[bool, int]] = []  # (is a load, duration) of every reported transfer (diagnostic)
         self._uncommitted: OffloadingConnectorMetadata | None = None
 
     def pre_forward(self, meta: OffloadingConnectorMetadata, now_ns: int, gpu_free_ns: int) -> int:
@@ -96,7 +101,7 @@ class SimOffloadWorker:
         for jid, job in self._deferred_stores:
             self._submit(self.stores, jid, job, None, max(now_ns, gpu_free_ns))
         self._deferred_stores = []
-        ready = max([now_ns] + [self._ends[j] for j in flush if j in self._ends])
+        ready = max([now_ns] + [self._times(self._inflight[j])[1] for j in flush if j in self._inflight])
         self._loads_submitted = any(job.sync for job in meta.load_jobs.values())
         if self._loads_submitted:
             waits = self._submit_loads(meta, max(ready, gpu_free_ns))
@@ -117,16 +122,19 @@ class SimOffloadWorker:
                 self._submit_loads(meta, forward_end_ns)
         flush = meta.jobs_to_flush or set()
         self._deferred_stores += [(jid, job) for jid, job in meta.store_jobs.items() if jid not in flush]
-        done = self.stores.finished_by(poll_ns) + self.loads.finished_by(poll_ns) + self.sync_loads.finished_by(poll_ns)
+        done = (self.stores.finished_by(poll_ns, self._times) + self.loads.finished_by(poll_ns, self._times)
+                + self.sync_loads.finished_by(poll_ns, self._times))
         if not done:
             return set(), None
         out = OffloadingWorkerMetadata()
         finished_recving = set()
         for t in done:
-            del self._ends[t.job_id]
+            del self._inflight[t.job_id]
+            start, end = self._times(t)
             out.mark_completed(t.job_id)
             stats = out.transfer_stats.load if t.is_load else out.transfer_stats.store
-            stats.record(t.nbytes, (t.end_ns - t.start_ns) / 1e9)
+            stats.record(t.nbytes, (end - start) / 1e9)
+            self.job_ns.append((t.is_load, end - start))
             if t.req_id is not None:
                 finished_recving.add(t.req_id)
         return finished_recving, out
@@ -139,7 +147,7 @@ class SimOffloadWorker:
 
     def next_end(self) -> int | None:
         """When the next submitted transfer finishes (the engine must poll then)."""
-        return min(self._ends.values(), default=None)
+        return min((self._times(t)[1] for t in self._inflight.values()), default=None)
 
     def deliverable(self, now_ns: int) -> bool:
         """A transfer has finished and is waiting for the engine's next poll."""
@@ -156,14 +164,30 @@ class SimOffloadWorker:
                 self._submit(self.loads, jid, job, job.req_id, after_ns)
         return waits
 
+    def _times(self, t: _Transfer) -> tuple[int, int]:
+        """(start, end) of a transfer: exact, or in the fabric the end it has now (projected while it runs)."""
+        if self.net is None:
+            return t.start_ns, t.end_ns
+        return self.net.fabric.info(("offload", self.net.engine_id, t.job_id))
+
     def _submit(self, lane: _Lane, jid: int, job: TransferJob, req_id: str | None, after_ns: int) -> int:
         gpu = job.src_spec if isinstance(job.src_spec, GPULoadStoreSpec) else job.dst_spec
         nbytes = len(gpu.block_ids) * self.block_bytes
+        if self.net is not None:
+            is_load = lane is not self.stores
+            lane_name = "stores" if lane is self.stores else ("loads" if lane is self.loads else "sync_loads")
+            self.net.fabric.submit(("offload", self.net.engine_id, jid), ("offload", self.net.engine_id, lane_name),
+                                   self.net.load_path() if is_load else self.net.store_path(), nbytes, after_ns,
+                                   self.link.latency_ns, forced_end=self.replay_done_ns.get(jid))
+            t = _Transfer(jid, req_id, is_load, nbytes, 0, 0)
+            lane.queue.append(t)
+            self._inflight[jid] = t
+            return self._times(t)[1]
         start = max(after_ns, lane.free_ns)
         end = start + self.link.transfer_ns(nbytes)
         if jid in self.replay_done_ns:
             end = max(start, self.replay_done_ns[jid])  # earlier only if the replay already diverged
         lane.free_ns = end
         lane.queue.append(_Transfer(jid, req_id, lane is not self.stores, nbytes, start, end))
-        self._ends[jid] = end
+        self._inflight[jid] = lane.queue[-1]
         return end

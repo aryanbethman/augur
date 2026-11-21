@@ -94,6 +94,7 @@ class _Job:
     nbytes: int
     start_ns: int
     end_ns: int
+    fixed: tuple[int, int] | None = None  # (start, end) once known without the fabric (nothing moved, or drained)
 
 
 class _Lane:
@@ -126,6 +127,15 @@ class SimMemoryTier(SecondaryTierManager):
         self._reading: Counter = Counter()  # keys pinned by reads in flight
         self._writes, self._reads = _Lane(), _Lane()
         self._jobs: list[_Job] = []
+        # With --contention on, the engine's Net (augur.sim.fabric): a tier's writes and reads are FIFO
+        # streams of flows through host memory and the tier's own bandwidth, shared with every other flow.
+        self._net = getattr(self._clock, "net", None)
+        self._tier_name = name
+
+    def _times(self, j: _Job) -> tuple[int, int]:
+        if self._net is None or j.fixed is not None:
+            return j.fixed or (j.start_ns, j.end_ns)
+        return self._net.fabric.info(("tier", self._net.engine_id, self._tier_name, j.job_id))
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -154,8 +164,9 @@ class SimMemoryTier(SecondaryTierManager):
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
         now = self._clock.tier_clock_ns
-        done = sorted((j for j in self._jobs if j.end_ns <= now), key=lambda j: (j.end_ns, j.job_id))
-        self._jobs = [j for j in self._jobs if j.end_ns > now]
+        ends = {id(j): self._times(j)[1] for j in self._jobs}
+        done = sorted((j for j in self._jobs if ends[id(j)] <= now), key=lambda j: (ends[id(j)], j.job_id))
+        self._jobs = [j for j in self._jobs if ends[id(j)] > now]
         return [self._finish(j) for j in done]
 
     @override
@@ -177,11 +188,18 @@ class SimMemoryTier(SecondaryTierManager):
         """Every job in flight completes now (there is no real I/O to wait for)."""
         now = self._clock.tier_clock_ns
         for j in self._jobs:
-            j.end_ns = min(j.end_ns, now)
+            if self._net is None:
+                j.end_ns = min(j.end_ns, now)
+            else:
+                start, end = self._times(j)
+                if end > now:
+                    if j.fixed is None:
+                        self._net.fabric.cancel(("tier", self._net.engine_id, self._tier_name, j.job_id))
+                    j.fixed = (min(start, now), now)
 
     def next_end(self) -> int | None:
         """When the next job in flight completes: vLLM polls for it at its next step."""
-        return min((j.end_ns for j in self._jobs), default=None)
+        return min((self._times(j)[1] for j in self._jobs), default=None)
 
     def deliverable(self, now_ns: int) -> bool:
         end = self.next_end()
@@ -202,10 +220,20 @@ class SimMemoryTier(SecondaryTierManager):
     def _add_job(self, lane: _Lane, job_id: int, is_load: bool, keys: list, missing: list, now: int) -> None:
         nbytes = len(keys) * self.block_size_bytes
         start = end = now
+        if keys and self._net is not None:
+            net = self._net
+            reading = lane is self._reads
+            self._net.fabric.submit(("tier", net.engine_id, self._tier_name, job_id),
+                                    ("tier", net.engine_id, self._tier_name, "r" if reading else "w"),
+                                    net.tier_read_path(self._tier_name) if reading
+                                    else net.tier_write_path(self._tier_name), nbytes, now, self.link.latency_ns)
+            self._jobs.append(_Job(job_id, is_load, keys, missing, nbytes, start, end))
+            return
         if keys:  # nothing to move costs nothing and does not hold the lane
             start = max(now, lane.free_ns)
             end = lane.free_ns = start + self.link.transfer_ns(nbytes)
-        self._jobs.append(_Job(job_id, is_load, keys, missing, nbytes, start, end))
+        self._jobs.append(_Job(job_id, is_load, keys, missing, nbytes, start, end, fixed=(start, end)
+                               if self._net is not None else None))
 
     def _finish(self, j: _Job) -> JobResult:
         if j.is_load:
@@ -219,7 +247,7 @@ class SimMemoryTier(SecondaryTierManager):
                 self._present[k] = None
         partial = j.is_load and j.missing and j.keys
         return JobResult(job_id=j.job_id, success=not j.missing, successful_keys=list(j.keys) if partial else None,
-                         transfer_time=(j.end_ns - j.start_ns) / 1e9, transfer_bytes=j.nbytes)
+                         transfer_time=(lambda t: (t[1] - t[0]) / 1e9)(self._times(j)), transfer_bytes=j.nbytes)
 
 
 class _AnonymousRegion:

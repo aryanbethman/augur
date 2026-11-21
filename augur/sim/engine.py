@@ -74,10 +74,11 @@ def _simulated_gpu_batch_defaults(spec: EngineSpec):
 
 
 class SimEngine:
-    def __init__(self, engine_id: int, spec: EngineSpec, cost: CostModel):
+    def __init__(self, engine_id: int, spec: EngineSpec, cost: CostModel, net=None):
         self.engine_id = engine_id
         self.spec = spec
         self.ctx = SimContext(cost=cost, hardware=SimHardware(kv_cache_bytes=spec.kv_cache_bytes))
+        self.ctx.net = net  # --contention on: this engine's paths through the shared transfer fabric
         # Secondary tiers are built inside vLLM from plain config: they find
         # this engine's clock by key.
         clock_key = f"augur-{engine_id}-{id(self.ctx)}"
@@ -138,7 +139,7 @@ class SimEngine:
             # The connector's scheduler half is vLLM's; this is its worker half.
             # kv_block_bytes was set while EngineCore sized the KV cache.
             self.ctx.offload = SimOffloadWorker(spec.kv_offload_link, self.ctx.kv_block_bytes,
-                                                replay_done_ns=getattr(cost, "kv_done", None))
+                                                replay_done_ns=getattr(cost, "kv_done", None), net=net)
         self.busy = False
         self.admitting = 0  # calls routed here that are still in the API server (--frontend-latency-ms)
         self.xfer_wake_at: int | None = None  # offload: the poll already queued for a finishing transfer

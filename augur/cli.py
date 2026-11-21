@@ -214,6 +214,30 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--step-log-vllm", default=None,
                    help="write vLLM-scheduler step events (augur.verify.hooks format) to <path>.<pid>.jsonl; "
                         "with several engines, one log each: <path>.e<engine id>.<pid>.jsonl")
+    p.add_argument("--contention", choices=["off", "on"], default="off",
+                   help="on: every KV transfer (offload stores and loads, tier writes and reads, PD pulls) is a flow "
+                        "through shared resources (PCIe links, root complex, host memory, tiers, NICs) and concurrent "
+                        "flows share bandwidth max-min fairly (augur/sim/fabric.py). off: each transfer has its link "
+                        "to itself, as before")
+    p.add_argument("--fabric", default=None, metavar="FILE",
+                   help="--contention on: JSON topology overrides (see augur.sim.fabric.Topology.from_file)")
+    p.add_argument("--gpus-per-host", type=int, default=8, help="--contention on: GPUs sharing a host's PCIe root and memory")
+    p.add_argument("--host-mem-gbps", type=float, default=None,
+                   help="--contention on: host memory bandwidth shared by every transfer on the host (default: --cpu-mem-bw)")
+    p.add_argument("--pcie-root-gbps", type=float, default=None,
+                   help="--contention on: a host's PCIe root bandwidth shared by every GPU transfer on it (default two GPUs' links, both directions)")
+    p.add_argument("--d2h-duplex-penalty", type=float, default=0.15, metavar="P",
+                   help="--contention on: a GPU's D2H capacity drops by this fraction while an H2D copy runs on it "
+                        "(RTX 4060 Ti measured 0.15; H2D loses about 1%%)")
+    p.add_argument("--host-mem-background-gbps", type=float, default=0.0,
+                   help="--contention on: host memory bandwidth other work takes (a loaded host); the default "
+                        "assumes an idle host")
+    p.add_argument("--hbm-interference", type=float, default=None, metavar="K",
+                   help="--contention on: a step runs t * (1 + K * r / HBM bandwidth) where r is what the GPU's PCIe "
+                        "flows move when the step starts (default 1.4, measured on an RTX 4060 Ti: +7%% under an H2D "
+                        "copy, +5%% D2H, +11-12%% both, at 288 GB/s; 0: none). Not applied in replays")
+    p.add_argument("--hbm-bw-gbps", type=float, default=None,
+                   help="GPU memory bandwidth for --hbm-interference (default: --npu-mem-bw, else the fork's for --hardware)")
     p.add_argument("--replay-durations", default=None,
                    help="price step k with the duration recorded in this vLLM step log (see augur.verify.replay). "
                         "With several engines: the --step-log-vllm prefix of the run, or one log per engine, "
@@ -407,17 +431,52 @@ def main(argv: list[str] | None = None) -> int:
                       kv_events=a.router == "kv-aware",
                       step_log_tag=bool(a.step_log_vllm) and a.num_engines > 1)
     import dataclasses
+    topology = None
+    if a.contention == "on":
+        from augur.sim.fabric import Topology
+        topo_args = dict(gpus_per_host=a.gpus_per_host,
+                         h2d_gbps=spec.kv_offload_link.gbps if spec.kv_offload_link else 25.0,
+                         mem_gbps=a.host_mem_gbps if a.host_mem_gbps is not None else a.cpu_mem_bw,
+                         root_gbps=a.pcie_root_gbps, nic_gbps=a.pd_link_bw,
+                         d2h_duplex_penalty=a.d2h_duplex_penalty, host_mem_background_gbps=a.host_mem_background_gbps,
+                         tiers={t.name: t.gbps for t in a.kv_offload_tiers})
+        tps = [(i, a.tp) for i in range(a.num_engines)]
+        try:
+            topology = (Topology.from_file(a.fabric, tps, **topo_args) if a.fabric
+                        else Topology.build(tps, **topo_args))
+        except (OSError, ValueError, KeyError) as e:
+            print(f"augur: --fabric: {e}", file=sys.stderr)
+            return 2
+    net_of = (lambda i: topology.net(i)) if topology is not None else (lambda i: None)
     if a.dp > 1:
         engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
                                                     enable_expert_parallel=a.enable_expert_parallel),
-                             replay_costs[i] if replay_costs else cost)
+                             replay_costs[i] if replay_costs else cost, net_of(i))
                    for i in range(a.dp)]
     elif a.prefill_engines:
         roles = ["kv_producer"] * a.prefill_engines + ["kv_consumer"] * a.decode_engines
-        engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), replay_costs[i] if replay_costs else cost)
+        engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), replay_costs[i] if replay_costs else cost, net_of(i))
                    for i, r in enumerate(roles)]
     else:
-        engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost) for i in range(a.engines)]
+        engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost, net_of(i)) for i in range(a.engines)]
+    if topology is not None and a.hbm_interference != 0:
+        hbm_bw = a.hbm_bw_gbps or a.npu_mem_bw
+        if hbm_bw is None:
+            try:
+                from augur.cost.convert import _npu_mem_bw_default
+                hbm_bw = _npu_mem_bw_default(a.fork, a.hardware)
+            except Exception:  # no fork on this machine
+                hbm_bw = None
+        if not hbm_bw:
+            if a.hbm_interference is not None:
+                print("augur: --hbm-interference needs the GPU memory bandwidth: give --hbm-bw-gbps", file=sys.stderr)
+                return 2
+            print("augur: no GPU memory bandwidth known for --hardware %s: steps are not slowed by PCIe traffic "
+                  "(give --hbm-bw-gbps to model it)" % a.hardware, file=sys.stderr)
+        else:
+            k = 1.4 if a.hbm_interference is None else a.hbm_interference
+            for e in engines:
+                e.ctx.hbm_interference, e.ctx.hbm_bw_gbps = k, float(hbm_bw)
     if hasattr(cost, "max_num_batched_tokens"):  # the fork's traces are built for the engine's real budget
         cost.max_num_batched_tokens = engines[0].vllm_config.scheduler_config.max_num_batched_tokens
     if not a.replay_durations:  # a logged step's duration already holds its CPU time
@@ -452,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
         entry_router, decode_router = ReplayRouter.from_logs(replay_logs)
     coord = Coordinator(engines, entry_router, workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
-                        decode_router=decode_router,
+                        decode_router=decode_router, topology=topology,
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
                         frontend_latency_ns=0 if replaying else int(a.frontend_latency_ms * 1e6),
                         delivery_latency_ns=0 if replaying else int(a.delivery_latency_ms * 1e6))
@@ -485,6 +544,18 @@ def main(argv: list[str] | None = None) -> int:
         summary["dp_rounds"] = coord.dp_rounds
         summary["dp_dummy_forwards"] = coord.dp_dummy_forwards
     summary["async_scheduling"] = spec.async_scheduling
+    jobs = [x for e in engines if e.ctx.offload is not None for x in e.ctx.offload.job_ns]
+    if jobs:
+        def dist(ns):
+            ns = sorted(ns)
+            return {"n": len(ns), "mean_ms": round(sum(ns) / len(ns) / 1e6, 3),
+                    "p50_ms": round(ns[len(ns) // 2] / 1e6, 3), "p99_ms": round(ns[min(len(ns) - 1, int(0.99 * len(ns)))] / 1e6, 3)}
+        summary["offload_transfers"] = {kind: dist([ns for is_load, ns in jobs if is_load == (kind == "load")])
+                                        for kind in ("store", "load") if any(is_load == (kind == "load") for is_load, _ in jobs)}
+    if topology is not None:
+        summary["fabric"] = {"hosts": len({n for n in topology.gpu_of.values()}) and
+                             max(topology.gpu_of.values()) // topology.gpus_per_host + 1,
+                             "rate_recomputations": topology.fabric.recomputes}
     if hasattr(cost, "steps_beyond_profile"):
         summary["steps_beyond_profile"] = cost.steps_beyond_profile
     summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
