@@ -121,9 +121,16 @@ def _empty(sch) -> bool:
 class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
-                 pd_link: PDLink | None = None, frontend_latency_ns: int = 0, delivery_latency_ns: int = 0):
+                 pd_link: PDLink | None = None, frontend_latency_ns: int = 0, delivery_latency_ns: int = 0,
+                 frontend_ns_per_token: float = 0.0):
         self.engines = engines
         self.frontend_latency_ns = frontend_latency_ns
+        # Replay of a real log: call id -> the engine request id the real run logged. Same strings, same hashes, so
+        # the sets vLLM iterates (finished ids, ...) come out in the real order, which the CPU tier's eviction order
+        # follows with KV offload (the real ids carry a random suffix per run, so only a replay can reuse them).
+        self.request_ids: dict[str, str] = {}
+        self._call_of_rid: dict[str, str] = {}
+        self.frontend_ns_per_token = frontend_ns_per_token  # added per prompt token (tokenization, request parsing)
         self.delivery_latency_ns = delivery_latency_ns  # engine emits a token -> the client has it
         # PD disaggregation: the coordinator plays vLLM's PD proxy. A call goes
         # to a prefill engine with max_tokens=1 and do_remote_decode; the
@@ -198,9 +205,8 @@ class Coordinator:
         prio = CAUSED_ARRIVAL if getattr(e, "after_step_start", False) else ARRIVAL
         self._push(t, prio, "entry", e)
 
-    @staticmethod
-    def _cid(request_id: str) -> str:
-        return strip_pd_suffix(request_id)
+    def _cid(self, request_id: str) -> str:
+        return self._call_of_rid.get(request_id) or strip_pd_suffix(request_id)
 
     def _pick(self, router: Router, call: Call, engines: list[SimEngine]) -> SimEngine:
         eid = router.route(call, engines, self.now)
@@ -219,12 +225,13 @@ class Coordinator:
         self._records[call.call_id] = rec
         self._calls[call.call_id] = call
         self._call_engine[call.call_id] = eng
-        if self.frontend_latency_ns:
+        delay = self.frontend_latency_ns + int(self.frontend_ns_per_token * len(call.prompt_ids))
+        if delay:
             # The API server's work before the engine sees the request (HTTP,
             # tokenization, hand-off); the call's times stay measured from
             # when the client sent it.
             eng.admitting += 1
-            self._push(self.now + self.frontend_latency_ns, ARRIVAL, "admit", (eng, call))
+            self._push(self.now + delay, ARRIVAL, "admit", (eng, call))
         else:
             self._admit(eng, call)
 
@@ -233,7 +240,10 @@ class Coordinator:
             eng.add(call, self.now, request_id=call.call_id + "@p", max_tokens=1,
                     kv_transfer_params={"do_remote_decode": True})
         else:
-            eng.add(call, self.now)
+            rid = self.request_ids.get(call.call_id)
+            if rid is not None:
+                self._call_of_rid[rid] = call.call_id
+            eng.add(call, self.now, request_id=rid)
 
     def _on_arrival(self, ev: _Event) -> None:
         p = ev.payload
@@ -312,7 +322,9 @@ class Coordinator:
         (self.decode_router if self.pd else self.router).release(call, done_ns)
         del self._records[call_id]
         self._call_engine.pop(call_id, None)
-        eng.ctx.output_ids.pop(call_id + "@d" if self.pd else call_id, None)
+        rid = self.request_ids.get(call_id, call_id)
+        self._call_of_rid.pop(rid, None)
+        eng.ctx.output_ids.pop(call_id + "@d" if self.pd else rid, None)
         if call.session_id is not None:
             s = self._sessions[call.session_id]
             if s.next_index < len(s.sub_requests):

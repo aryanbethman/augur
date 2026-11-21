@@ -213,3 +213,39 @@ def test_offload_runs_replay_their_own_logs_exactly(tmp_path, sessions, sched):
         "--step-log-vllm", str(rep))
     r = compare(str(orig), str(next(tmp_path.glob("rep.*.jsonl"))))
     assert r["steps_a"] == r["steps_b"] == r["identical_steps"] > 0
+
+
+def test_a_replay_reuses_the_request_ids_the_logged_engine_used(tmp_path, sessions):
+    # Regression (2026-11-21): a real async + offload run (SWE-bench, 16 GiB tier) replayed 10,501 of 11,495 steps.
+    # vLLM's set iteration over request ids sets the CPU tier's eviction order, and a real server's engine ids
+    # carry a random suffix per run (cmpl-augur.<call>.-0-<hex>), so replaying with bare call ids hashed
+    # differently, evicted a different block, and missed a CPU hit the real run had. Replays now use the ids from
+    # the log; here a log is rewritten with such ids and the replay must carry them (the steps need not match: this
+    # log's own eviction order came from the bare ids).
+    import random as rnd
+    run(tmp_path, sessions, "orig", "--kv-offload-gib", "1", "--async-scheduling", "--step-log-vllm", str(tmp_path / "orig"))
+    orig = next(tmp_path.glob("orig.*.jsonl"))
+    r = rnd.Random(5)
+    new: dict[str, str] = {}
+
+    def f(rid):
+        return new.setdefault(rid, f"cmpl-augur.{rid}.-0-{r.getrandbits(32):08x}")
+
+    real = tmp_path / "real_style.1.jsonl"
+    with open(orig) as fi, open(real, "w") as fo:
+        for line in fi:
+            e = json.loads(line)
+            if "rid" in e:
+                e["rid"] = f(e["rid"])
+            for k in ("tok", "new", "out"):
+                if k in e:
+                    e[k] = {f(x): v for x, v in e[k].items()}
+            for k in ("pre", "fin", "recv"):
+                if k in e:
+                    e[k] = [f(x) for x in e[k]]
+            fo.write(json.dumps(e) + "\n")
+    run(tmp_path, sessions, "rep", "--kv-offload-gib", "1", "--async-scheduling", "--replay-durations", str(real),
+        "--step-log-vllm", str(tmp_path / "rep"))
+    rep = next(tmp_path.glob("rep.*.jsonl"))
+    added = {json.loads(line)["rid"] for line in open(rep) if '"ev":"add"' in line}
+    assert added == set(new.values())
