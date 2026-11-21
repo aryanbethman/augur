@@ -30,7 +30,7 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
    study; a short pilot on the RTX 4060 Ti first to shake out the memory probe
 
 ## Next features (proposed order, no runs needed)
-1. Contention-aware co-simulation (in progress)  2. ngram speculation step cost  3. MoE TP4 and DP+EP on the tables
+1. Contention-aware co-simulation (built on feature/contention-20261121, not merged)  2. Shipped profiles with decode query lengths 1,2,4  3. MoE TP4 and DP+EP on the tables
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
@@ -78,8 +78,13 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
 - [x] Real-GPU check of CPU offload (2026-11-21, f394170): replay exact sync 11,396/11,396 and async 11,136/11,136
       once replay reuses the logged request ids (vLLM's CPU-tier eviction follows set order of request ids); end to
       end mean TTFT/TPOT/latency −3.2/−1.6/−2.9% sync, −4.0/−1.3/−3.2% async; prefix hits within 1.5 points
-- [ ] Model ngram speculation step cost: real steps ~2.3x the profile's price in both simulators (about 1 ms per
-      request per step); re-measure on a quiet host first (host load was 33-41)
+- [x] ngram speculation step cost (2026-11-21, d5d6b1b): the gap is verification attention with 1+k queries priced
+      as a one-token decode (1.4-1.9x), plus 160-210 us per request per step; the ngram proposer is 0.1-0.25 ms.
+      --spec-us-per-request (default 100); stepcheck now prices spec steps as decodes. With a q=1,4 profile the real
+      runs come to −1.3% (async) and +0.6% (sync) mean latency
+- [ ] Regenerate the shipped RTX4060Ti Qwen3-1.7B profile with --decode-q-lens 1,2,4 so speculation is priced out of
+      the box (augur.profile; the pilot matched the shipped profile within 0.2% on non-spec shapes). Refit
+      --spec-us-per-request on a quiet host and another GPU
 - [ ] Offload: GPU-to-CPU copies lose 15% when a load overlaps; decode is 7% slower during a copy (contention work)
 - [ ] Multi-GPU offload: two GPUs do not contend on an idle host, but under memory-bound CPU load aggregate copy
       bandwidth falls 25-33% (2026-11-21, two-GPU benchmark): model it in the contention work
@@ -115,6 +120,9 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
 - [x] Async loop fix (2026-11-18) reran: async PD moved 0.5% mean TTFT (207.8 -> 206.8 ms), sync PD identical
 
 ## 5. Profiles
+- [x] augur.profile pilot (2026-11-21): Qwen3-1.7B on the 4060 Ti, small grid, 19 min; check, memory, layers and
+      convert all work; prices within 0.2% of the shipped profile; memory numbers match the real servers' except peak
+      activation (0.82 vs 0.50-0.63 GiB)
 - [~] Profiling pipeline (2026-11-21, c2e506c): `python -m augur.profile --model M --hardware H --tp N [--max-kv
       --max-batch-tokens]` runs the fork's profiler (layers, skew), records vLLM's memory accounting (weights,
       non-torch, peak activation, CUDA graphs, KV size) from a dummy-weight start-up, converts with the self-check;
