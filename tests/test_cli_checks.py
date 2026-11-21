@@ -87,3 +87,21 @@ def test_batch_limit_flags_win_over_the_defaults(tmp_path):
                       max_model_len=8192, hbm_gb=80, hardware="H100", max_num_seqs=128, max_num_batched_tokens=2048)
     limits = SimEngine(0, spec, FixedCost()).vllm_config.scheduler_config
     assert (limits.max_num_batched_tokens, limits.max_num_seqs) == (2048, 128)
+
+
+def _latency(tmp_path, workload, name, *args):
+    out = tmp_path / f"{name}.csv"
+    r = augur("--workload", workload, "--num-entries", "6", "--output", str(out), "--no-async-scheduling", *args)
+    assert r.returncode == 0, r.stderr
+    with open(out) as f:
+        return [int(x["latency"]) for x in csv.DictReader(f)]
+
+
+def test_spec_us_per_request_slows_only_speculative_steps(tmp_path, workload):
+    spec = ["--num-speculative-tokens", "3"]
+    base = _latency(tmp_path, workload, "base", *spec, "--spec-us-per-request", "0")
+    slow = _latency(tmp_path, workload, "slow", *spec, "--spec-us-per-request", "2000")
+    assert sum(slow) > 1.2 * sum(base)
+    # without speculation the flag has no effect
+    assert _latency(tmp_path, workload, "p0", "--spec-us-per-request", "0") == \
+        _latency(tmp_path, workload, "p2000", "--spec-us-per-request", "2000")
