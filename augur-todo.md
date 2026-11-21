@@ -20,9 +20,11 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
 ## Verification runs, once the GPUs and CPUs are free
 1. [x] Rerun the PD async comparisons after the async loop fix: async PD moved 0.5% mean TTFT; sync identical
 2. [x] 256-GPU scale run with the table pricer: 20 s, 1.5 GB RSS, byte-identical to the ASTRA-priced run
-3. Real-GPU check of CPU offload (section 4; script ready)
-4. Real-GPU runs where the schedulers differ (section 6)
-5. `vllm bench serve` vs `augur bench` end to end (section 1)
+3. [x] Real-GPU check of CPU offload: replay exact sync 11,396/11,396, async 11,136/11,136 (after the request-id
+   fix); end to end −3 to −4% mean TTFT; PCIe 12.7 GB/s
+4. [x] Real-GPU runs where the schedulers differ: async SWE-bench, both simulators within 1% mean; ngram
+   speculation, both 25-35% too fast (see section 4)
+5. `vllm bench serve` vs `augur bench` end to end at other prompt lengths (256 and 4,096 done for TTFT)
 6. Wheel pip-installed into a clean venv: needs vllm 0.33.0 and its dependencies from the network (uv cache empty)
 7. `python -m augur.profile` for H100 Llama-3.1-70B TP4 with KV to 32k (~4-12 h of GPU), then redo the arrival
    study; a short pilot on the RTX 4060 Ti first to shake out the memory probe
@@ -69,8 +71,12 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
       unmodified, augur/sim/offload.py as its GPU worker (store/load/sync-load FIFO lanes, latency + bytes/bw,
       default the CPU memory's as LLMServingSim); --kv-offload-gib/-gbps/-latency-ns; step log records offload
       jobs, replay re-times them. Own-log replay exact (sync and async); runs repeat exactly (PYTHONHASHSEED pinned)
-- [ ] Real-GPU check of CPU offload: scripts/real_offload_check.sh (SWE-bench 50 sessions, 16 GiB CPU tier,
-      GPU 0, ~15 min), then replay + measured PCIe rate + e2e. Waiting for a free GPU
+- [x] Real-GPU check of CPU offload (2026-11-21, f394170): replay exact sync 11,396/11,396 and async 11,136/11,136
+      once replay reuses the logged request ids (vLLM's CPU-tier eviction follows set order of request ids); end to
+      end mean TTFT/TPOT/latency −3.2/−1.6/−2.9% sync, −4.0/−1.3/−3.2% async; prefix hits within 1.5 points
+- [ ] Model ngram speculation step cost: real steps ~2.3x the profile's price in both simulators (about 1 ms per
+      request per step); re-measure on a quiet host first (host load was 33-41)
+- [ ] Offload: GPU-to-CPU copies lose 15% when a load overlaps; decode is 7% slower during a copy (contention work)
 - [x] Tiered KV offload (2026-11-18): vLLM's TieringOffloadingManager unmodified (cascade CPU -> tiers,
       promotion tier -> CPU -> GPU), augur/sim/tiers.py SimMemoryTier as the tier (capacity, LRU, FIFO
       write/read lanes, latency + bytes/bw on the virtual clock), CPU tier buffer anonymous (no /dev/shm).
@@ -140,12 +146,15 @@ Next: contention-aware co-simulation (design doc), on branch feature/contention-
 - [ ] TP follow-ups: the guard rests on ~300 probes, not a derivation; the inexact corner (large CPU-memory
       latency) is not understood; multi-node out of scope. 256-GPU run redone with the table pricer (2026-11-21):
       20 s, 1.5 GB RSS, byte-identical to the ASTRA-priced run
-- [ ] Waiting for a free GPU: real-GPU runs where the schedulers differ (preemption-heavy,
-      spec decoding, agent sessions under async): augur vs LLMServingSim per request
+- [x] Real-GPU runs where the schedulers differ (2026-11-21): async SWE-bench 50 (replay 11,214/11,214): augur
+      −0.8/+0.1/−0.6%, LLMServingSim −0.4/−0.6/−0.4% mean TTFT/TPOT/latency; at 0.2 sessions/s they do not diverge
+- [ ] Same at a higher session rate, where vLLM's and LLMServingSim's schedulers can differ
 - [x] Front-end model (456dcac): constant 6.5 ms intake + 8 ms delivery as defaults; the load-dependent
       part is the engine loop, which augur reproduces (775/778 steps from client send times). 2 req/s
       TTFT -11.7% -> -1.2%. Trace client's 100-connection cap removed (untested on a server)
-- [ ] Front end: prompt-length dependence of the 6.5 ms (only 1,024-token text prompts measured); other hosts
+- [x] Front end by prompt length (2026-11-21): 3.0 ms + 3.0 us per token measured at 256/1,024/4,096 tokens;
+      --frontend-latency-ms 3.4 + --frontend-us-per-token 3.0 (6.5 ms at 1,024 tokens as before)
+- [ ] Front end: token-id prompts (the trace client) and other hosts
 - [x] Run-to-run noise: covered by the +-1% sensitivity range in augur bench
 - [~] Automatic KV size from memory accounting (now a manual --kv-reserve-gib). Looked at 2026-11-18: in the 7
       real 4060 Ti logs (same model and config) vLLM's own reserve moves 0.65-0.97 GiB run to run (peak

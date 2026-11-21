@@ -29,6 +29,11 @@ augur with the real run's arrival times and step durations
 | ShareGPT 300, ngram speculative decoding k=3, sync | 1,880 / 1,880 |
 | ShareGPT 300, ngram speculative decoding k=3, async | 1,722 / 1,722 |
 | `vllm bench serve`, random 1,024/128 at 6 req/s, async | 778 / 778 |
+| SWE-bench 50 sessions, async | 11,214 / 11,214 |
+| SWE-bench 50 sessions, KV offload to a 16 GiB CPU tier, sync | 11,396 / 11,396 |
+| SWE-bench 50 sessions, KV offload to a 16 GiB CPU tier, async | 11,136 / 11,136 |
+| ShareGPT 300, ngram k=3, sync, rerun on GPU 0 | 1,653 / 1,653 |
+| ShareGPT 300, ngram k=3, async, rerun on GPU 0 | 1,760 / 1,760 |
 
 Replay takes the KV block count from the server log (it varies run to run)
 and uses `--no-recorded-outputs`; runs from `augur.verify.client` add
@@ -37,8 +42,12 @@ With timing fixed from the log, any mismatch is a bug in what augur wraps
 around vLLM (executor, coordinator), not in the timing model. Every
 mismatch found so far was such a bug, now fixed (a resumed preempted
 request's prefill length; async log ordering; ngram drafts near
-`max_tokens`). `tests/test_replay_selftest.py` replays augur's own logs for
-sync, async and speculative runs.
+`max_tokens`; with KV offload, request ids: vLLM iterates sets of request
+ids, the CPU tier's eviction order follows that order, and the real engine's
+ids carry a random per-run suffix, so replay now reuses the logged ids).
+`tests/test_replay_selftest.py` replays augur's own logs for sync, async and
+speculative runs; `tests/test_multi_replay.py` for several engines,
+prefill/decode and DP, with and without offload.
 
 ## 2. Step times: the profile
 
@@ -107,9 +116,14 @@ first; both systems were throughput-bound, and the per-call times still agree.
 constants around it, measured on the 6 req/s run by lining up the client's
 send times with the engine's step log (same clock):
 
-- `--frontend-latency-ms`, default 6.5: client send to the engine process
-  (HTTP, tokenization, hand-off). Constant to within about 1 ms for 298 of 300
-  requests.
+- `--frontend-latency-ms`, default 3.4, plus `--frontend-us-per-token`,
+  default 3.0: client send to the engine process (HTTP, tokenization,
+  hand-off); 6.5 ms for a 1,024-token prompt. Constant to within about 1 ms for
+  298 of 300 requests at 1,024 tokens. With the engine idle at light load,
+  median intake was 3.5 / 5.9 / 14 ms for 256 / 1,024 / 4,096-token text
+  prompts (fit: 3.0 ms + 3.0 us per token, 95% interval 2.6-3.5 us). With it,
+  median TTFT at 4,096 tokens moves from −1.3% to +0.9%; at 256 tokens augur
+  stays about 7 ms high for another reason.
 - `--delivery-latency-ms`, default 8: engine emits a token to the client
   having it (output processing, detokenization, streaming, client parse). It
   does not accumulate: mean client inter-token latency equals the engine's.
@@ -121,8 +135,34 @@ Replaying the real run with each request arriving at its client send time
 plus a constant 6 ms, instead of at its logged engine arrival, still gives
 775 of 778 steps with identical decisions (726 with no delay, 549 with 15 ms).
 Without the two constants light-load TTFT reads 12% low (−11.7% mean at 2
-req/s). Both were measured with vLLM 0.33 on an i7-12700 and 1,024-token text
-prompts; other hosts and prompt lengths will differ.
+req/s). Both were measured with vLLM 0.33 on an i7-12700 with text prompts;
+other hosts will differ, and token-id prompts (the trace client) are untested.
+
+**KV offload against real vLLM.** SWE-bench 50 sessions with a 16 GiB CPU
+tier, Qwen3-1.7B, RTX 4060 Ti; augur at the measured PCIe rate (12.7 GB/s
+CPU to GPU, 12.1-13.0 GB/s GPU to CPU). Error of augur:
+
+| Run | Mean TTFT / TPOT / latency | Median per-call TTFT / TPOT / latency (absolute) | Prefix-hit rate, real vs augur |
+| --- | --- | --- | --- |
+| sync | −3.2 / −1.6 / −2.9% | 12.6 / 6.5 / 7.4% | 47.8% vs 48.5% |
+| async | −4.0 / −1.3 / −3.2% | 12.9 / 5.7 / 6.9% | 51.5% vs 53.0% |
+
+**Contention on one GPU** (`scripts/contention_bench.py`, RTX 4060 Ti):
+copies run at 12.7 GB/s to the GPU and 13.1 GB/s from it, flat from one KV
+block (1.84 MB) to 64 MB. With both directions at once, GPU-to-CPU copies lose
+14-15% and CPU-to-GPU copies about 1%; two CPU-to-GPU streams split the link
+evenly. A memory-bound decode-like forward is 7% slower while a 512 MB copy to
+the GPU runs, 5% with a copy from it, 11-12% with both. The real offload logs
+agree: stores that finished in the same step as a load ran 15% slower (10.4 vs
+12.1-12.3 GB/s); loads were unaffected. On this trace transfers overlap about
+5% of the run, so contention costs under 0.5% of step time here; it matters
+when transfers are active most of the time, or when GPUs share a host.
+
+**Speculative decoding timing.** ngram k=3, ShareGPT 300, rerun on GPU 0
+(host load 33-41): both simulators are far too fast. Mean TPOT error: augur
+−32% async and −35% sync, LLMServingSim −26% and −29%. Real steps take about
+2.3x the priced time, about 1 ms per request per step more. Neither simulator
+prices the drafter or verification overhead; decisions still replay exactly.
 
 **Knee TTFT** is the hardest metric. With the real engine arrivals held fixed
 (`--replay-arrivals`), median TTFT is 1,111 ms with the real step times and
@@ -158,10 +198,15 @@ measured, is reliable.
 | ShareGPT 300, async | mean TTFT / TPOT / latency | +1.4 / +0.9 / +1.2% | +1.7 / +1.1 / +1.5% |
 | SWE-bench sessions (765 calls), sync | mean TTFT / TPOT / latency | −4.5 / −2.1 / −3.6% | +0.4 / 0.0 / +0.2% |
 | SWE-bench sessions, sync | session duration, median per-session error | 3.7% | 0.9% |
+| SWE-bench sessions, async | mean TTFT / TPOT / latency | −0.4 / −0.6 / −0.4% | −0.8 / +0.1 / −0.6% |
+| SWE-bench sessions, async | median per-call TTFT / TPOT / latency (absolute) | 8.7 / 8.2 / 6.1% | 9.1 / 7.0 / 6.1% |
+| ShareGPT 300, ngram k=3, async | mean TPOT | −25.5% | −32.0% |
 | random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −1.2 / −1.9% |
 | random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −11.2 / −28.1%, −1.4% |
 | random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.4%, −2.1%, +2.0% |
 
+At 0.2 sessions/s the async SWE-bench engine is rarely saturated and the two
+schedulers agree. Neither simulator prices ngram drafting (section 3).
 On sync runs and at light load augur is closer: LLMServingSim has no term for
 vLLM's CPU time, the API server or the client. On loaded async runs the two
 are equally close. LLMServingSim's async runs come out
@@ -245,14 +290,14 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
 
 ## Modeled, not yet checked against real vLLM
 
-- **KV offload to CPU** (`--kv-offload-gib`). vLLM's OffloadingConnector
+- **KV offload to CPU** (`--kv-offload-gib`), now partly checked. vLLM's OffloadingConnector
   scheduler half runs unmodified; augur stands in for its GPU worker
   (augur/sim/offload.py). Checked against augur's own logs only: sync and
   async runs replay step for step, and runs repeat exactly. Transfer time is
   latency + bytes / bandwidth on three FIFO lanes (stores, loads, sync loads)
-  that do not share bandwidth; the real PCIe rate and any contention with
-  compute are untested. `scripts/real_offload_check.sh` runs the real check
-  (50 SWE-bench sessions, 16 GiB CPU tier, GPU 0).
+  that do not share bandwidth. Checked against real runs since 2026-11-21
+  (section 3: exact replay, end to end within 3-4% mean TTFT);
+  `scripts/real_offload_check.sh` reruns the check.
 - **Secondary KV tiers** (`--kv-offload-tier`). vLLM's TieringOffloadingManager
   runs unmodified (stores cascade from the CPU tier to every secondary tier;
   hits there are promoted to the CPU tier, then loaded to the GPU). augur's
