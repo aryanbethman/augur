@@ -16,8 +16,8 @@ Rules (all times integer ns, bandwidth in bytes per ns = GB/s):
 * Rates are recomputed whenever the set of flows consuming bandwidth changes.
   Everything is processed in insertion order, so a run is deterministic.
 * ``rounding="ceil"`` finishes a flow at ``ceil(remaining / rate)`` and treats
-  half a byte or less as done, as ``coordinator.SharedLink`` does; with one
-  link in the fabric the two agree to the byte (tests/test_fabric.py).
+  half a byte or less as done (``--pd-contention decode``); with one link it
+  matches the processor-sharing reference in tests/test_fabric.py to the ns.
 * ``forced_end`` (replay): the flow ends at max(its start, forced_end), whatever
   its rate, like the offload worker's ``replay_done_ns``.
 
@@ -25,7 +25,8 @@ The fabric advances itself between ``advance(now)`` calls: flows that start
 later (a load queued behind a forward pass) and finish in between are handled at
 their own times, so a caller only ever needs to advance to the present.
 ``info(key)`` gives (start, end) of a flow, projected for one still running on the
-assumption that no flow joins later; the projection is cached until the next
+assumption that no flow joins later. The projection simulates only the flows linked
+to it (through resources, couplings or streams) and is cached until the next
 ``submit``/``cancel``.
 """
 
@@ -88,11 +89,6 @@ class Fabric:
         self.epoch += 1
 
     # ---- flows ------------------------------------------------------------
-    def start(self, key, path, nbytes: int, now: int, latency_ns: int = 0, payload=None, notify: bool = False,
-              rounding: str = "floor", stream=None, forced_end: int | None = None) -> None:
-        """Begin a flow at ``now`` (or, in a stream, when the stream's earlier flows are done)."""
-        self.submit(key, stream, path, nbytes, now, latency_ns, payload, notify, rounding, forced_end)
-
     def submit(self, key, stream, path, nbytes: int, earliest: int, latency_ns: int = 0, payload=None,
                notify: bool = False, rounding: str = "floor", forced_end: int | None = None) -> None:
         if key in self.flows or key in self.done:
@@ -129,30 +125,20 @@ class Fabric:
         f = self.flows.get(key)
         return f.rnum / f.rden if f is not None and f.state == ACTIVE else 0.0
 
-    def capacity_now(self, resource: str) -> float:
-        """A resource's capacity at present (reduced while a coupled flow is running)."""
-        c = self.cap[resource]
-        for trigger, victim, penalty in self.couplings:
-            if victim == resource and any(f.state == ACTIVE and trigger in f.path for f in self.flows.values()):
-                c *= 1.0 - penalty
-        return c
-
     def rates_through(self, resource: str) -> float:
         """Sum of the rates of the flows using bandwidth on a resource now."""
         return sum(f.rnum / f.rden for f in self.flows.values() if f.state == ACTIVE and resource in f.path)
-
-    def finished(self, key) -> bool:
-        return key in self.done
 
     def info(self, key) -> tuple[int, int]:
         """(start, end) of a flow: exact once finished, else projected."""
         d = self.done.get(key)
         if d is not None:
             return d
-        return self._projection()[key]
-
-    def end(self, key) -> int:
-        return self.info(key)[1]
+        if self._proj is None or self._proj[0] != self.epoch:
+            self._proj = (self.epoch, {})
+        if key not in self._proj[1]:
+            self._proj[1].update(self._projection(key))
+        return self._proj[1][key]
 
     def next_event(self) -> int | None:
         """The next time a flow starts, begins using bandwidth or ends."""
@@ -162,9 +148,6 @@ class Fabric:
     def pop_completed(self) -> list:
         out, self.completed = self.completed, []
         return out
-
-    def busy(self) -> bool:
-        return bool(self.flows)
 
     # ---- time ---------------------------------------------------------------
     def advance(self, now: int) -> None:
@@ -185,7 +168,7 @@ class Fabric:
     def _left(self, f: _Flow, t: int) -> float:
         """Bytes a flow using bandwidth still has at t, at the rate it has had since its last update. Updated
         only when the flows using bandwidth change, so the arithmetic does not depend on when the fabric is
-        advanced (and, with one link, matches coordinator.SharedLink to the byte)."""
+        advanced (and, with one link, matches tests/test_fabric.py's SharedLink to the byte)."""
         return f.remaining - (t - f.t0) * f.rnum / f.rden
 
     def _next_time(self):
@@ -260,7 +243,7 @@ class Fabric:
     def _recompute(self, touched: set) -> None:
         """Max-min fair rates by progressive filling over the flows using bandwidth. A flow whose rate
         changes, or that shares a resource with a flow that started or stopped (``touched``), is first brought
-        up to date at its old rate; any other keeps its arithmetic (as SharedLink, per link)."""
+        up to date at its old rate; any other keeps its arithmetic."""
         self.recomputes += 1
         t = self.time
         active = [f for f in self.flows.values() if f.state == ACTIVE]
@@ -318,13 +301,29 @@ class Fabric:
                 f.fin = INF
 
     # ---- projection -------------------------------------------------------
-    def _projection(self) -> dict:
-        if self._proj is not None and self._proj[0] == self.epoch:
-            return self._proj[1]
+    def _projection(self, key) -> dict:
+        """(start, end) of ``key`` and every flow linked to it, simulated to the end. Flows that share no
+        resource, coupling or stream with them, directly or through other flows, cannot change their rates."""
+        coupled: dict = {}
+        for trigger, victim, _ in self.couplings:
+            coupled.setdefault(trigger, set()).add(victim)
+            coupled.setdefault(victim, set()).add(trigger)
+        res, streams, linked = set(), {self.flows[key].stream}, set()
+        grew = True
+        while grew:
+            grew = False
+            for k, f in self.flows.items():
+                if k not in linked and (f.stream in streams or not res.isdisjoint(f.path)):
+                    linked.add(k)
+                    streams.add(f.stream)
+                    for r in f.path:
+                        res.add(r)
+                        res.update(coupled.get(r, ()))
+                    grew = True
         sim = copy.copy(self)
-        sim.flows = {k: copy.copy(f) for k, f in self.flows.items()}
-        sim.streams = {s: deque(q) for s, q in self.streams.items()}
-        sim.stream_free = dict(self.stream_free)
+        sim.flows = {k: copy.copy(f) for k, f in self.flows.items() if k in linked}
+        sim.streams = {s: deque(q) for s, q in self.streams.items() if s in streams}
+        sim.stream_free = {s: self.stream_free[s] for s in streams if s in self.stream_free}
         # (couplings and capacities are shared: a projection never changes them)
         sim.done = {}
         sim.completed = []
@@ -334,7 +333,6 @@ class Fabric:
             if t is None:
                 raise RuntimeError("fabric: flows that can never finish (zero bandwidth)")
             sim._process(int(t))
-        self._proj = (self.epoch, sim.done)
         return sim.done
 
 

@@ -366,16 +366,27 @@ class TableCost:
 
     # --- TP>1 communication ----------------------------------------------
 
-    def _comm_ns(self, tokens: int, rows: int) -> int:
+    def _ring_ns(self, tokens: int, rows: int) -> tuple[int, int, int, int]:
+        """ASTRA-Sim's ring at TP>1: (one hop and the whole of an all-reduce of ``tokens`` tokens, one hop and
+        the whole of the logits all-gather of ``rows`` sequences; 0 for the whole without rows)."""
         n, lat, c = self.tp, self.link_latency_ns, self._coll
         bw = self.link_bw * (1 << 30) / 1000000000          # NetworkFunction.cpp: bw * (1<<30) / 1e9 bytes/ns
-        cpu_bw = int(self.cpu_mem_bw)                       # AnalyticalMemory: uint64 mem_bw
         local = int(self.npu_mem_bw) * 1000000000           # Sys.cc: local-mem-bw (json, int) * 1e9
-        a = self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / cpu_bw)  # token ids in (CPU memory)
-        b = self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / cpu_bw)     # sampled ids out
         msg = (c["all_reduce_bytes_per_token"] * tokens) // n   # Ring.cc: chunk = data_size / N
         hop = int(lat + msg / bw)                           # BasicTopology.cpp: one FullyConnected hop
+        # Ring.cc: 2(N-1) steps; reduce half is processed by the memory bus, 3 x size/local_bw (PacketBundle.cc);
+        # MemBus + endpoint delay (10 ns, system.json) once per step and once for the first packet
+        ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
         ag_hop = int(lat + c["all_gather_bytes_per_seq"] * rows / bw) if rows else hop
+        ag = (n - 1) * ag_hop + 10 * n if rows else 0      # N-1 steps (Ring.cc)
+        return hop, ar, ag_hop, ag
+
+    def _comm_ns(self, tokens: int, rows: int) -> int:
+        n, lat, c = self.tp, self.link_latency_ns, self._coll
+        cpu_bw = int(self.cpu_mem_bw)                       # AnalyticalMemory: uint64 mem_bw
+        a = self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / cpu_bw)  # token ids in (CPU memory)
+        b = self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / cpu_bw)     # sampled ids out
+        hop, ar, ag_hop, ag = self._ring_ns(tokens, rows)
         if 2 * a > hop or 2 * b > ag_hop:
             raise OutsideRegime(
                 f"TP={n} step (T={tokens}, R={rows}): a CPU-memory access (A={a} ns for the token ids, B={b} ns "
@@ -383,16 +394,11 @@ class TableCost:
                 f"is more than half a ring step (all-reduce {hop} ns, last collective {ag_hop} ns; link latency "
                 f"{lat} ns, bandwidth {self.link_bw} GB/s); the closed form is not exact there. "
                 f"Use --cost llmservingsim")
-        # Ring.cc: 2(N-1) steps; reduce half is processed by the memory bus, 3 x size/local_bw (PacketBundle.cc);
-        # MemBus + endpoint delay (10 ns, system.json) once per step and once for the first packet
-        ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
         total = n * max(a, b) + min(a, b) + c["all_reduce_count"] * ar   # CPU memory: one FIFO queue per node
         m = c.get("moe_layers", 0)
         if m:  # see the MoE note in the module docstring
             total -= max(0, min(m, a, max(m, a) - b))
-        if rows:  # all-gather of the per-rank logits chunk, N-1 steps (Ring.cc)
-            total += (n - 1) * ag_hop + 10 * n
-        return total
+        return total + ag  # and the all-gather of the per-rank logits chunk
 
     # --- MoE block, TP>1 legacy path ---------------------------------------
 
@@ -434,89 +440,20 @@ class TableCost:
 
     # --- drafter passes (EAGLE / MTP) -----------------------------------------
 
-    def _draft_comm_ns(self, tokens: int, rows: int, layers: int) -> int:
-        """Collectives of ``layers`` decoder layers plus the logits all-gather at TP>1: the formula of
-        ``_comm_ns`` without its CPU-memory terms (the drafter's token ids never leave the GPU) and with two
-        all-reduces per layer."""
-        n, lat, c = self.tp, self.link_latency_ns, self._coll
-        bw = self.link_bw * (1 << 30) / 1000000000
-        local = int(self.npu_mem_bw) * 1000000000
-        msg = (c["all_reduce_bytes_per_token"] * tokens) // n
-        hop = int(lat + msg / bw)
-        ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
-        total = 2 * layers * ar
-        if rows:
-            ag_hop = int(lat + c["all_gather_bytes_per_seq"] * rows / bw)
-            total += (n - 1) * ag_hop + 10 * n
-        return total
-
-    def draft_pass_ns(self, shape: StepShape, layers: int = 1, rows: int | None = None, proj: int = 0) -> int:
-        """One forward pass of a drafter, priced from this model's own per-layer tables.
-
-        ``layers`` decoder layers (the profile's layer block, attention included, at ``shape``), ``proj`` times the
-        ``o_proj`` price for the drafter's input projection (EAGLE ``fc``, MTP ``eh_proj``; an approximation),
-        then the final norm, ``lm_head`` and sampler for ``rows`` sequences (default: the shape's).  No embedding
-        (the drafter reads the target's), no CPU-memory terms.  Used by ``augur.sim.draft.DraftCost``."""
+    @staticmethod
+    def _batch_key(shape: StepShape) -> tuple:
+        """What a batch's layer prices depend on: (prefill chunks, decodes, decode query length, mean and max
+        decode KV length)."""
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         n_dec = len(dec)
         dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1) or 1
-        kv_mean = sum(dec) // n_dec if n_dec else 0
-        kv_max = max(dec, default=0)
-        tokens = shape.forward_tokens
-        rows = len(shape.seqs) if rows is None else rows
-        key = ("draft", pre, n_dec, dq, kv_mean, kv_max, tokens, rows, layers, proj)
-        hit = self._cache.get(key)
-        if hit is not None:
-            return hit
+        return pre, n_dec, dq, sum(dec) // n_dec if n_dec else 0, max(dec, default=0)
+
+    def _pricer(self, batch: tuple, tokens: int, rows: int):
+        """price(layer name) for one batch (``_batch_key``) of ``tokens`` forward tokens and ``rows`` sequences."""
+        pre, n_dec, dq, kv_mean, kv_max = batch
         t, r = max(int(tokens), 1), max(int(rows), 1)
-
-        def price(name):
-            if name in self._attn:
-                chunk = sum(q for q, _ in pre)
-                if chunk == 0 and n_dec == 0:
-                    return 0
-                return self._attention_ns(name, chunk, _prefill_key(pre), n_dec, kv_mean, kv_max, dq)
-            if name in self._per_seq:
-                keys, vals = self._per_seq[name]
-                return max(1, int(_interp1d(keys, vals, r)))
-            keys, vals = self._dense[name]
-            return max(1, int(_interp1d(keys, vals, t)))
-
-        ns = layers * sum(count * price(n) for n, count in self._block.items())
-        if proj and "o_proj" in self._dense:
-            ns += proj * price("o_proj")
-        ns += sum(price(n) for n in self._head if rows > 0 or n not in self._per_seq)
-        if self.tp > 1:
-            ns += self._draft_comm_ns(tokens, rows, layers)
-        self._cache[key] = ns
-        return ns
-
-    # --- step ------------------------------------------------------------
-
-    def round_ns(self, shapes, first_rank: int = 0):
-        raise NotImplementedError("TableCost does not price DP rounds (EP collectives)")
-
-    def step_ns(self, shape: StepShape) -> int:
-        pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
-        dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
-        n_dec = len(dec)
-        dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1) or 1
-        kv_mean = sum(dec) // n_dec if n_dec else 0
-        kv_max = max(dec, default=0)
-        tokens = shape.forward_tokens
-        rows = 0 if shape.dummy else len(shape.seqs)
-        key = (pre, n_dec, dq, kv_mean, kv_max, tokens, rows)
-        hit = self._cache.get(key)
-        self.steps += 1
-        if hit is not None:
-            if key in self._beyond:
-                self.steps_beyond_profile += 1
-            return hit
-
-        comm = self._comm_ns(tokens, rows) if self.tp > 1 else None
-        t = max(int(tokens), 1)
-        r = max(int(rows), 1)
 
         def price(name):
             moe = self._moe_ns(name, tokens)
@@ -532,8 +469,54 @@ class TableCost:
                 return max(1, int(_interp1d(keys, vals, r)))
             keys, vals = self._dense[name]
             return max(1, int(_interp1d(keys, vals, t)))
+        return price
 
-        beyond = self._beyond_axes(pre, n_dec, kv_max, dq, t, r)
+    def draft_pass_ns(self, shape: StepShape, layers: int = 1, rows: int | None = None, proj: int = 0) -> int:
+        """One forward pass of a drafter, priced from this model's own per-layer tables.
+
+        ``layers`` decoder layers (the profile's layer block, attention included, at ``shape``), ``proj`` times the
+        ``o_proj`` price for the drafter's input projection (EAGLE ``fc``, MTP ``eh_proj``; an approximation),
+        then the final norm, ``lm_head`` and sampler for ``rows`` sequences (default: the shape's).  No embedding
+        (the drafter reads the target's), no CPU-memory terms.  Used by ``augur.sim.draft.DraftCost``."""
+        batch = self._batch_key(shape)
+        tokens = shape.forward_tokens
+        rows = len(shape.seqs) if rows is None else rows
+        key = ("draft", *batch, tokens, rows, layers, proj)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        price = self._pricer(batch, tokens, rows)
+        ns = layers * sum(count * price(n) for n, count in self._block.items())
+        if proj and "o_proj" in self._dense:
+            ns += proj * price("o_proj")
+        ns += sum(price(n) for n in self._head if rows > 0 or n not in self._per_seq)
+        if self.tp > 1:  # the drafter's token ids never leave the GPU: no CPU-memory terms; two all-reduces a layer
+            _, ar, _, ag = self._ring_ns(tokens, rows)
+            ns += 2 * layers * ar + ag
+        self._cache[key] = ns
+        return ns
+
+    # --- step ------------------------------------------------------------
+
+    def round_ns(self, shapes, first_rank: int = 0):
+        raise NotImplementedError("TableCost does not price DP rounds (EP collectives)")
+
+    def step_ns(self, shape: StepShape) -> int:
+        batch = self._batch_key(shape)
+        pre, n_dec, dq, _, kv_max = batch
+        tokens = shape.forward_tokens
+        rows = 0 if shape.dummy else len(shape.seqs)
+        key = (*batch, tokens, rows)
+        hit = self._cache.get(key)
+        self.steps += 1
+        if hit is not None:
+            if key in self._beyond:
+                self.steps_beyond_profile += 1
+            return hit
+
+        comm = self._comm_ns(tokens, rows) if self.tp > 1 else None
+        price = self._pricer(batch, tokens, rows)
+        beyond = self._beyond_axes(pre, n_dec, kv_max, dq, max(int(tokens), 1), max(int(rows), 1))
         if beyond:
             self._beyond[key] = beyond
             self.steps_beyond_profile += 1

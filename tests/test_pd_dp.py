@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from augur.cost import FixedCost
-from augur.sim.coordinator import Coordinator, SharedLink
+from augur.sim.coordinator import Coordinator
 from augur.sim.engine import EngineSpec, SimEngine
 from augur.sim.models import model_dir
 from augur.sim.router import make_router
@@ -30,14 +30,6 @@ def pd_run(tmp_path, workload, name, *args):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with open(out) as f:
         return list(csv.DictReader(f))
-
-
-def test_shared_link_two_equal_pulls_take_twice_as_long():
-    link = SharedLink(bw_gbps=2.0)
-    link.active = {"a": [1000.0, None], "b": [1000.0, None]}
-    assert link.next_finish(0) == 1000  # alone, one pull would take 500 ns
-    link.advance(500)
-    assert [v[0] for v in link.active.values()] == [500.0, 500.0]
 
 
 @pytest.mark.parametrize("contention", ["none", "decode"])

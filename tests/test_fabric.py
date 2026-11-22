@@ -10,7 +10,6 @@ import sys
 
 import pytest
 
-from augur.sim.coordinator import SharedLink
 from augur.sim.fabric import Fabric, Topology
 
 
@@ -20,8 +19,8 @@ def run_to_end(fab: Fabric) -> None:
 
 def test_two_flows_on_one_link_share_it_equally():
     f = Fabric({"a": 10.0})
-    f.start("x", ["a"], 1000, 0)
-    f.start("y", ["a"], 1000, 0)
+    f.submit("x", None, ["a"], 1000, 0)
+    f.submit("y", None, ["a"], 1000, 0)
     f.advance(0)
     assert f.rate("x") == f.rate("y") == 5.0
     run_to_end(f)
@@ -30,9 +29,9 @@ def test_two_flows_on_one_link_share_it_equally():
 
 def test_three_flows_on_two_links_share_the_bottleneck_max_min_fairly():
     f = Fabric({"a": 10.0, "b": 4.0})
-    f.start("long", ["a", "b"], 10_000, 0)
-    f.start("on_a", ["a"], 10_000, 0)
-    f.start("on_b", ["b"], 10_000, 0)
+    f.submit("long", None, ["a", "b"], 10_000, 0)
+    f.submit("on_a", None, ["a"], 10_000, 0)
+    f.submit("on_b", None, ["b"], 10_000, 0)
     f.advance(0)
     assert (f.rate("long"), f.rate("on_b"), f.rate("on_a")) == (2.0, 2.0, 8.0)
     assert f.rates_through("a") == 10.0 and f.rates_through("b") == 4.0
@@ -40,32 +39,32 @@ def test_three_flows_on_two_links_share_the_bottleneck_max_min_fairly():
 
 def test_flows_joining_and_leaving_change_the_rates_of_the_others():
     f = Fabric({"a": 10.0})
-    f.start("a1", ["a"], 1000, 0)  # alone: would end at 100
+    f.submit("a1", None, ["a"], 1000, 0)  # alone: would end at 100
     f.advance(50)
-    f.start("b", ["a"], 200, 50)  # a1 has 500 left; both at 5/ns: b ends at 90
+    f.submit("b", None, ["a"], 200, 50)  # a1 has 500 left; both at 5/ns: b ends at 90
     f.advance(50)
     assert f.rate("a1") == f.rate("b") == 5.0
     run_to_end(f)
-    assert f.end("b") == 90
-    assert f.end("a1") == 120  # 300 left at 90, alone again at 10/ns
+    assert f.info("b")[1] == 90
+    assert f.info("a1")[1] == 120  # 300 left at 90, alone again at 10/ns
 
 
 def test_a_flow_alone_takes_latency_plus_bytes_over_the_slowest_resource():
     for nbytes, latency in [(1_000_003, 0), (7, 20_000), (0, 500), (123_456_789, 20_000)]:
         f = Fabric({"fast": 256.0, "slow": 25.0, "mid": 64.0})
-        f.start("x", ["fast", "slow", "mid"], nbytes, 1000, latency_ns=latency)
+        f.submit("x", None, ["fast", "slow", "mid"], nbytes, 1000, latency_ns=latency)
         run_to_end(f)
         assert f.info("x") == (1000, 1000 + latency + int(nbytes / 25.0))
 
 
 def test_a_flows_latency_is_a_delay_before_it_uses_bandwidth():
     f = Fabric({"a": 10.0})
-    f.start("x", ["a"], 1000, 0)
-    f.start("y", ["a"], 1000, 0, latency_ns=100)
+    f.submit("x", None, ["a"], 1000, 0)
+    f.submit("y", None, ["a"], 1000, 0, latency_ns=100)
     f.advance(50)
     assert f.rate("x") == 10.0 and f.rate("y") == 0.0  # y has not reached the link
     run_to_end(f)
-    assert f.end("x") == 100 and f.end("y") == 200
+    assert f.info("x")[1] == 100 and f.info("y")[1] == 200
 
 
 def test_a_stream_runs_its_flows_one_after_another_and_not_before_earliest():
@@ -92,6 +91,22 @@ def test_projected_ends_are_the_ends_the_flows_then_get():
     assert {i: f.info(i) for i in range(12)} == projected
 
 
+def test_a_projection_over_linked_flows_only_gets_the_same_ends():
+    """info() simulates only the flows linked to the one asked about (shared resources, PCIe duplex
+    couplings, streams); across hosts the projected ends are still the ends the flows get."""
+    rng = random.Random(3)
+    topo = Topology.build([(i, 1) for i in range(4)], gpus_per_host=2, h2d_gbps=25.0, tiers={"cxl": 30.0})
+    f = topo.fabric
+    for i in range(40):
+        net = topo.net(rng.randrange(4))
+        path = rng.choice([net.store_path(), net.load_path(), net.tier_write_path("cxl"), net.tier_read_path("cxl")])
+        f.submit(i, (net.gpu, rng.randrange(2)), path, rng.randint(1 << 10, 1 << 24), rng.randint(0, 10**5),
+                 rng.choice([0, 500]))
+    projected = {i: f.info(i) for i in range(40)}
+    run_to_end(f)
+    assert {i: f.info(i) for i in range(40)} == projected
+
+
 def test_a_run_repeats_exactly():
     def once():
         rng = random.Random(7)
@@ -110,17 +125,17 @@ def test_forced_end_replaces_the_flows_own_end():
     f.submit("x", None, ["a"], 1000, 0, forced_end=500)
     f.submit("y", None, ["a"], 1000, 0, forced_end=3)
     run_to_end(f)
-    assert f.end("x") == 500 and f.end("y") == 3
+    assert f.info("x")[1] == 500 and f.info("y")[1] == 3
 
 
 def test_cancel_frees_the_bandwidth():
     f = Fabric({"a": 10.0})
-    f.start("x", ["a"], 1000, 0)
-    f.start("y", ["a"], 1000, 0)
+    f.submit("x", None, ["a"], 1000, 0)
+    f.submit("y", None, ["a"], 1000, 0)
     f.advance(40)  # 800 left each
     f.cancel("y")
     run_to_end(f)
-    assert f.end("x") == 40 + 80
+    assert f.info("x")[1] == 40 + 80
 
 
 def test_a_resource_needs_bandwidth_and_a_flow_a_known_resource():
@@ -128,10 +143,34 @@ def test_a_resource_needs_bandwidth_and_a_flow_a_known_resource():
         Fabric({"a": 0.0})
     f = Fabric({"a": 1.0})
     with pytest.raises(KeyError):
-        f.start("x", ["nope"], 1, 0)
+        f.submit("x", None, ["nope"], 1, 0)
 
 
-# ---- the simulator's own link model --------------------------------------------
+# ---- processor sharing on one link, the reference for rounding="ceil" ------------
+
+class SharedLink:
+    """n active transfers each get bandwidth / n. Remaining bytes are advanced whenever the set changes; the next
+    completion is (re)scheduled as an event tagged with a version, so stale ones are ignored. (The coordinator's
+    --pd-contention decode model before it ran on the fabric.)"""
+
+    def __init__(self, bw_gbps: float):
+        self.bw = bw_gbps  # bytes per ns
+        self.active: dict = {}  # key -> [remaining bytes, payload]
+        self.last = 0
+
+    def advance(self, now: int) -> None:
+        if self.active and now > self.last:
+            share = (now - self.last) * self.bw / len(self.active)
+            for v in self.active.values():
+                v[0] -= share
+        self.last = now
+
+    def next_finish(self, now: int) -> int | None:
+        if not self.active:
+            return None
+        least = min(v[0] for v in self.active.values())
+        return now + max(0, int(-(-least * len(self.active) // self.bw)))
+
 
 def shared_link_ends(joins, bw):
     """coordinator.SharedLink driven as the coordinator drives it: a join and each completion is an event."""
@@ -174,9 +213,9 @@ def test_one_link_in_the_fabric_reproduces_shared_link_to_the_ns():
         f = Fabric({"link": bw})
         for at, i, n in joins:
             f.advance(at)
-            f.start(i, ["link"], n, at, rounding="ceil")
+            f.submit(i, None, ["link"], n, at, rounding="ceil")
         run_to_end(f)
-        got = {i: f.end(i) for _, i, _ in joins}
+        got = {i: f.info(i)[1] for _, i, _ in joins}
         assert got == expect, (trial, bw)
 
 
@@ -313,7 +352,7 @@ def copy_rates(n_gpus, directions, background=0.0, mem=256.0):
                           host_mem_background_gbps=background)
     for i, (g, d) in enumerate(directions):
         net = topo.net(g)
-        topo.fabric.start(i, net.load_path() if d == "h2d" else net.store_path(), 10**12, 0)
+        topo.fabric.submit(i, None, net.load_path() if d == "h2d" else net.store_path(), 10**12, 0)
     topo.fabric.advance(0)
     return [topo.fabric.rate(i) for i in range(len(directions))]
 
