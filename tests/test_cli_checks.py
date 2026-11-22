@@ -105,3 +105,23 @@ def test_spec_us_per_request_slows_only_speculative_steps(tmp_path, workload):
     # without speculation the flag has no effect
     assert _latency(tmp_path, workload, "p0", "--spec-us-per-request", "0") == \
         _latency(tmp_path, workload, "p2000", "--spec-us-per-request", "2000")
+
+
+def test_default_kv_size_counts_the_weights_vllm_loads(tmp_path):
+    """Without --num-gpu-blocks / --kv-cache-gb the KV cache is GPU memory x utilisation - weights - reserve, so a
+    wrong weight estimate shifts every default run. vLLM logged "Model loading took 3.22 GiB" for Qwen3-1.7B in all
+    18 real runs (out/)."""
+    from augur.sim.models import estimate_weight_bytes, model_dir
+    config = os.path.join(model_dir("", MODEL, str(tmp_path), None), "config.json")
+    assert estimate_weight_bytes(config) / 2**30 == pytest.approx(3.22, rel=0.01)
+
+
+def test_auto_cost_takes_the_shipped_tables_else_needs_a_fork_profile(tmp_path):
+    from augur.cli import _parser, _pick_cost
+    base = ["--model", MODEL, "--workload", "unused", "--hardware", "RTX4060Ti", "--fork", str(tmp_path)]
+    a = _parser().parse_args(base)
+    assert str(_pick_cost(a, (None, None))).endswith("RTX4060Ti/Qwen--Qwen3-1.7B/bf16-tp1.json.gz") and a.cost == "tables"
+    a = _parser().parse_args([*base, "--dp", "2"])  # the tables price no DP: the fork, which has no profile here
+    with pytest.raises(FileNotFoundError, match="no step-time profile"):
+        _pick_cost(a, (None, None))
+    assert a.cost == "llmservingsim"

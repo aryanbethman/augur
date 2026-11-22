@@ -130,6 +130,8 @@ def main(argv=None) -> int:
     p.add_argument("--sensitivity", type=float, default=1.0,
                    help="also run with step times scaled by 1 -/+ this many percent and print how much each "
                         "metric moves (3 runs); 0 disables")
+    p.add_argument("--step-log", default=None, help="augur's --step-log, for the reported run only")
+    p.add_argument("--step-log-vllm", default=None, help="augur's --step-log-vllm, for the reported run only")
     p.add_argument("--step-time-scale", type=float, default=1.0,
                    help="augur's --step-time-scale: multiplies every GPU step time (applied to all sensitivity runs)")
     args, augur_args = p.parse_known_args(argv)
@@ -167,8 +169,10 @@ def main(argv=None) -> int:
                     else tokenizer(r.prompt).input_ids
                 out.write(json.dumps({"input_toks": len(ids), "output_toks": r.expected_output_len,
                                       "arrival_time_ns": int(t * 1e9), "input_tok_ids": ids}) + "\n")
+        logs = [x for flag, v in (("--step-log", args.step_log), ("--step-log-vllm", args.step_log_vllm)) if v
+                for x in (flag, v)]
         for sc in scales:
-            r = _run(args, augur_args, trace, requests, offsets, tokenizer, sc)
+            r = _run(args, augur_args + (logs if sc == base else []), trace, requests, offsets, tokenizer, sc)
             if isinstance(r, int):
                 return r
             runs.append(r)

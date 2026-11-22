@@ -61,8 +61,8 @@ STALL_NS = 60 * 1_000_000_000
 class PDLink:
     """KV pull from a prefill to a decode engine: latency + bytes / bandwidth.
 
-    No contention between concurrent pulls yet (ASTRA-Sim congestion-aware
-    mode is the planned upgrade). Defaults are the fork's single-node link."""
+    Concurrent pulls share bandwidth only in the fabric (--pd-contention decode,
+    --contention on). Defaults are the fork's single-node link."""
 
     bw_gbps: float = 16.0
     latency_ns: int = 20_000
@@ -70,33 +70,6 @@ class PDLink:
 
     def transfer_ns(self, nbytes: int) -> int:
         return self.latency_ns + int(nbytes / self.bw_gbps)
-
-
-class SharedLink:
-    """Processor sharing: n active transfers each get bandwidth / n.
-
-    Remaining bytes are advanced whenever the set changes; the next completion
-    is (re)scheduled as an event tagged with a version, so stale ones are
-    ignored."""
-
-    def __init__(self, bw_gbps: float):
-        self.bw = bw_gbps  # bytes per ns
-        self.active: dict = {}  # key -> [remaining bytes, payload]
-        self.last = 0
-        self.version = 0
-
-    def advance(self, now: int) -> None:
-        if self.active and now > self.last:
-            share = (now - self.last) * self.bw / len(self.active)
-            for v in self.active.values():
-                v[0] -= share
-        self.last = now
-
-    def next_finish(self, now: int) -> int | None:
-        if not self.active:
-            return None
-        least = min(v[0] for v in self.active.values())
-        return now + max(0, int(-(-least * len(self.active) // self.bw)))
 
 
 @dataclass(order=True)
@@ -167,7 +140,6 @@ class Coordinator:
         self._dpa_finished: dict[int, set] = {}  # round -> ranks done with it
         self._entries_done = False
         self._xfers_started: set[str] = set()
-        self._links: dict[int, SharedLink] = {}
         # LLMServingSim loop compatibility, for comparisons only (off by
         # default; none of this is vLLM behaviour):
         # - A fully idle cluster advances in fixed quanta (1 ms): a session call
@@ -423,16 +395,7 @@ class Coordinator:
         last_joined = list(self._dp_pending)[-1]
         first_rank = next(i for i, e in enumerate(g) if e.engine_id == last_joined)
         self._dp_pending.clear()
-        wants = [(s.total_tokens, all(x.num_new == 1 for x in s.seqs)) if s else (1, True) for s in shapes]
-        padded = self._dp_padded_tokens(wants)
-        from augur.cost import SeqWork, StepShape
-        final = []
-        for s, p in zip(shapes, padded):
-            if s is None:
-                self.dp_dummy_forwards += 1
-                final.append(StepShape(seqs=(SeqWork(1, 1, True),), padded_tokens=p, dummy=True))
-            else:
-                final.append(StepShape(seqs=s.seqs, padded_tokens=p))
+        final = self._round_shapes(shapes)
         replay = self._replay_rounds(g)
         per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final, first_rank=first_rank))
         # The ranks meet in the round's first collective, so the slowest rank's CPU time holds up all of them.
@@ -445,12 +408,31 @@ class Coordinator:
                 e.ctx.offload.commit_loads(self.now + ns)  # the round's forward ends with the step
         self.dp_rounds += 1
         for e, sh, ns in zip(g, final, per_rank):
-            if e.step_log is not None:
-                e.step_log.append((self.now, ns, sh.total_tokens, sum(x.num_new for x in sh.seqs if not x.is_decode),
-                                   sh.num_decode, sh.num_prefill, sh.forward_tokens, int(sh.dummy)))
+            self._log_step(e, self.now, ns, sh)
         for e, outputs, ns in zip(g, outs, per_rank):
             e.busy = True
             self._push(self.now + ns, STEP_DONE, "step_done", (e, outputs))
+
+    def _round_shapes(self, shapes) -> list:
+        """A DP round's batches, padded to the tokens vLLM's DP ranks agree on; an idle rank (None) runs a
+        dummy forward."""
+        from augur.cost import SeqWork, StepShape
+        wants = [(s.total_tokens, all(x.num_new == 1 for x in s.seqs)) if s else (1, True) for s in shapes]
+        final = []
+        for s, p in zip(shapes, self._dp_padded_tokens(wants)):
+            if s is None:
+                self.dp_dummy_forwards += 1
+                final.append(StepShape(seqs=(SeqWork(1, 1, True),), padded_tokens=p, dummy=True))
+            else:
+                final.append(StepShape(seqs=s.seqs, padded_tokens=p))
+        return final
+
+    @staticmethod
+    def _log_step(eng: SimEngine, start: int, ns: int, sh) -> None:
+        """One --step-log row: start, duration and batch shape."""
+        if eng.step_log is not None and sh is not None:
+            eng.step_log.append((start, ns, sh.total_tokens, sum(x.num_new for x in sh.seqs if not x.is_decode),
+                                 sh.num_decode, sh.num_prefill, sh.forward_tokens, int(sh.dummy)))
 
     @staticmethod
     def _replay_rounds(g) -> list[int] | None:
@@ -518,11 +500,8 @@ class Coordinator:
                 eng.gpu_free_at = start + ns
                 eng.batch_finish.append(eng.gpu_free_at)
                 eng.batch_reports.append(eng.ctx.last_kv_report)
-                if ns and eng.step_log is not None and eng.ctx.last_shape is not None:
-                    sh = eng.ctx.last_shape
-                    eng.step_log.append((start, ns, sh.total_tokens,
-                                         sum(x.num_new for x in sh.seqs if not x.is_decode), sh.num_decode,
-                                         sh.num_prefill, sh.forward_tokens, 0))
+                if ns:
+                    self._log_step(eng, start, ns, eng.ctx.last_shape)
             launched = bool(eng.ctx.launches)
             eng.ctx.launches.clear()
             self._after_step(eng)
@@ -622,17 +601,7 @@ class Coordinator:
                     self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, e.dp_held.pop(x))))
             return True
         g = self.dp_group
-        from augur.cost import SeqWork, StepShape
-        sh = [shapes.get(e.engine_id) for e in g]
-        wants = [(s.total_tokens, all(w.num_new == 1 for w in s.seqs)) if s else (1, True) for s in sh]
-        padded = self._dp_padded_tokens(wants)
-        final = []
-        for s, p in zip(sh, padded):
-            if s is None:
-                self.dp_dummy_forwards += 1
-                final.append(StepShape(seqs=(SeqWork(1, 1, True),), padded_tokens=p, dummy=True))
-            else:
-                final.append(StepShape(seqs=s.seqs, padded_tokens=p))
+        final = self._round_shapes([shapes.get(e.engine_id) for e in g])
         replay = self._replay_rounds(g)
         per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final))
         self._log_round(g, final, per_rank)
@@ -640,9 +609,7 @@ class Coordinator:
         self._dpa_running = x
         self._dpa_left = {e.engine_id for e in g}
         for e, sh, ns in zip(g, final, per_rank):
-            if e.step_log is not None:
-                e.step_log.append((self.now, ns, sh.total_tokens, sum(x.num_new for x in sh.seqs if not x.is_decode),
-                                   sh.num_decode, sh.num_prefill, sh.forward_tokens, int(sh.dummy)))
+            self._log_step(e, self.now, ns, sh)
         self._dpa_next_form = x + 1
         del self._dpa_shapes[x]
         for e, ns in zip(g, per_rank):
@@ -710,25 +677,13 @@ class Coordinator:
                 # promotes those requests at the next schedule, right away.
                 self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (eng, outputs)))
             self._check_progress(eng, executed)
-            for rid, hit in eng.ctx.last_new_req_ids.items():
-                rec = self._records.get(self._cid(rid))
-                if rec is not None and rec.first_sched_ns is None:
-                    rec.first_sched_ns = self.now
-                    rec.cached_tokens = hit
-            for rid in eng.ctx.last_preempted_req_ids:
-                rec = self._records.get(self._cid(rid))
-                if rec is not None:
-                    rec.num_preemptions += 1
+            self._after_step(eng)
             if not executed and step_ns == 0:
                 # Nothing could be scheduled (e.g. KV cache full with nothing to preempt).
                 # Apply any outputs now; the engine waits for the next event.
                 self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (eng, outputs)))
                 continue
-            if eng.step_log is not None and eng.ctx.last_shape is not None:
-                sh = eng.ctx.last_shape
-                eng.step_log.append((self.now, step_ns, sh.total_tokens,
-                                     sum(x.num_new for x in sh.seqs if not x.is_decode), sh.num_decode, sh.num_prefill,
-                                     sh.forward_tokens, 0))
+            self._log_step(eng, self.now, step_ns, eng.ctx.last_shape)
             eng.busy = True
             self._push(self.now + step_ns, STEP_DONE, "step_done", (eng, outputs))
 
@@ -826,43 +781,9 @@ class Coordinator:
                 self.fabric.submit(("pd", rid), None, path, nbytes, self.now, self.pd_link.latency_ns,
                                    payload=payload, notify=True,
                                    rounding="ceil" if self.pd_link.contention == "decode" else "floor")
-            elif self.pd_link.contention == "decode":
-                # Pay the link latency, then join the decode engine's shared link.
-                self._push(self.now + self.pd_link.latency_ns, TRANSFER_DONE, "kv_join", (nbytes, payload))
             else:
                 ns = self.pd_link.transfer_ns(nbytes)
                 self._push(self.now + ns, TRANSFER_DONE, "kv_pull", payload)
-
-    def _link_of(self, eng: SimEngine) -> SharedLink:
-        link = self._links.get(eng.engine_id)
-        if link is None:
-            link = self._links[eng.engine_id] = SharedLink(self.pd_link.bw_gbps)
-        return link
-
-    def _reschedule(self, eng: SimEngine, link: SharedLink) -> None:
-        link.version += 1
-        t = link.next_finish(self.now)
-        if t is not None:
-            self._push(t, TRANSFER_DONE, "kv_link", (eng, link.version))
-
-    def _on_link_event(self, ev: _Event) -> None:
-        if ev.kind == "kv_join":
-            nbytes, payload = ev.payload
-            eng = payload[0]
-            link = self._link_of(eng)
-            link.advance(self.now)
-            link.active[payload[1]] = [float(nbytes), payload]
-            self._reschedule(eng, link)
-            return
-        eng, version = ev.payload
-        link = self._link_of(eng)
-        if version != link.version:
-            return  # superseded by a later change to this link
-        link.advance(self.now)
-        for key in [k for k, v in link.active.items() if v[0] <= 0.5]:
-            _, payload = link.active.pop(key)
-            self._on_transfer_done(_Event(self.now, TRANSFER_DONE, 0, "kv_pull", payload))
-        self._reschedule(eng, link)
 
     def _advance_fabric(self) -> None:
         """Run the fabric to now; the PD pulls it finished are delivered (as a TRANSFER_DONE event would)."""
@@ -901,8 +822,6 @@ class Coordinator:
                 elif ev.prio == TRANSFER_DONE:
                     if ev.kind == "fabric":
                         self._on_fabric_event()
-                    elif ev.kind in ("kv_join", "kv_link"):
-                        self._on_link_event(ev)
                     else:
                         self._on_transfer_done(ev)
                 else:

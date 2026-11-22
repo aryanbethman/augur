@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -106,13 +107,7 @@ def _offload_tiers(a) -> tuple:
     return tiers
 
 
-def main(argv: list[str] | None = None) -> int:
-    if argv is None:
-        pin_hash_seed("augur.cli")
-    args = sys.argv[1:] if argv is None else argv
-    if args[:1] == ["bench"]:
-        from augur.bench import main as bench_main
-        return bench_main(args[1:])
+def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="augur")
     p.add_argument("--fork", default=default_fork(),
                    help="LLMServingSim fork checkout (model configs, profiles); "
@@ -309,7 +304,115 @@ def main(argv: list[str] | None = None) -> int:
                    help="comparison only: reproduce LLMServingSim's main-loop timing artifacts "
                         "(1 ms idle quantum, TP>1 same-instant admission); not vLLM behaviour")
     p.add_argument("--quiet", action="store_true")
-    a = p.parse_args(argv)
+    return p
+
+
+def _pick_cost(a, cpu_flags) -> str | None:
+    """--cost auto: the shipped tables when augur has a profile for --hardware, --model and --tp (no DP/EP and a TP
+    config the closed form covers), else the fork, whose profile must exist. Sets ``a.cost``; returns the tables'
+    profile (None for the fork). Raises FileNotFoundError. Called by: main."""
+    auto = a.cost == "auto"
+    profile = None
+    if a.cost in ("tables", "auto"):
+        from augur.cost.tables import bundled_profile
+        plain = a.dp == 1 and not a.enable_expert_parallel and not a.profile_variant
+        if a.cost == "tables" or a.profile:
+            profile = a.profile or bundled_profile(a.hardware, a.model, a.tp)
+        elif plain:
+            try:
+                profile = bundled_profile(a.hardware, a.model, a.tp)
+                if a.tp > 1:
+                    _tp_params(a, *cpu_flags)  # a config the closed form does not cover: use the fork
+            except FileNotFoundError:
+                pass
+            except ValueError:
+                profile = None
+        a.cost = "tables" if profile else "llmservingsim"
+    if a.cost == "llmservingsim" and not a.replay_durations:
+        from augur.cost.profiles import check, shipped
+        try:
+            check(a.fork, a.hardware, a.model, a.tp, a.profile_variant)
+        except FileNotFoundError:
+            if not auto:
+                raise
+            have = "\n".join(f"  {h} {m} {d} tp{t}" for h, m, d, t in shipped())
+            raise FileNotFoundError(
+                f"no step-time profile for {a.model} on {a.hardware} (tp={a.tp}, dp={a.dp}). "
+                f"Profiles shipped with augur (--cost tables, DP=1 and no expert parallelism):\n{have}\n"
+                "For another model or GPU, point augur at an LLMServingSim fork that has the profile "
+                "(--fork DIR or AUGUR_FORK=DIR; python -m augur.cost.profiles --fork DIR lists them), "
+                "or use --cost fixed (a constant step time, no profile).") from None
+    return profile
+
+
+def _build_engines(a, spec, cost, replay_costs, topology) -> list:
+    """The run's engines: DP ranks, prefill + decode engines, or colocated ones, with augur's per-step terms.
+    Called by: main."""
+    from augur.sim.engine import SimEngine
+    net_of = (lambda i: topology.net(i)) if a.contention == "on" else (lambda i: None)
+    if a.dp > 1:
+        engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
+                                                    enable_expert_parallel=a.enable_expert_parallel),
+                             replay_costs[i] if replay_costs else cost, net_of(i))
+                   for i in range(a.dp)]
+    elif a.prefill_engines:
+        roles = ["kv_producer"] * a.prefill_engines + ["kv_consumer"] * a.decode_engines
+        engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), replay_costs[i] if replay_costs else cost, net_of(i))
+                   for i, r in enumerate(roles)]
+    else:
+        engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost, net_of(i)) for i in range(a.engines)]
+    if not a.replay_durations:  # a logged step's duration already holds its CPU time
+        for e in engines:
+            e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
+            e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
+            e.ctx.spec_ns_per_request = int(a.spec_us_per_request * 1e3)
+            e.ctx.step_time_scale = a.step_time_scale
+    if a.step_log:
+        for e in engines:
+            e.step_log = []
+    return engines
+
+
+def _summary(a, rec, coord, engines, cost, topology, kv_bytes) -> dict:
+    """The JSON summary main prints after a run. Called by: main."""
+    summary = rec.summary()
+    steps = sum(e.steps for e in engines)
+    cpu = sum(e.sched_cpu_s for e in engines)
+    if hasattr(cost, "oracle") and cost.oracle is not None:
+        summary["astra_runs"] = cost.oracle.runs
+    if coord.dp_group:
+        summary["dp_rounds"] = coord.dp_rounds
+        summary["dp_dummy_forwards"] = coord.dp_dummy_forwards
+    summary["async_scheduling"] = engines[0].spec.async_scheduling
+    jobs = [x for e in engines if e.ctx.offload is not None for x in e.ctx.offload.job_ns]
+    if jobs:
+        def dist(ns):
+            ns = sorted(ns)
+            return {"n": len(ns), "mean_ms": round(sum(ns) / len(ns) / 1e6, 3),
+                    "p50_ms": round(ns[len(ns) // 2] / 1e6, 3), "p99_ms": round(ns[min(len(ns) - 1, int(0.99 * len(ns)))] / 1e6, 3)}
+        summary["offload_transfers"] = {kind: dist([ns for is_load, ns in jobs if is_load == (kind == "load")])
+                                        for kind in ("store", "load") if any(is_load == (kind == "load") for is_load, _ in jobs)}
+    if a.contention == "on":
+        summary["fabric"] = {"hosts": len({n for n in topology.gpu_of.values()}) and
+                             max(topology.gpu_of.values()) // topology.gpus_per_host + 1,
+                             "rate_recomputations": topology.fabric.recomputes}
+    if hasattr(cost, "steps_beyond_profile"):
+        summary["steps_beyond_profile"] = cost.steps_beyond_profile
+    summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
+                    "vllm_step_cpu_ms_per_step": round(1e3 * cpu / max(steps, 1), 3),
+                    "kv_cache_gib_per_engine": round(kv_bytes / 2**30, 2),
+                    "num_gpu_blocks": engines[0].vllm_config.cache_config.num_gpu_blocks})
+    return summary
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        pin_hash_seed("augur.cli")
+    args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ["bench"]:
+        from augur.bench import main as bench_main
+        return bench_main(args[1:])
+    a = _parser().parse_args(argv)
     if a.profile_variant and a.cost in ("tables", "fixed"):
         print(f"augur: --profile-variant selects a profile folder of the fork: it needs --cost llmservingsim "
               f"(or auto), not --cost {a.cost}", file=sys.stderr)
@@ -343,43 +446,13 @@ def main(argv: list[str] | None = None) -> int:
         ensure_parent_dir(path)  # before the run: results are written at its end
     from augur.cost import FixedCost
     from augur.sim.coordinator import Coordinator
-    from augur.sim.engine import EngineSpec, SimEngine
+    from augur.sim.engine import EngineSpec
     from augur.sim.models import estimate_weight_bytes, model_dir
     from augur.trace.workload import Workload
 
     cache_root = os.path.expanduser("~/.cache/augur/models")
-    auto = a.cost == "auto"
     try:
-        profile = None
-        if a.cost in ("tables", "auto"):
-            from augur.cost.tables import bundled_profile
-            plain = a.dp == 1 and not a.enable_expert_parallel and not a.profile_variant
-            if a.cost == "tables" or a.profile:
-                profile = a.profile or bundled_profile(a.hardware, a.model, a.tp)
-            elif plain:
-                try:
-                    profile = bundled_profile(a.hardware, a.model, a.tp)
-                    if a.tp > 1:
-                        _tp_params(a, *cpu_flags)  # a config the closed form does not cover: use the fork
-                except FileNotFoundError:
-                    pass
-                except ValueError:
-                    profile = None
-            a.cost = "tables" if profile else "llmservingsim"
-        if a.cost == "llmservingsim" and not a.replay_durations:
-            from augur.cost.profiles import check, shipped
-            try:
-                check(a.fork, a.hardware, a.model, a.tp, a.profile_variant)
-            except FileNotFoundError:
-                if not auto:
-                    raise
-                have = "\n".join(f"  {h} {m} {d} tp{t}" for h, m, d, t in shipped())
-                raise FileNotFoundError(
-                    f"no step-time profile for {a.model} on {a.hardware} (tp={a.tp}, dp={a.dp}). "
-                    f"Profiles shipped with augur (--cost tables, DP=1 and no expert parallelism):\n{have}\n"
-                    "For another model or GPU, point augur at an LLMServingSim fork that has the profile "
-                    "(--fork DIR or AUGUR_FORK=DIR; python -m augur.cost.profiles --fork DIR lists them), "
-                    "or use --cost fixed (a constant step time, no profile).") from None
+        profile = _pick_cost(a, cpu_flags)
         mdir = model_dir(a.fork, a.model, cache_root, a.model_config, profile)
     except FileNotFoundError as e:
         print(f"augur: {e}", file=sys.stderr)
@@ -441,8 +514,8 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"augur: {e}", file=sys.stderr)
             return 2
-        if a.speculative_method != "ngram" and a.dp > 1:
-            print("augur: eagle / eagle3 / mtp are not priced with --dp yet", file=sys.stderr)
+        if a.dp > 1:
+            print("augur: speculative decoding is not priced with --dp yet", file=sys.stderr)
             return 2
     spec = EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=kv_bytes,
                       max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
@@ -459,7 +532,6 @@ def main(argv: list[str] | None = None) -> int:
                       kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware,
                       kv_events=a.router == "kv-aware",
                       step_log_tag=bool(a.step_log_vllm) and a.num_engines > 1)
-    import dataclasses
     topology = None
     if a.contention == "on":
         from augur.sim.fabric import Topology
@@ -476,19 +548,12 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError, KeyError) as e:
             print(f"augur: --fabric: {e}", file=sys.stderr)
             return 2
-    net_of = (lambda i: topology.net(i)) if topology is not None else (lambda i: None)
-    if a.dp > 1:
-        engines = [SimEngine(i, dataclasses.replace(spec, data_parallel_size=a.dp, data_parallel_rank=i,
-                                                    enable_expert_parallel=a.enable_expert_parallel),
-                             replay_costs[i] if replay_costs else cost, net_of(i))
-                   for i in range(a.dp)]
-    elif a.prefill_engines:
-        roles = ["kv_producer"] * a.prefill_engines + ["kv_consumer"] * a.decode_engines
-        engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), replay_costs[i] if replay_costs else cost, net_of(i))
-                   for i, r in enumerate(roles)]
-    else:
-        engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost, net_of(i)) for i in range(a.engines)]
-    if topology is not None and a.hbm_interference != 0:
+    elif a.pd_contention == "decode" and a.prefill_engines:
+        from augur.sim.fabric import Topology  # each decode engine's pulls share its pd.<engine> link
+        topology = Topology.build([(i, a.tp) for i in range(a.num_engines)], nic_gbps=a.pd_link_bw,
+                                  pd_mode="decode-link")
+    engines = _build_engines(a, spec, cost, replay_costs, topology)
+    if a.contention == "on" and a.hbm_interference != 0:
         hbm_bw = a.hbm_bw_gbps or a.npu_mem_bw
         if hbm_bw is None:
             try:
@@ -508,15 +573,6 @@ def main(argv: list[str] | None = None) -> int:
                 e.ctx.hbm_interference, e.ctx.hbm_bw_gbps = k, float(hbm_bw)
     if hasattr(cost, "max_num_batched_tokens"):  # the fork's traces are built for the engine's real budget
         cost.max_num_batched_tokens = engines[0].vllm_config.scheduler_config.max_num_batched_tokens
-    if not a.replay_durations:  # a logged step's duration already holds its CPU time
-        for e in engines:
-            e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
-            e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
-            e.ctx.spec_ns_per_request = int(a.spec_us_per_request * 1e3)
-            e.ctx.step_time_scale = a.step_time_scale
-    if a.step_log:
-        for e in engines:
-            e.step_log = []
     from augur.sim.coordinator import PDLink
     replaying = bool(a.replay_durations or a.replay_arrivals)  # arrival times are engine-side: no client latencies
     if replaying:
@@ -569,34 +625,7 @@ def main(argv: list[str] | None = None) -> int:
             for e in engines:
                 for row in e.step_log:
                     w.writerow([e.engine_id, *row])
-    summary = rec.summary()
-    steps = sum(e.steps for e in engines)
-    cpu = sum(e.sched_cpu_s for e in engines)
-    if hasattr(cost, "oracle") and cost.oracle is not None:
-        summary["astra_runs"] = cost.oracle.runs
-    if coord.dp_group:
-        summary["dp_rounds"] = coord.dp_rounds
-        summary["dp_dummy_forwards"] = coord.dp_dummy_forwards
-    summary["async_scheduling"] = spec.async_scheduling
-    jobs = [x for e in engines if e.ctx.offload is not None for x in e.ctx.offload.job_ns]
-    if jobs:
-        def dist(ns):
-            ns = sorted(ns)
-            return {"n": len(ns), "mean_ms": round(sum(ns) / len(ns) / 1e6, 3),
-                    "p50_ms": round(ns[len(ns) // 2] / 1e6, 3), "p99_ms": round(ns[min(len(ns) - 1, int(0.99 * len(ns)))] / 1e6, 3)}
-        summary["offload_transfers"] = {kind: dist([ns for is_load, ns in jobs if is_load == (kind == "load")])
-                                        for kind in ("store", "load") if any(is_load == (kind == "load") for is_load, _ in jobs)}
-    if topology is not None:
-        summary["fabric"] = {"hosts": len({n for n in topology.gpu_of.values()}) and
-                             max(topology.gpu_of.values()) // topology.gpus_per_host + 1,
-                             "rate_recomputations": topology.fabric.recomputes}
-    if hasattr(cost, "steps_beyond_profile"):
-        summary["steps_beyond_profile"] = cost.steps_beyond_profile
-    summary.update({"engines": len(engines), "steps": steps, "wall_s": round(coord.wall_s, 2),
-                    "vllm_step_cpu_ms_per_step": round(1e3 * cpu / max(steps, 1), 3),
-                    "kv_cache_gib_per_engine": round(kv_bytes / 2**30, 2),
-                    "num_gpu_blocks": engines[0].vllm_config.cache_config.num_gpu_blocks})
-    print(json.dumps(summary, indent=2, default=float))
+    print(json.dumps(_summary(a, rec, coord, engines, cost, topology, kv_bytes), indent=2, default=float))
     return 0
 
 

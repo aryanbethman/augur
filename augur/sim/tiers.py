@@ -28,6 +28,7 @@ import weakref
 from collections import Counter, OrderedDict
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any, ClassVar
 
 import numpy as np
@@ -234,13 +235,9 @@ class SimMemoryTier(SecondaryTierManager):
         """Evict least recently used chunks, never ones being read, until
         ``needed`` more fit (or nothing more can go)."""
         excess = len(self._present) + len(self._writing) + needed - self.capacity
-        for k in list(self._present):
-            if excess <= 0:
-                return
-            if self._reading[k]:
-                continue
-            del self._present[k]
-            excess -= 1
+        if excess > 0:  # a store with room left must not walk a large tier's keys
+            for k in list(islice((k for k in self._present if not self._reading[k]), excess)):
+                del self._present[k]
 
     def _add_job(self, lane: _Lane, job_id: int, is_load: bool, keys: list, missing: list, now: int) -> None:
         nbytes = len(keys) * self.block_size_bytes

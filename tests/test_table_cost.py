@@ -291,3 +291,5 @@ def test_astra_runs_in_a_private_directory(monkeypatch):
     cost.step_ns(StepShape(seqs=(SeqWork(1, 100, True), SeqWork(64, 0, False))))
     assert seen and all(c == cost.oracle.workdir for c in seen)
     assert not os.path.exists(os.path.join(FORK, "serving", "tmp__mem", "remote_mem.json"))
+    left = [d for d, _, files in os.walk(os.path.join(cost.oracle.workdir, "workload")) if files]
+    assert all(d.endswith("event_handler") for d in left), left  # a run's round graphs are deleted after it

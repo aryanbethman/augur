@@ -94,9 +94,10 @@ def test_refusals(workload, tmp_path, capsys):
     assert "no eagle head" in capsys.readouterr().err  # vLLM 0.33 has Eagle3 for Qwen3, not Eagle
     assert main([*run, "--speculative-method", "mtp"]) == 2
     assert "defines no MTP layers" in capsys.readouterr().err
-    assert main(["--model", LLAMA, "--cost", "fixed", "--workload", workload, "--num-speculative-tokens", "3",
-                 "--speculative-method", "eagle", "--dp", "2"]) == 2
-    assert "--dp" in capsys.readouterr().err
+    for method in ("eagle", "ngram"):
+        assert main(["--model", LLAMA, "--cost", "fixed", "--workload", workload, "--num-speculative-tokens", "3",
+                     "--speculative-method", method, "--dp", "2"]) == 2
+        assert "--dp" in capsys.readouterr().err
 
 
 def test_draft_config_is_one_layer_of_the_targets_shape():
@@ -129,8 +130,9 @@ def test_tensor_parallel_drafter_pays_collectives():
     cost = TableCost(bundled_profile("H100", "meta-llama/Llama-3.1-70B", 4), cpu_mem_bw=512, link_bw=900,
                      link_latency_ns=0, npu_mem_bw=3350)
     one = StepShape(seqs=tuple(SeqWork(1, 800, True) for _ in range(8)))
-    base = sum(cost._draft_comm_ns(8, 8, n) for n in (1,))
-    assert cost._draft_comm_ns(8, 8, 2) > base > 0
+    _, all_reduce, _, all_gather = cost._ring_ns(8, 8)
+    base = 2 * all_reduce + all_gather  # one layer's two all-reduces, then the logits all-gather
+    assert all_reduce > 0 and all_gather > 0
     assert cost.draft_pass_ns(one, 1, 8, 2) > base
 
 

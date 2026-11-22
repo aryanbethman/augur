@@ -236,6 +236,8 @@ class AstraOracle:
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 p.kill()
+            for wl in set(wl_of_npu.values()):  # each round's graphs get a new folder; only the event graph is reused
+                shutil.rmtree(os.path.dirname(wl), ignore_errors=True)
         if os.environ.get("AUGUR_ASTRA_DEBUG"):
             print("ASTRA given", given, "done", done, file=sys.stderr, flush=True)
         # Each member's step runs from the round's first handover to its own

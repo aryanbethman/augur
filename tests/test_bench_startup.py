@@ -50,3 +50,21 @@ def test_bench_removes_its_working_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(bench, "_run", failed_run)
     assert bench.main(["--model", "m", "--dataset-name", "random", "--num-prompts", "1"]) == 3
     assert seen == [True] and list(tmp_path.iterdir()) == []
+
+
+def test_bench_step_logs_hold_the_reported_run_only(monkeypatch):
+    """The sensitivity runs share one process: logs from all three would overwrite or append to each other."""
+    from augur import bench
+    seen = []
+
+    def run(args, augur_args, trace, requests, offsets, tokenizer, scale):
+        seen.append((scale, "--step-log" in augur_args, "--step-log-vllm" in augur_args))
+        return 3 if len(seen) == 3 else (None, 0.0, 0.0)
+
+    monkeypatch.setattr("vllm.tokenizers.get_tokenizer", lambda *a, **k: None)
+    monkeypatch.setattr("vllm.benchmarks.datasets.datasets.get_samples", lambda args, tokenizer: [])
+    monkeypatch.setattr(bench, "_arrival_offsets", lambda requests, args: [])
+    monkeypatch.setattr(bench, "_run", run)
+    assert bench.main(["--model", "m", "--dataset-name", "random", "--num-prompts", "1",
+                       "--step-log", "s.csv", "--step-log-vllm", "v"]) == 3
+    assert seen == [(0.99, False, False), (1.0, True, True), (1.01, False, False)]

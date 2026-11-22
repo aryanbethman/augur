@@ -112,7 +112,7 @@ class LLMServingSimCost:
             return self._tg.generate_trace(
                 self._batch(shape), self.hardware, self.tp, 1, self.ep, self.ep,
                 max_num_batched_tokens=self.max_num_batched_tokens, dtype=self.dtype,
-                placement=self._placement, enable_block_copy=True,
+                placement=self._placement, enable_block_copy=True,  # same prices, ~10x faster
             )
         finally:
             os.chdir(cwd)
@@ -146,11 +146,19 @@ class LLMServingSimCost:
             os.chdir(cwd)
         return self.oracle.run_group(members, self.model, self.hardware, first_member=first_rank)
 
-    def _step_ns_astra(self, shape: StepShape) -> int:
+    def _astra_ns(self, trace) -> int:
         """compute (sum of layer latencies) + ASTRA-Sim's time for the rest.
 
         Checked exact against a full ASTRA-Sim run of the same trace for
         decode, mixed and prefill steps at TP2."""
+        comp = sum(int(r[1]) for r in trace.rows if len(r) == 11 and r[0] not in ("kv_load", "kv_evict"))
+        rows = [r for r in trace.rows if not (len(r) == 11 and r[0] in ("kv_load", "kv_evict"))]
+        return comp + self.oracle.comm_ns(rows, trace.header_line, self.model, self.hardware, self.tp)
+
+    def trace_rows(self, shape: StepShape) -> list:
+        return self._trace(shape).rows
+
+    def step_ns(self, shape: StepShape) -> int:
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         n_dec = len(dec)
@@ -161,47 +169,9 @@ class LLMServingSimCost:
         if hit is not None:
             return hit
         trace = self._trace(shape)
-        comp = sum(int(r[1]) for r in trace.rows if len(r) == 11 and r[0] not in ("kv_load", "kv_evict"))
-        rows = [r for r in trace.rows if not (len(r) == 11 and r[0] in ("kv_load", "kv_evict"))]
-        ns = comp + self.oracle.comm_ns(rows, trace.header_line, self.model, self.hardware, self.tp)
-        self._cache[key] = ns
-        return ns
-
-    def trace_rows(self, shape: StepShape) -> list:
-        cwd = os.getcwd()
-        os.chdir(self._run_dir)
-        try:
-            trace = self._tg.generate_trace(
-                self._batch(shape), self.hardware, self.tp, 1, self.ep, self.ep,
-                max_num_batched_tokens=self.max_num_batched_tokens, dtype=self.dtype,
-                placement=self._placement, enable_block_copy=True,
-            )
-        finally:
-            os.chdir(cwd)
-        return trace.rows
-
-    def step_ns(self, shape: StepShape) -> int:
         if self.oracle is not None:
-            return self._step_ns_astra(shape)
-        dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
-        pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
-        n_dec = len(dec)
-        dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1)
-        key = (pre, n_dec, dq, (sum(dec) // n_dec) if n_dec else 0, max(dec, default=0), min(dec, default=0),
-               shape.forward_tokens, len(shape.seqs))
-        hit = self._cache.get(key)
-        if hit is not None:
-            return hit
-        cwd = os.getcwd()
-        os.chdir(self._run_dir)
-        try:
-            trace = self._tg.generate_trace(
-                self._batch(shape), self.hardware, self.tp, 1, self.ep, self.ep,
-                max_num_batched_tokens=self.max_num_batched_tokens, dtype=self.dtype,
-                placement=self._placement, enable_block_copy=True,  # same prices, ~10x faster
-            )
-        finally:
-            os.chdir(cwd)
+            self._cache[key] = ns = self._astra_ns(trace)
+            return ns
         ns = 0
         for row in trace.rows:
             # Skip EXPERT/PIM markers (one field). With EP=1 they wrap a single
