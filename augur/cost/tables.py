@@ -225,8 +225,9 @@ class _Attention:
 
 # GPU memory bandwidth (GB/s) for hardware whose profiles carry none because the fork's
 # hardware_defaults has no entry for it. H100: SXM5 HBM3, 3.35 TB/s, the value the fork's H100
-# cluster configs set (an H100 PCIe has 2.0 TB/s: pass npu_mem_bw for it).
-NPU_MEM_BW_GBPS = {"H100": 3350.0}
+# cluster configs set (an H100 PCIe has 2.0 TB/s: pass npu_mem_bw for it). RTX 4060 Ti: 128-bit GDDR6 at
+# 18 Gb/s (also what --hbm-interference was fitted against).
+NPU_MEM_BW_GBPS = {"H100": 3350.0, "RTX4060Ti": 288.0}
 
 
 class OutsideRegime(ValueError):

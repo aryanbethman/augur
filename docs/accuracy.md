@@ -394,10 +394,43 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   host-to-GPU runs (`--d2h-duplex-penalty`), two GPUs independent on an idle
   host, host memory shared under CPU load (`--host-mem-background-gbps`;
   aggregates of 14 and 24 GB/s reproduced, the per-GPU asymmetry is not). A
-  step beside transfers takes t x (1 + 1.4 x PCIe rate / GPU memory
-  bandwidth), sampled at its start (`--hbm-interference`; measured +7%, +5%,
-  +11-12%). With contention off, outputs and the real-GPU replays are
-  unchanged; with it on, own-log replay is exact.
+  step beside transfers takes t x (1 + K x PCIe rate / GPU memory
+  bandwidth), sampled at its start, with K = 1.1 for decode-only steps
+  (`--hbm-interference`) and 0.1 for steps with prefill tokens
+  (`--hbm-interference-prefill`), fitted on real vLLM steps (below). With
+  contention off, outputs and the real-GPU replays are unchanged; with it on,
+  own-log replay is exact.
+
+  Checked against real contended runs (2026-11-23, one RTX 4060 Ti,
+  `KV_GIB=4 scripts/real_offload_check.sh`): SWE-bench 50 sessions with a
+  16 GiB CPU tier and the GPU KV cache cut to 4 GiB (37,440 tokens), so
+  138 GB is loaded back and 341-348 GB stored per run. Transfers ran at the
+  idle-host rates (12.6-12.8 GB/s loads, 12.3-13.0 stores): the link itself
+  was not contended, and the fabric agrees (the same transfers with and
+  without it). What the real runs do show is the GPU slowing down beside
+  transfers. Replaying each run through the fabric gives every real step's
+  PCIe rate; against steps with none, measured / predicted rose by
+  4.4% (async) and 5.6% (sync) for decode steps beside a one-way transfer
+  (8.9-11% with both directions), and by 0.1-0.8% for steps with prefill
+  (`scripts/fit_hbm_interference.py`): K = 0.99 / 1.25 for decode and
+  0.17 / 0.03 with prefill. The microbenchmark's 1.4 (a memory-bound GEMV
+  kernel) was too high for real steps, and for compute-bound ones by far.
+  End to end, mean TTFT / TPOT / latency (K fitted on these runs, so this is
+  a calibration, not a held-out check):
+
+  | Run | Contention off | On, K = 1.4 (before) | On, fitted K |
+  | --- | --- | --- | --- |
+  | async | −1.1 / −0.8 / −1.0% | +2.4 / −0.2 / +2.0% | −0.1 / −0.8 / −0.2% |
+  | sync | −0.6 / −1.0 / −0.5% | −0.9 / −1.2 / −0.7% | −0.8 / −0.2 / −0.7% |
+
+  Decisions: the async run replays exactly (24,373 / 24,373 steps); the sync
+  run 24,191 / 24,195: two requests whose CPU loads the real engine reported
+  done in step 2341 were scheduled a step apart in replay (open). Four host
+  processes streaming memory barely slow one GPU's copies (H2D −2%, D2H 0%;
+  the losses of 11-56% need both GPUs copying), so a loaded-host run on one
+  GPU was not made. Before 2026-11-23 `--hardware RTX4060Ti` had no GPU
+  memory bandwidth, so interference was off for it unless `--hbm-bw-gbps` was
+  given; it now defaults to 288 GB/s.
 
   What it changes, on SWE-bench sessions compressed 500x on 8 engines per
   host (Qwen3-1.7B, 16 GiB CPU tier each): with 100 GB/s of host memory and
@@ -406,7 +439,7 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   steps differ and mean TTFT rises 3.2%; with prefill/decode (4+4) and KV
   pulls sharing NICs at 12.5 GB/s, 82% of steps differ and p99 TPOT rises from
   27.4 to 29.8 ms. Wall time +2 to +7%. Not checked against contended real
-  runs at 8 GPUs per host.
+  runs at 8 GPUs per host (these numbers predate the fitted K).
 
 ## Not modeled yet
 

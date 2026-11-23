@@ -311,6 +311,21 @@ def test_hbm_interference_slows_steps_only_while_transfers_run(tmp_path, session
     assert sum(int(r["latency"]) for r in some) > sum(int(r["latency"]) for r in zero)
 
 
+def test_hbm_interference_k_depends_on_whether_the_step_has_prefill():
+    from augur.cost import SeqWork, StepShape
+    from augur.sim.executor import SimContext
+    topo = Topology.build([(0, 1)], h2d_gbps=12.0)
+    topo.fabric.submit("load", None, topo.net(0).load_path(), 10**9, 0)
+    topo.fabric.advance(0)
+    ctx = SimContext(None, None, net=topo.net(0), hbm_interference=1.1, hbm_interference_prefill=0.1,
+                     hbm_bw_gbps=288.0)
+    decode = StepShape(seqs=(SeqWork(1, 100, True),))
+    mixed = StepShape(seqs=(SeqWork(1, 100, True), SeqWork(64, 0, False)))
+    assert ctx.interference_factor(decode) == pytest.approx(1 + 1.1 * 12 / 288)
+    assert ctx.interference_factor(mixed) == pytest.approx(1 + 0.1 * 12 / 288)
+    assert SimContext(None, None, net=topo.net(0), hbm_bw_gbps=288.0).interference_factor(decode) == 1.0  # K = 0: none
+
+
 def test_topology_default_paths_and_packing():
     topo = Topology.build([(0, 2), (1, 2), (2, 4), (3, 1)], gpus_per_host=4, h2d_gbps=25.0, mem_gbps=100.0,
                           tiers={"cxl": 30.0})

@@ -244,9 +244,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="--contention on: host memory bandwidth other work takes (a loaded host); the default "
                         "assumes an idle host")
     p.add_argument("--hbm-interference", type=float, default=None, metavar="K",
-                   help="--contention on: a step runs t * (1 + K * r / HBM bandwidth) where r is what the GPU's PCIe "
-                        "flows move when the step starts (default 1.4, measured on an RTX 4060 Ti: +7%% under an H2D "
-                        "copy, +5%% D2H, +11-12%% both, at 288 GB/s; 0: none). Not applied in replays")
+                   help="--contention on: a decode-only step runs t * (1 + K * r / HBM bandwidth) where r is what the "
+                        "GPU's PCIe flows move when the step starts (default 1.1, fitted on two real vLLM offload runs "
+                        "on an RTX 4060 Ti, 288 GB/s: 0.99 async, 1.25 sync; 0: none). Not applied in replays")
+    p.add_argument("--hbm-interference-prefill", type=float, default=None, metavar="K",
+                   help="--contention on: K for steps with prefill tokens (default 0.1, fitted on the same runs: 0.17 "
+                        "async, 0.03 sync; compute-bound steps are hardly slowed; 0 when --hbm-interference is 0)")
     p.add_argument("--hbm-bw-gbps", type=float, default=None,
                    help="GPU memory bandwidth for --hbm-interference (default: --npu-mem-bw, else the fork's for --hardware)")
     p.add_argument("--replay-durations", default=None,
@@ -554,7 +557,11 @@ def main(argv: list[str] | None = None) -> int:
         topology = Topology.build([(i, a.tp) for i in range(a.num_engines)], nic_gbps=a.pd_link_bw,
                                   pd_mode="decode-link")
     engines = _build_engines(a, spec, cost, replay_costs, topology)
-    if a.contention == "on" and a.hbm_interference != 0:
+    k_decode = 1.1 if a.hbm_interference is None else a.hbm_interference
+    k_prefill = a.hbm_interference_prefill
+    if k_prefill is None:  # --hbm-interference 0 alone turns interference off for every step
+        k_prefill = 0.0 if a.hbm_interference == 0 else 0.1
+    if a.contention == "on" and (k_decode or k_prefill):
         hbm_bw = a.hbm_bw_gbps or a.npu_mem_bw
         if hbm_bw is None:
             try:
@@ -562,16 +569,19 @@ def main(argv: list[str] | None = None) -> int:
                 hbm_bw = _npu_mem_bw_default(a.fork, a.hardware)
             except Exception:  # no fork on this machine
                 hbm_bw = None
+        if hbm_bw is None:
+            from augur.cost.tables import NPU_MEM_BW_GBPS
+            hbm_bw = NPU_MEM_BW_GBPS.get(a.hardware)
         if not hbm_bw:
-            if a.hbm_interference is not None:
+            if a.hbm_interference is not None or a.hbm_interference_prefill is not None:
                 print("augur: --hbm-interference needs the GPU memory bandwidth: give --hbm-bw-gbps", file=sys.stderr)
                 return 2
             print("augur: no GPU memory bandwidth known for --hardware %s: steps are not slowed by PCIe traffic "
                   "(give --hbm-bw-gbps to model it)" % a.hardware, file=sys.stderr)
         else:
-            k = 1.4 if a.hbm_interference is None else a.hbm_interference
             for e in engines:
-                e.ctx.hbm_interference, e.ctx.hbm_bw_gbps = k, float(hbm_bw)
+                e.ctx.hbm_interference, e.ctx.hbm_interference_prefill = k_decode, k_prefill
+                e.ctx.hbm_bw_gbps = float(hbm_bw)
     if hasattr(cost, "max_num_batched_tokens"):  # the fork's traces are built for the engine's real budget
         cost.max_num_batched_tokens = engines[0].vllm_config.scheduler_config.max_num_batched_tokens
     from augur.sim.coordinator import PDLink

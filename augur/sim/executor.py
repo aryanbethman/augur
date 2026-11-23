@@ -102,16 +102,20 @@ class SimContext:
     offload: Any = None
     # Contention (--contention on): this engine's view of the transfer fabric (augur.sim.fabric.Net), and
     # how much a step is slowed by the PCIe traffic beside it: t * (1 + k * rate / hbm_bw), the rate of the
-    # GPU's PCIe flows sampled when the step starts.
+    # GPU's PCIe flows sampled when the step starts; k is hbm_interference for a decode-only step and
+    # hbm_interference_prefill for one with prefill tokens (compute-bound work feels the copies less).
     net: Any = None
     hbm_interference: float = 0.0
+    hbm_interference_prefill: float = 0.0
     hbm_bw_gbps: float = 0.0
 
-    def interference_factor(self) -> float:
-        """1 + k * (bytes per ns now moving over this GPU's PCIe links) / HBM bandwidth; 1 without contention."""
-        if not self.hbm_interference or self.net is None:
+    def interference_factor(self, shape: StepShape | None = None) -> float:
+        """1 + k * (bytes per ns now moving over this GPU's PCIe links) / HBM bandwidth for a step of ``shape``;
+        1 without contention. Called by: Executor.execute_model, Coordinator._scaled."""
+        k = self.hbm_interference_prefill if shape is not None and shape.num_prefill else self.hbm_interference
+        if not k or self.net is None:
             return 1.0
-        return 1.0 + self.hbm_interference * self.net.interference_rate() / self.hbm_bw_gbps
+        return 1.0 + k * self.net.interference_rate() / self.hbm_bw_gbps
     now_ns: int = 0
     gpu_free_ns: int = 0
     last_offload_wait_ns: int = 0  # the step's wait for flushed stores / sync loads (DP rounds add it to the CPU term)
@@ -386,8 +390,8 @@ class SimWorker:
                 gpu = round(gpu * self.ctx.step_time_scale)
             if self.ctx.spec_ns_per_request and not hasattr(self.ctx.cost, "durations"):
                 gpu += self.ctx.spec_ns_per_request * sum(1 for x in seqs if x.is_decode and x.num_new > 1)
-            if self.ctx.hbm_interference and self.ctx.net is not None and not hasattr(self.ctx.cost, "durations"):
-                gpu = round(gpu * self.ctx.interference_factor())
+            if self.ctx.net is not None and not hasattr(self.ctx.cost, "durations"):
+                gpu = round(gpu * self.ctx.interference_factor(shape))
             cpu = (self.ctx.cpu_fixed_ns + self.ctx.cpu_per_request_ns * len(seqs)) if seqs else 0
             if not hasattr(self.ctx.cost, "durations"):  # a replayed duration already holds its stalls
                 cpu += forward_ready - self.ctx.now_ns  # offload waits (flushed stores, sync loads) hold the step

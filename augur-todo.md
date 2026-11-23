@@ -17,6 +17,10 @@ audit fixes (2026-11-18), --profile-variant (2026-11-19).
 
 Contention-aware co-simulation (design doc) is merged (2026-11-21), off by default (`--contention on`).
 
+2026-11-23 (branch feature/next-features-20261123): RTX 4060 Ti profile with q=1,2,4 attention (fork e8625e0, not
+pushed); MoE TP4 on the tables (projected bundle); contention checked against two real offload runs and
+--hbm-interference refitted (decode 1.1, prefill 0.1).
+
 ## Verification runs, once the GPUs and CPUs are free
 1. [x] Rerun the PD async comparisons after the async loop fix: async PD moved 0.5% mean TTFT; sync identical
 2. [x] 256-GPU scale run with the table pricer: 20 s, 1.5 GB RSS, byte-identical to the ASTRA-priced run
@@ -30,7 +34,8 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
    study; a short pilot on the RTX 4060 Ti first to shake out the memory probe
 
 ## Next features (proposed order, no runs needed)
-1. Contention: validate against real contended runs  2. Shipped profiles with decode query lengths 1,2,4  3. MoE TP4 and DP+EP on the tables
+Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 on
+the tables. Left: DP+EP on the tables (section 6), the sync replay difference (section 4).
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
@@ -98,9 +103,20 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
       on`, `--fabric`, `--host-mem-gbps`, `--host-mem-background-gbps`, `--pcie-root-gbps`, `--d2h-duplex-penalty`,
       `--hbm-interference`. Off by default and byte-identical (six real-GPU replays exact); own-log replay exact
       with it on. Matters little on an idle host; strongly for PD pulls on shared NICs and for a busy host memory
-- [ ] Contention: calibrate --hbm-interference (1.4, one 4060 Ti) and host memory on more hosts; two-socket hosts;
-      real contended offload/PD runs at several GPUs per host; poll-time waits use projected flow ends; host memory
-      shares fairly and does not reproduce the measured per-GPU asymmetry
+- [x] Contention against real contended runs (2026-11-23, one 4060 Ti, SWE-bench 50 sessions, 16 GiB CPU tier, GPU
+      KV cut to 4 GiB so 138 GB comes back from CPU per run; async and sync). Links ran at idle rates (fabric agrees).
+      Real steps beside a transfer are slower: decode +4.4/+5.6% one way, steps with prefill +0.1-0.8%. Fitted
+      --hbm-interference 1.1 for decode-only steps and the new --hbm-interference-prefill 0.1 (was 1.4 for all, from
+      a GEMV microbenchmark: async e2e +2.4% TTFT, now −0.1%). RTX4060Ti now has a 288 GB/s default (interference
+      was silently off for it). Scripts: real_offload_check.sh KV_GIB / HOST_LOAD, fit_hbm_interference.py,
+      step_xfer_slowdown.py, host_mem_load.py; stepcheck --csv records each step's transfer bytes
+- [ ] Sync replay of the 4 GiB-KV offload run: 24,191 / 24,195 steps (two requests whose CPU loads finished in real
+      step 2341 are scheduled a step apart; augur-next-20261123/augur-src/out/real/swe50_offload16_kv4 on anjuna3).
+      Async replays exactly
+- [ ] Contention: K and host memory on more hosts and GPUs (fitted on the same two runs, one 4060 Ti); two-socket
+      hosts; real contended runs at several GPUs per host (GPU 1 here is clock-locked); a transfer-bound run (here
+      transfers overlapped ~8% of steps); poll-time waits use projected flow ends; host memory shares fairly and
+      does not reproduce the measured per-GPU asymmetry
 - [~] Multi-GPU offload: two GPUs do not contend on an idle host, but under memory-bound CPU load aggregate copy
       bandwidth falls 25-33% (2026-11-21, two-GPU benchmark): the fabric models it as shared host memory
       (--host-mem-background-gbps); the per-GPU asymmetry is not reproduced
