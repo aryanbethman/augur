@@ -307,6 +307,7 @@ class Coordinator:
         rid = self.request_ids.get(call_id, call_id)
         self._call_of_rid.pop(rid, None)
         eng.ctx.output_ids.pop(call_id + "@d" if self.pd else rid, None)
+        eng.ctx.recorded.discard(call_id + "@d" if self.pd else rid)
         if call.session_id is not None:
             s = self._sessions[call.session_id]
             if s.next_index < len(s.sub_requests):

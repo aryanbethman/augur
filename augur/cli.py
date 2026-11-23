@@ -167,7 +167,14 @@ def _parser() -> argparse.ArgumentParser:
                         "with --attention-decode-q-lens, else attention is priced as a one-token decode). Ignored "
                         "with --replay-durations")
     p.add_argument("--spec-accept-rate", type=float, default=0.7,
-                   help="probability each draft token is accepted (content decides this on a GPU)")
+                   help="probability each draft token is accepted. Used only for calls that have no recorded output "
+                        "ids (--no-recorded-outputs, or a trace/--replay-tokens that lacks them) and for EAGLE/MTP: "
+                        "with ngram, a call whose outputs are all recorded drafts with the model runner's own ngram "
+                        "drafter (V2: NgramGPUSpeculator) over its real context and accepts the drafts that equal "
+                        "the next recorded ids, as a GPU would")
+    p.add_argument("--spec-rate-only", action="store_true",
+                   help="ngram: accept drafts at --spec-accept-rate even for calls with recorded output ids "
+                        "(the drafter then proposes the recorded next ids)")
     p.add_argument("--dp", type=int, default=1, help="DP ranks in one lockstep group (vLLM data_parallel_size)")
     p.add_argument("--enable-expert-parallel", action="store_true", help="MoE experts split across DP x TP ranks")
     p.add_argument("--pd-link-bw", type=float, default=16.0, help="PD KV pull bandwidth, GB/s")
@@ -626,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
                       enforce_eager=a.enforce_eager,
                       async_scheduling=a.async_scheduling,
                       speculative=speculative,
-                      spec_accept_rate=a.spec_accept_rate,
+                      spec_accept_rate=a.spec_accept_rate, spec_rate_only=a.spec_rate_only,
                       scheduler_cls=scheduler_cls, scheduling_policy=a.scheduling_policy,
                       kv_cache_dtype=a.kv_cache_dtype, num_gpu_blocks=a.num_gpu_blocks,
                       kv_offload_gib=a.kv_offload_gib,
