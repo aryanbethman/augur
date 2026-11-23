@@ -4,9 +4,16 @@
 the workload file the run replayed, and writes ``<out>/requests.json``: one row per
 call, in arrival order, with
 
-* ``arrival_s``: when the call reached the engine (the step log's ``add`` event, seconds
-  after the log's first step starts, never before 0). Every simulator
-  gets these arrivals, so no simulator models a front end (HTTP, tokenizer);
+* ``arrival_s``: when the call reached the engine in the real run (the step log's ``add`` event,
+  seconds after the log's first step starts, never before 0). The replay rows of every simulator take
+  these. No simulator models a front end (HTTP, tokenizer);
+* ``arrival_trace_s``, ``tool_wait_s``, ``frontend_s``, ``delivery_s``: augur's normal arrival process: a flat
+  request or a session's first call is sent at the trace's time and reaches the engine a front end
+  (3.4 ms + 3 us per prompt token) later; a session's next call is sent the previous call's tool wait plus
+  8 ms (delivery) after that call completes, and reaches the engine a front end later;
+* ``arrival_aug_s`` (``arrivals``, after augur's normal run): when each call reached the engine in that run.
+  Vidur and Frontier, which cannot loop a session through their own completions, and BLIS's flat requests take
+  these; BLIS loops sessions itself (``think_time_us``);
 * ``input``, ``output``: prompt and output token counts;
 * ``blocks``: the prompt's full 16-token blocks as chained hashes (vLLM's prefix-cache
   keys), from the workload's token ids;
@@ -55,7 +62,7 @@ import os
 import re
 import sys
 
-from augur.trace.workload import call_id
+from augur.trace.workload import Session, Workload, call_id
 from augur.verify.replay import ReplayWorkload, is_async, read_log, steps
 
 BLOCK = 16
@@ -140,11 +147,29 @@ def prepare(a) -> int:
                 run_dir=os.path.abspath(a.run_dir))
     wl = ReplayWorkload(a.workload, log_path=log, recorded_outputs=False, filler_vocab=150000)
     calls = list(wl.entries())  # arrival_ns: engine arrival, session chaining off
+    # What the trace itself says, for the normal arrival process: when each flat request and each session's first
+    # call is sent, and how long a session waits after each call (tool time).
+    plain = Workload(a.workload, recorded_outputs=False, filler_vocab=150000)
+    sent, wait = {}, {}
+    for e in plain.entries():
+        if isinstance(e, Session):
+            for i in range(len(e.sub_requests)):
+                c = plain.next_call(e, 0)
+                wait[c.call_id] = c.tool_wait_ns / 1e9
+            sent[f"{e.session_id}#0"] = e.arrival_ns / 1e9
+        else:
+            sent[e.call_id] = e.arrival_ns / 1e9
     real = _real_requests(events)
     rows = []
     for c in calls:
+        fe = (a.frontend_latency_ms * 1e3 + a.frontend_us_per_token * len(c.prompt_ids)) / 1e6
         rows.append({"call_id": c.call_id, "arrival_s": c.arrival_ns / 1e9, "input": len(c.prompt_ids),
-                     "output": c.output_toks, "blocks": _block_hashes(c.prompt_ids), "real": real.get(c.call_id)})
+                     "output": c.output_toks, "blocks": _block_hashes(c.prompt_ids), "real": real.get(c.call_id),
+                     # a flat request's and a session's first call's engine arrival in augur's normal run: sent at the
+                     # trace's time, a front end earlier than it reaches the engine; None for a later call
+                     "arrival_trace_s": sent[c.call_id] + fe if c.call_id in sent else None,
+                     "tool_wait_s": wait.get(c.call_id, 0.0), "frontend_s": fe,
+                     "delivery_s": a.delivery_latency_ms / 1e3})
     # Time zero is the first step's start (the engine adds a request just before the schedule that takes it): a
     # simulator whose first step starts at its first arrival then has every step on the real run's timeline, and
     # a request is never added at the very instant a step starts.
@@ -160,8 +185,18 @@ def prepare(a) -> int:
             "add_s": (rr["add"] - t0) / 1e9, "first_s": None if rr["first"] is None else (rr["first"] - t0) / 1e9,
             "fin_s": None if rr["fin"] is None else (rr["fin"] - t0) / 1e9, "out": rr["out"], "pre": rr["pre"]}
     _map_prefixes(rows, meta)
+    # top-level entries of the trace the real run sent (a flat request, or a whole session), for augur's --num-entries
+    meta["num_entries"] = len({r["call_id"].rsplit("#", 1)[0] if "#" in r["call_id"] else r["call_id"] for r in rows})
     if meta["spec_k"]:
         meta["acceptance"] = _acceptance(events, meta["spec_k"])
+        acc = meta["acceptance"]["mean_tokens_per_step"] - 1  # accepted drafts per decode request-step
+        # augur's --spec-accept-rate is a per-position probability: p + p^2 + ... + p^k accepted drafts per step
+        lo, hi = 0.0, 1.0
+        for _ in range(60):
+            p = (lo + hi) / 2
+            lo, hi = (p, hi) if sum(p ** i for i in range(1, meta["spec_k"] + 1)) < acc else (lo, p)
+        meta["acceptance"]["accepted_per_step"] = acc
+        meta["acceptance"]["spec_p"] = round((lo + hi) / 2, 4)
     os.makedirs(a.out, exist_ok=True)
     json.dump({"requests": rows}, open(os.path.join(a.out, "requests.json"), "w"))
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=1)
@@ -238,61 +273,94 @@ def _load(out: str) -> tuple[list[dict], dict]:
     return json.load(open(os.path.join(out, "requests.json")))["requests"], json.load(open(os.path.join(out, "meta.json")))
 
 
+def arrivals(a) -> int:
+    """After augur's normal run: when each call reached the engine in it (seconds after its first add), as
+    ``arrival_aug_s``. A simulator that cannot loop a session through its own completions takes these."""
+    log = sorted(glob.glob(os.path.join(a.out, "augur_steps.*.jsonl")))[-1]
+    rows, meta = _load(a.out)
+    idx = {r["call_id"]: i for i, r in enumerate(rows)}
+    add = {idx[call_id(e["rid"])]: e["t"] for e in read_log(log) if e["ev"] == "add" and call_id(e["rid"]) in idx}
+    t0 = min(add.values())
+    for i, r in enumerate(rows):
+        r["arrival_aug_s"] = (add[i] - t0) / 1e9 if i in add else None
+    json.dump({"requests": rows}, open(os.path.join(a.out, "requests.json"), "w"))
+    return 0
+
+
+def _arrival(r: dict, replay: bool) -> float:
+    """The engine arrival a simulator is given: the real run's (replay), else augur's normal run's."""
+    return r["arrival_s"] if replay or r.get("arrival_aug_s") is None else r["arrival_aug_s"]
+
+
 def vidur(a) -> int:
     rows, _ = _load(a.out)
-    with open(os.path.join(a.out, "vidur.csv"), "w") as f:
-        f.write("arrived_at,num_prefill_tokens,num_decode_tokens\n")
-        for r in rows:
-            f.write(f"{r['arrival_s']:.9f},{r['input']},{r['output']}\n")
+    for v in ("", "_replay"):
+        with open(os.path.join(a.out, f"vidur{v}.csv"), "w") as f:
+            f.write("arrived_at,num_prefill_tokens,num_decode_tokens\n")
+            for r in rows:
+                f.write(f"{_arrival(r, bool(v)):.9f},{r['input']},{r['output']}\n")
     return 0
 
 
 def frontier(a) -> int:
     rows, _ = _load(a.out)
-    sessions: dict[str, int] = {}
-    with open(os.path.join(a.out, "frontier.csv"), "w") as f:
-        f.write("arrived_at,num_prefill_tokens,num_decode_tokens,session_id,block_hash_ids\n")
-        for i, r in enumerate(rows):
-            sid = r["call_id"].rsplit("#", 1)[0] if "#" in r["call_id"] else r["call_id"]
-            f.write(f"{r['arrival_s']:.9f},{r['input']},{r['output']},{sessions.setdefault(sid, len(sessions))},"
-                    f"{'|'.join(map(str, r['blocks']))}\n")
+    for v in ("", "_replay"):
+        sessions: dict[str, int] = {}
+        with open(os.path.join(a.out, f"frontier{v}.csv"), "w") as f:
+            f.write("arrived_at,num_prefill_tokens,num_decode_tokens,session_id,block_hash_ids\n")
+            for i, r in enumerate(rows):
+                sid = r["call_id"].rsplit("#", 1)[0] if "#" in r["call_id"] else r["call_id"]
+                f.write(f"{_arrival(r, bool(v)):.9f},{r['input']},{r['output']},{sessions.setdefault(sid, len(sessions))},"
+                        f"{'|'.join(map(str, r['blocks']))}\n")
     return 0
 
 
 def blis(a) -> int:
+    """blis.yaml/blis.csv: the normal arrival process (a flat request at augur's engine arrival; a session's first
+    call likewise and each later call think_time_us after the previous one completes, closed loop). blis_replay.*:
+    every call at its real arrival (``replay --session-mode fixed-accumulate`` for sessions)."""
     rows, meta = _load(a.out)
     sessions = any("#" in r["call_id"] for r in rows)
-    open(os.path.join(a.out, "blis.yaml"), "w").write(
-        "trace_version: 4\ntime_unit: microseconds\nmode: converted\nworkload_seed: 1\n"
-        + ("session_context_growth: accumulate\n" if sessions else ""))
-    cols = ("request_id,client_id,tenant_id,slo_class,session_id,round_index,prefix_group,prefix_length,streaming,"
-            "input_tokens,output_tokens,text_tokens,image_tokens,audio_tokens,video_tokens,reason_ratio,model,"
-            "deadline_us,arrival_time_us,first_chunk_time_us,last_chunk_time_us,status"
-            + (",input_tokens_reset" if sessions else "") + "\n")
-    last: dict[str, dict] = {}  # session -> previous round
-    with open(os.path.join(a.out, "blis.csv"), "w") as f:
-        f.write(cols)
-        for i, r in enumerate(rows):
-            sid, rnd, tail = "", 0, ""
-            if "#" in r["call_id"]:
-                sid, idx = r["call_id"].rsplit("#", 1)
-                rnd = int(idx)
-                prev = last.get(sid)
-                grown = prev["input"] + prev["output"] if prev else 0
-                # the trace's delta law: round n's input = round n-1's input + output + delta; a round that
-                # is shorter than that is a compaction, stated as a reset to its absolute length
-                if prev is None:
-                    n_in, tail = r["input"], ","
-                elif r["input"] >= grown:
-                    n_in, tail = r["input"] - grown, ","
+    for v in ("", "_replay"):
+        replay = bool(v)
+        think = sessions and not replay
+        open(os.path.join(a.out, f"blis{v}.yaml"), "w").write(
+            "trace_version: 4\ntime_unit: microseconds\nmode: converted\nworkload_seed: 1\n"
+            + ("session_context_growth: accumulate\n" if sessions else ""))
+        cols = ("request_id,client_id,tenant_id,slo_class,session_id,round_index,prefix_group,prefix_length,streaming,"
+                "input_tokens,output_tokens,text_tokens,image_tokens,audio_tokens,video_tokens,reason_ratio,model,"
+                "deadline_us,arrival_time_us,first_chunk_time_us,last_chunk_time_us,status"
+                + (",think_time_us" if think else "") + (",input_tokens_reset" if sessions else "") + "\n")
+        last: dict[str, dict] = {}  # session -> previous round
+        with open(os.path.join(a.out, f"blis{v}.csv"), "w") as f:
+            f.write(cols)
+            for i, r in enumerate(rows):
+                sid, rnd, tail, tt = "", 0, "", ""
+                if "#" in r["call_id"]:
+                    sid, idx = r["call_id"].rsplit("#", 1)
+                    rnd = int(idx)
+                    prev = last.get(sid)
+                    grown = prev["input"] + prev["output"] if prev else 0
+                    # the trace's delta law: round n's input = round n-1's input + output + delta; a round that
+                    # is shorter than that is a compaction, stated as a reset to its absolute length
+                    if prev is None:
+                        n_in, reset = r["input"], ""
+                    elif r["input"] >= grown:
+                        n_in, reset = r["input"] - grown, ""
+                    else:
+                        n_in, reset = 0, str(r["input"])
+                    if think:
+                        # as augur's loop: the previous call's tool wait and delivery, then a front end
+                        tt = "" if prev is None else str(round((prev["tool_wait_s"] + r["delivery_s"] + r["frontend_s"]) * 1e6))
+                        tail = f",{tt},{reset}"
+                    else:
+                        tail = f",{reset}"
+                    last[sid] = r
                 else:
-                    n_in, tail = 0, f",{r['input']}"
-                last[sid] = r
-            else:
-                # input_tokens is what follows the shared prefix (the replay prepends the group's prefix)
-                n_in = r["input"] - r["prefix_len"]
-            f.write(f"{i},c,,,{sid},{rnd},{r['prefix_group']},{r['prefix_len']},false,{n_in},{r['output']},0,0,0,0,0,,0,"
-                    f"{round(r['arrival_s'] * 1e6)},0,0,ok{tail}\n")
+                    # input_tokens is what follows the shared prefix (the replay prepends the group's prefix)
+                    n_in = r["input"] - r["prefix_len"]
+                f.write(f"{i},c,,,{sid},{rnd},{r['prefix_group']},{r['prefix_len']},false,{n_in},{r['output']},0,0,0,0,0,,0,"
+                        f"{round(_arrival(r, replay) * 1e6)},0,0,ok{tail}\n")
     spec = ""
     if meta["spec_k"]:
         s = meta["spec"]
@@ -349,13 +417,18 @@ def main(argv=None) -> int:
     pr.add_argument("run_dir")
     pr.add_argument("workload")
     pr.add_argument("out")
+    # augur's front-end and delivery defaults (augur.cli), which its normal run applies to every call
+    pr.add_argument("--frontend-latency-ms", type=float, default=3.4)
+    pr.add_argument("--frontend-us-per-token", type=float, default=3.0)
+    pr.add_argument("--delivery-latency-ms", type=float, default=8.0)
+    sub.add_parser("arrivals").add_argument("out")
     for n in ("vidur", "frontier", "blis"):
         sub.add_parser(n).add_argument("out")
     g = sub.add_parser("get")
     g.add_argument("out")
     g.add_argument("key")
     a = p.parse_args(argv)
-    return {"prepare": prepare, "vidur": vidur, "frontier": frontier, "blis": blis, "get": get}[a.cmd](a)
+    return {"prepare": prepare, "vidur": vidur, "frontier": frontier, "blis": blis, "get": get, "arrivals": arrivals}[a.cmd](a)
 
 
 if __name__ == "__main__":

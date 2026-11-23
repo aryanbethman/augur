@@ -48,13 +48,13 @@ prepare() {
 augur() {
   local extra=""
   [ "$(get async_scheduling)" = true ] && extra="--async-scheduling" || extra="--no-async-scheduling"
-  local k=$(get spec_k); [ "$k" != 0 ] && extra="$extra --num-speculative-tokens $k --spec-accept-rate $(get acceptance.accepted_per_scheduled)"
-  local g=$(get kv_offloading_gib); [ -n "$g" ] && extra="$extra --kv-offload-gib $g"
+  local k=$(get spec_k); [ "$k" != 0 ] && extra="$extra --num-speculative-tokens $k --spec-accept-rate $(get acceptance.spec_p)"
+  local g=$(get kv_offloading_gib); [ -n "$g" ] && extra="$extra --kv-offload-gib $g --kv-offload-gbps 12.7"
   rm -f $O/augur_steps.*.jsonl
   $PY -m augur.cli --model Qwen/Qwen3-1.7B --hardware RTX4060Ti --cost tables --num-gpu-blocks $(get num_gpu_blocks) \
     --max-num-seqs $(get max_num_seqs) --max-num-batched-tokens $(get max_num_batched_tokens) \
     --max-model-len $(get max_model_len) $extra --step-cpu-us 2000 --no-recorded-outputs --filler-vocab 150000 --quiet \
-    --workload $wl --replay-arrivals $(get step_log) --step-log-vllm $O/augur_steps --output $O/augur.csv > $O/augur.log 2>&1
+    --workload $wl --num-entries $(get num_entries) --step-log-vllm $O/augur_steps --output $O/augur.csv > $O/augur.log 2>&1
 }
 
 blis_build() {
@@ -72,19 +72,22 @@ blis_build() {
 blis() {
   blis_build || return 1
   local mml=$(get max_model_len) flags="" k=$(get spec_k)
-  grep -q accumulate $O/blis.yaml && flags="--session-mode fixed-accumulate"
+  # sessions: closed loop (think times in the trace) in the normal run, recorded arrivals in the replay
+  if grep -q accumulate $O/blis$V.yaml; then
+    [ -n "$V" ] && flags="--session-mode fixed-accumulate" || flags="--session-mode closed-loop"
+  fi
   if [ "$k" != 0 ]; then
     flags="$flags --speculative-acceptance-length $(get acceptance.mean_tokens_per_step)"; export BLIS_SPEC_K=$k
   fi
   [ "$(get async_scheduling)" = true ] && export BLIS_PRICER_NO_CPU=1 || unset BLIS_PRICER_NO_CPU
-  # KV offload transfers as augur prices them: its default link, 256 GB/s, and Qwen3-1.7B's block (28 layers x 2 x 8 KV
-  # heads x 128 x 2 bytes x 16 tokens)
-  [ -n "$(get kv_offloading_gib)" ] && export BLIS_OFFLOAD_GBPS=256 BLIS_OFFLOAD_BLOCK_BYTES=1835008
+  # KV offload transfers as augur's control prices them: the PCIe rate measured on the real runs (12.7 GB/s), and
+  # Qwen3-1.7B's block (28 layers x 2 x 8 KV heads x 128 x 2 bytes x 16 tokens)
+  [ -n "$(get kv_offloading_gib)" ] && export BLIS_OFFLOAD_GBPS=12.7 BLIS_OFFLOAD_BLOCK_BYTES=1835008
   rm -f $O/blis_steps$V.jsonl
   BLIS_PRICER_CMD="env PYTHONPATH=$W VLLM_LOGGING_LEVEL=ERROR $PY $S/pricer.py serve --max-model-len $mml $PX" \
   BLIS_NUM_GPU_BLOCKS=$(get num_gpu_blocks) BLIS_STEP_LOG=$O/blis_steps$V.jsonl \
-    $BASE/inference-sim/blis-ext replay --scenarios $O/scen --scenario scenario.yaml --trace-header $O/blis.yaml \
-      --trace-data $O/blis.csv $flags --output $O/blis_result$V.json > $O/blis$V.log 2>&1
+    $BASE/inference-sim/blis-ext replay --scenarios $O/scen --scenario scenario.yaml --trace-header $O/blis$V.yaml \
+      --trace-data $O/blis$V.csv $flags --output $O/blis_result$V.json > $O/blis$V.log 2>&1
   unset BLIS_SPEC_K BLIS_PRICER_NO_CPU BLIS_OFFLOAD_GBPS BLIS_OFFLOAD_BLOCK_BYTES
 }
 
@@ -105,7 +108,7 @@ frontier() {
       --vllm_v1_scheduler_config_num_blocks_mode explicit --vllm_v1_scheduler_config_num_blocks $(get num_gpu_blocks) \
       --vllm_v1_scheduler_config_watermark_blocks_fraction 0 --vllm_v1_scheduler_config_enable_chunked_prefill \
       --vllm_v1_scheduler_config_enable_prefix_caching --decode_cuda_graph_mode none \
-      --request_generator_config_type trace_replay --trace_request_generator_config_trace_file $O/frontier.csv \
+      --request_generator_config_type trace_replay --trace_request_generator_config_trace_file $O/frontier$V.csv \
       --trace_request_generator_config_max_tokens $mml \
       --random_forrest_execution_time_predictor_config_enable_dummy_mode \
       --random_forrest_execution_time_predictor_config_dummy_execution_time_ms 1.0 \
@@ -127,7 +130,7 @@ vidur() {
       --replica_scheduler_config_type sarathi --sarathi_scheduler_config_batch_size_cap $(get max_num_seqs) \
       --sarathi_scheduler_config_chunk_size $(get max_num_batched_tokens) --sarathi_scheduler_config_block_size 16 \
       --sarathi_scheduler_config_num_blocks $(get num_gpu_blocks) --sarathi_scheduler_config_watermark_blocks_fraction 0 \
-      --request_generator_config_type trace_replay --trace_request_generator_config_trace_file $O/vidur.csv \
+      --request_generator_config_type trace_replay --trace_request_generator_config_trace_file $O/vidur$V.csv \
       --trace_request_generator_config_max_tokens $mml --metrics_config_output_dir $O/vidur_out$V \
       --no-metrics_config_store_plots --no-metrics_config_enable_chrome_trace --metrics_config_store_request_metrics \
       --metrics_config_store_batch_metrics) > $O/vidur$V.log 2>&1
@@ -145,7 +148,7 @@ compare() { $PY $S/compare.py $O --md $O/results.md --json $O/results.json > /de
 
 has prepare && prepare
 [ -f $O/meta.json ] || { echo "run prepare first" >&2; exit 1; }
-has augur && augur
+has augur && augur && $PY $S/workloads.py arrivals $O && for s in vidur frontier blis; do $PY $S/workloads.py $s $O; done
 has blis && blis
 # no async scheduling, speculative decoding or KV offload in Frontier and Vidur
 plain=$([ "$(get spec_k)" = 0 ] && [ -z "$(get kv_offloading_gib)" ] && [ "$(get async_scheduling)" = false ] && echo 1 || echo 0)

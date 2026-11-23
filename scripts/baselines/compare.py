@@ -5,11 +5,15 @@
 Each directory is one run (see run.sh): ``requests.json`` and ``meta.json`` from workloads.py, and
 what each simulator wrote there. Rows are the calls in arrival order, the same in every simulator.
 
-Per-request metrics are the engine's own, measured from the moment the request reached the engine
-(every simulator got the real arrival times, so none models a front end): TTFT is the first token,
+Per-request metrics: TTFT is the first token,
 E2E the last, TPOT (E2E - TTFT) / (output tokens - 1). Real and augur numbers come from the step log
 (a token exists when the step that produced it is updated); BLIS, Frontier and Vidur report them in
-their own output. For each statistic (mean, p50, p90, p99 over the requests) the table gives the
+their own output. The runs with their own arrival process (augur's normal run, and BLIS, Frontier and Vidur given
+the same trace times) are compared as the real client measured the real run (client.csv, or the JSON of vllm bench
+serve): from the moment the request was sent, so a wait before the engine counts, with the front end (3.4 ms + 3 us per
+prompt token) and the delivery (8 ms) that augur's normal run uses added to a simulator's engine-side numbers. The
+``_replay`` rows are given the real run's arrival at the engine and compared with the real engine's own numbers (the
+step log's add and update). For each statistic (mean, p50, p90, p99 over the requests) the table gives the
 relative difference of a simulator's value from the reference's, in percent: ``vs real`` and ``vs
 augur``. augur runs the real scheduler code on the same pricer, so ``vs augur`` isolates what a
 re-implemented scheduler changes. ``|e|`` is the median over requests of the absolute relative error
@@ -40,6 +44,7 @@ import csv
 import glob
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -110,14 +115,14 @@ def _pre_events_log(path, rows):
     return out
 
 
-def _pre_events_steps(path):
+def _pre_events_steps(path, idx):
     """The same from a baseline's step file (BLIS writes the preempted request ids with each batch)."""
     if not os.path.exists(path):
         return None
     out = []
     for k, l in enumerate(open(path)):
         for r in json.loads(l).get("pre") or ():
-            out.append((k + 1, int(r.removeprefix("request_"))))
+            out.append((k + 1, _row_of(r, idx)))
     return out
 
 
@@ -131,10 +136,20 @@ def _preempt(events, real_events):
             "same_step_and_request": len(set(events) & set(real_events)) / len(real_events) if real_events else None}
 
 
-def _steps_file(path, strip=""):
+_SESSION_RID = re.compile(r"session_(.*)_round_(\d+)_\d+$")
+
+
+def _row_of(rid, idx):
+    """The row of a baseline's request id: ``request_<row>``, or BLIS's ``session_<id>_round_<n>_<k>`` (a session's call)."""
+    m = _SESSION_RID.match(rid)
+    return idx[f"{m.group(1)}#{m.group(2)}"] if m else int(rid.removeprefix("request_"))
+
+
+def _steps_file(path, idx=None):
     if not os.path.exists(path):
         return None
-    return [{int(k.removeprefix(strip)): v for k, v in json.loads(l)["tok"].items()} for l in open(path) if l.strip()]
+    return [{(_row_of(k, idx) if idx else int(k)): v for k, v in json.loads(l)["tok"].items()}
+            for l in open(path) if l.strip()]
 
 
 def _load_blis(d, rows, v=""):
@@ -143,12 +158,13 @@ def _load_blis(d, rows, v=""):
         return None
     j = json.load(open(p))
     ttft, e2e, out = [None] * len(rows), [None] * len(rows), [0] * len(rows)
+    idx = {r["call_id"]: i for i, r in enumerate(rows)}
     for r in j["request_rows"]:
-        i = int(r["id"].removeprefix("request_"))
+        i = _row_of(r["id"], idx)
         if r["fate"] == "completed":
             ttft[i], e2e[i], out[i] = r["ttft_us"] / 1e6, r["e2e_us"] / 1e6, r["output_tokens"]
     pre = j["reports"]["engine"]["cluster"]["preemptions"]
-    return _metrics(ttft, e2e, out), _steps_file(os.path.join(d, f"blis_steps{v}.jsonl"), "request_"), pre
+    return _metrics(ttft, e2e, out), _steps_file(os.path.join(d, f"blis_steps{v}.jsonl"), idx), pre
 
 
 def _load_csv_sim(d, rows, pattern, ttft_col, scale, pre_col):
@@ -217,6 +233,39 @@ def _decisions(sim_steps, real_steps):
             "prefix": ((first - 1) / n) if first else 1.0, "found": found / n}
 
 
+def _real_client(meta, rows):
+    """The real run's metrics as its client measured them: from the request's send (client.csv, or the JSON of
+    ``vllm bench serve``), so a wait before the engine (a connection cap, the API server) counts."""
+    idx = {r["call_id"]: i for i, r in enumerate(rows)}
+    n = len(rows)
+    ttft, e2e = [None] * n, [None] * n
+    d = meta["run_dir"]
+    if os.path.exists(os.path.join(d, "client.csv")):
+        for r in csv.DictReader(open(os.path.join(d, "client.csv"))):
+            sid = r.get("session_id")
+            cid = f"{sid}#{r['sub_request_index']}" if sid and sid != "None" else f"req_{r['request id']}"
+            i = idx.get(cid)
+            if i is not None and r["latency"] and r["TTFT"]:
+                ttft[i], e2e[i] = float(r["TTFT"]) / 1e9, float(r["latency"]) / 1e9
+    elif os.path.exists(os.path.join(d, "real.json")):
+        j = json.load(open(os.path.join(d, "real.json")))
+        for k, (t, lat, err) in enumerate(zip(j["ttfts"], j["latencies"], j["errors"])):
+            i = idx.get(f"req_{k}")
+            if i is not None and not err:
+                ttft[i], e2e[i] = t, lat
+    else:
+        return None
+    return _metrics(ttft, e2e, [r["real"]["out"] if r["real"] else 0 for r in rows])
+
+
+def _client_side(m, rows):
+    """An engine-side metric set put on the client's side as augur's normal run does: the front end before the
+    engine and the delivery after it (TTFT and E2E; TPOT is unchanged)."""
+    add = [r["frontend_s"] + r["delivery_s"] for r in rows]
+    return {"ttft": [None if t is None else t + a for t, a in zip(m["ttft"], add)], "tpot": m["tpot"],
+            "e2e": [None if t is None else t + a for t, a in zip(m["e2e"], add)]}
+
+
 def compare(d):
     rows = json.load(open(os.path.join(d, "requests.json")))["requests"]
     meta = json.load(open(os.path.join(d, "meta.json")))
@@ -236,29 +285,46 @@ def compare(d):
             x = load(d, rows, v)
             if x is not None:
                 runs[name + v] = x
-    res = {"run": os.path.basename(d.rstrip("/")), "requests": len(rows), "async": meta["async_scheduling"],
+    spec = None
+    if meta["spec_k"] and af:
+        from workloads import _acceptance
+        from augur.verify.replay import read_log
+        got = _acceptance(read_log(af[-1]), meta["spec_k"])
+        spec = {"real_accepted_per_step": meta["acceptance"]["accepted_per_step"], "spec_p": meta["acceptance"]["spec_p"],
+                "augur_accepted_per_step": got["mean_tokens_per_step"] - 1}
+    res = {"run": os.path.basename(d.rstrip("/")), "spec": spec, "requests": len(rows), "async": meta["async_scheduling"],
            "spec_k": meta["spec_k"], "offload_gib": meta["kv_offloading_gib"], "sims": {}}
     pre_ev = {"real": _pre_events_log(meta["step_log"], rows)}
     if af:
         pre_ev["augur"] = _pre_events_log(af[-1], rows)
     for v in ("", "_replay"):
-        e = _pre_events_steps(os.path.join(d, f"blis_steps{v}.jsonl"))
+        e = _pre_events_steps(os.path.join(d, f"blis_steps{v}.jsonl"), {r["call_id"]: i for i, r in enumerate(rows)})
         if e is not None:
             pre_ev["blis" + v] = e
+    real_eng = runs["real"][0]
+    real_cl = _real_client(meta, rows) or _client_side(real_eng, rows)
+    cl = {n: (m if n.endswith("_replay") else _client_side(m, rows)) for n, (m, _, _) in runs.items()}
     for name, (m, steps, pre) in runs.items():
-        r = {"abs": {k: [_stat(m[k], q) for _, q in STATS] for k in m}, "pre": pre,
+        replay = name.endswith("_replay")
+        # a run with its own arrival process is compared with the real run as its client measured it; a replay (real
+        # arrivals at the engine) with the engine's own numbers
+        mm, ref = (m, real_eng) if replay else (cl[name], real_cl)
+        if name == "real":
+            mm = real_cl
+        r = {"abs": {k: [_stat(mm[k], q) for _, q in STATS] for k in mm}, "pre": pre,
              "completed": sum(1 for v in m["e2e"] if v is not None)}
         if name != "real":
-            r["vs_real"] = _stat_errors(m, runs["real"][0])
-            r["abs_err_real"] = _abs_err(m, runs["real"][0])
-            if "augur" in runs and name != "augur" and not name.endswith("_replay"):
-                r["vs_augur"] = _stat_errors(m, runs["augur"][0])
-                r["abs_err_augur"] = _abs_err(m, runs["augur"][0])
+            r["vs_real"] = _stat_errors(mm, ref)
+            r["abs_err_real"] = _abs_err(mm, ref)
+            if "augur" in runs and name != "augur" and not replay:
+                r["vs_augur"] = _stat_errors(mm, cl["augur"])
+                r["abs_err_augur"] = _abs_err(mm, cl["augur"])
             r["decisions"] = _decisions(steps, real_steps)
-            if "augur" in runs and name != "augur" and not name.endswith("_replay"):
+            if "augur" in runs and name != "augur" and not replay:
                 r["decisions_augur"] = _decisions(steps, runs["augur"][1])
         r["preempt"] = _preempt(pre_ev.get(name), pre_ev["real"])
         res["sims"][name] = r
+    res["sims"]["real"]["abs_engine"] = {k: [_stat(real_eng[k], q) for _, q in STATS] for k in real_eng}
     return res
 
 
@@ -272,8 +338,11 @@ def render(results):
         mode = ("async" if res["async"] else "sync") + (f", ngram k={res['spec_k']}" if res["spec_k"] else "") + \
             (f", offload {res['offload_gib']} GiB" if res["offload_gib"] else "")
         out.append(f"### {res['run']} ({res['requests']} requests, {mode})\n")
+        if res["spec"]:
+            out.append(f"ngram acceptance, accepted drafts per decode step: real {res['spec']['real_accepted_per_step']:.3f}, "
+                       f"augur at --spec-accept-rate {res['spec']['spec_p']} {res['spec']['augur_accepted_per_step']:.3f}\n")
         real = res["sims"]["real"]["abs"]
-        out.append("real (s): " + ", ".join(f"{m} " + "/".join(_fmt(v, ".3f") for v in real[m]) for m in ("ttft", "tpot", "e2e"))
+        out.append("real, as the client measured it (s): " + ", ".join(f"{m} " + "/".join(_fmt(v, ".3f") for v in real[m]) for m in ("ttft", "tpot", "e2e"))
                    + "  (mean/p50/p90/p99)\n")
         for ref in ("real", "augur"):
             hdr = ("| sim | TTFT mean | p50 | p90 | p99 | TPOT mean | p50 | p90 | p99 | E2E mean | p50 | p90 | p99 | \\|e\\| |\n"
