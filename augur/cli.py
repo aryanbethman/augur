@@ -230,6 +230,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="fill unrecorded prompt tokens with in-vocabulary ids below this (match augur.verify.client runs)")
     p.add_argument("--no-recorded-outputs", action="store_true",
                    help="emit unique output ids instead of the trace's recorded outputs (as a real model does)")
+    p.add_argument("--replay-tokens", default=None, metavar="TOKENS_JSONL",
+                   help="emit the output ids a real run generated (augur.verify.client --tokens-out) instead of the "
+                        "trace's or unique ones, so that identical generations hit the prefix cache as they did")
     p.add_argument("--step-log-vllm", default=None,
                    help="write vLLM-scheduler step events (augur.verify.hooks format) to <path>.<pid>.jsonl; "
                         "with several engines, one log each: <path>.e<engine id>.<pid>.jsonl")
@@ -611,10 +614,11 @@ def main(argv: list[str] | None = None) -> int:
         workload = ReplayWorkload(a.workload, max_entries=a.num_entries,
                                   log_path=a.replay_durations or a.replay_arrivals,
                                   log_paths=replay_logs if replay_costs and a.num_engines > 1 else None,
-                                  recorded_outputs=not a.no_recorded_outputs, filler_vocab=a.filler_vocab)
+                                  recorded_outputs=not a.no_recorded_outputs, filler_vocab=a.filler_vocab,
+                                  output_tokens=a.replay_tokens)
     else:
         workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs,
-                            filler_vocab=a.filler_vocab)
+                            filler_vocab=a.filler_vocab, output_tokens=a.replay_tokens)
     router_options = dict(seed=a.router_seed, cache_threshold=a.router_cache_threshold,
                           balance_abs_threshold=a.router_balance_abs_threshold,
                           balance_rel_threshold=a.router_balance_rel_threshold,
