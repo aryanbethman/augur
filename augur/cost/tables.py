@@ -107,6 +107,7 @@ import gzip
 import json
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 from augur.cost import StepShape
 
@@ -238,11 +239,40 @@ class _Attention:
         return max(1, int(v0 + t_pc * (v1 - v0)))
 
 
-# GPU memory bandwidth (GB/s) for hardware whose profiles carry none because the fork's
-# hardware_defaults has no entry for it. H100: SXM5 HBM3, 3.35 TB/s, the value the fork's H100
-# cluster configs set (an H100 PCIe has 2.0 TB/s: pass npu_mem_bw for it). RTX 4060 Ti: 128-bit GDDR6 at
-# 18 Gb/s (also what --hbm-interference was fitted against).
-NPU_MEM_BW_GBPS = {"H100": 3350.0, "RTX4060Ti": 288.0}
+class GpuFacts(NamedTuple):
+    mem_gib: float  # device memory as torch / vLLM report it (GiB): what --gpu-memory-utilization is a share of
+    mem_bw_gbps: float | None = None  # GPU memory bandwidth (GB/s); None: the profiles carry it or it is not needed
+
+
+# What augur knows about each --hardware name.  mem_bw_gbps is for hardware whose profiles carry none because the
+# fork's hardware_defaults has no entry for it.
+# H100: SXM5 HBM3, 3.35 TB/s, the value the fork's H100 cluster configs set (an H100 PCIe has 2.0 TB/s: pass
+#   npu_mem_bw for it); 80 GB card, 79.19 GiB seen by torch (the total in PyTorch OOM messages for H100 80GB; not
+#   measured on this host).
+# RTX 4060 Ti: 128-bit GDDR6 at 18 Gb/s = 288 GB/s (also what --hbm-interference was fitted against); 16 GB card,
+#   15.58 GiB seen by vLLM 0.33 ("Free memory on device (15.4/15.58 GiB)" in all 11 out/real/*/server.log).
+# RTX PRO 6000 Blackwell: 96 GB GDDR7 (NVIDIA datasheet), 94.97 GiB seen by torch (the total in public PyTorch and
+#   vLLM logs for this card; not measured on this host).
+GPU_FACTS = {"H100": GpuFacts(79.19, 3350.0), "RTX4060Ti": GpuFacts(15.58, 288.0), "RTXPRO6000": GpuFacts(94.97)}
+
+
+def gpu_mem_bw_gbps(hardware) -> float | None:
+    facts = GPU_FACTS.get(hardware)
+    return facts.mem_bw_gbps if facts else None
+
+
+def measured_reserve_gib(mem: dict) -> float:
+    """What vLLM 0.33 keeps from the KV cache besides the weights, from a ``vllm_memory`` record: non-torch memory
+    plus peak activation (``reserve_gib`` when the record summarises several runs).  The CUDA-graph figure is not
+    added: vLLM's "peak activation" already holds the graph estimate (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS) and
+    KV = gpu_memory_utilization * total - (weights + non-torch) - peak activation."""
+    return mem.get("reserve_gib", mem["non_torch_gib"] + mem["peak_activation_gib"])
+
+
+def profile_vllm_memory(profile_path) -> dict | None:
+    """vLLM's memory accounting recorded in a profile's provenance (python -m augur.profile), None if it has none."""
+    with gzip.open(profile_path, "rt", encoding="utf-8") as f:
+        return json.load(f).get("provenance", {}).get("vllm_memory")
 
 
 class OutsideRegime(ValueError):
@@ -256,7 +286,7 @@ class TableCost:
     tensors that live in CPU memory, as in ``LLMServingSimCost``.  At TP>1 the
     collectives are priced from ``link_bw`` (GB/s), ``link_latency_ns`` and
     ``npu_mem_bw`` (GB/s; default: the profile's ``hardware`` entry, else
-    ``NPU_MEM_BW_GBPS`` for its hardware).
+    ``GPU_FACTS`` for its hardware).
     """
 
     def __init__(self, profile_path, cpu_mem_bw: float = 256.0, cpu_mem_latency_ns: int = 0,
@@ -283,7 +313,7 @@ class TableCost:
                 raise NotImplementedError(f"tp={self.tp} profile has no collective coefficients")
             npu = npu_mem_bw if npu_mem_bw is not None else (p.get("hardware") or {}).get("npu_mem_bw_gbps")
             if npu is None:
-                npu = NPU_MEM_BW_GBPS.get(ident.get("hardware"))
+                npu = gpu_mem_bw_gbps(ident.get("hardware"))
             if npu is None:
                 raise ValueError("TP>1 needs npu_mem_bw (GB/s): the profile has no default for this hardware")
             if int(npu) < 1 or int(cpu_mem_bw) < 1 or link_bw <= 0 or link_latency_ns < 0:
@@ -302,7 +332,7 @@ class TableCost:
         self._moe_dp = (moe or {}).get("dp", {})
         if self._moe_dp and self.tp == 1:  # DP rounds run collectives between the ranks: link and HBM bandwidth
             npu = npu_mem_bw if npu_mem_bw is not None else (p.get("hardware") or {}).get("npu_mem_bw_gbps")
-            npu = NPU_MEM_BW_GBPS.get(ident.get("hardware")) if npu is None else npu
+            npu = gpu_mem_bw_gbps(ident.get("hardware")) if npu is None else npu
             if npu is None or int(npu) < 1 or int(cpu_mem_bw) < 1 or link_bw <= 0 or link_latency_ns < 0:
                 raise ValueError("DP rounds need npu_mem_bw >= 1, cpu_mem_bw >= 1, link_bw > 0, link_latency_ns >= 0")
             self.link_bw, self.link_latency_ns, self.npu_mem_bw = link_bw, link_latency_ns, npu

@@ -52,6 +52,8 @@ class Client:
         body = {"model": self.model, "prompt": call.prompt_ids, "max_tokens": call.output_toks,
                 "min_tokens": call.output_toks, "ignore_eos": True, "temperature": 0.0,
                 "stream": True, "return_token_ids": True, "request_id": f"augur.{call.call_id}."}
+        if call.priority:  # a server on the fcfs policy refuses any priority, so only send one that was set
+            body["priority"] = call.priority
         generated: list[int] = []
         try:
             async with http.post(self.url, json=body) as resp:

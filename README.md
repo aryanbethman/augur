@@ -35,9 +35,23 @@ For traces (one JSON line per request or agent session; the format is described
 in `augur/trace/workload.py` and is LLMServingSim's), run augur directly:
 
 ```bash
-augur --hardware RTXPRO6000 --hbm-gb 96 --model meta-llama/Llama-3.1-8B \
+augur --hardware RTXPRO6000 --model meta-llama/Llama-3.1-8B \
   --workload trace.jsonl --output out/run.csv
 ```
+
+The KV cache is sized as vLLM sizes it: the GPU's memory for `--hardware`
+(`--hbm-gb` overrides it) times `--mem-util`, minus the weights and what vLLM
+keeps besides them (non-torch memory and peak activation, which holds the
+CUDA-graph estimate). That reserve comes from the profile when
+`python -m augur.profile` measured it, else from an estimate off the model
+shape (augur warns); `--kv-reserve-gib`, `--kv-cache-gb` and `--num-gpu-blocks`
+override it. `--kv-cache-dtype fp8` halves a block's bytes (attention is still
+priced as bf16).
+
+`--scheduler-cls DOTTED.PATH` runs your own vLLM scheduler class (a `Scheduler`
+subclass, or `AsyncScheduler` with `--async-scheduling`) in place of vLLM's;
+`--step-log-vllm` still logs it. `--scheduling-policy priority` orders requests
+by the workload's per-request `priority` field (lower first, default 0).
 
 Multi-GPU engines (`--tp`; link and memory settings from `--tp-link-bw`,
 `--tp-link-latency-ns`, `--npu-mem-bw` or an LLMServingSim cluster config,
@@ -85,6 +99,7 @@ when comparing with it.
 | `augur.verify.client` | Replays a trace against `vllm serve` with the same token-id prompts and exact output lengths |
 | `augur ... --replay-durations <log>` + `python -m augur.verify.replay compare` | Reruns a logged run with its arrival times and step durations; scheduling decisions must match step for step |
 | `augur.verify.stepcheck` | Prices every step of a real run and compares with its measured time |
+| `augur.verify.breakdown` | Splits augur's end-to-end error on a real run into outside the step loop, step time and scheduling decisions |
 | `pytest` | Replay self-tests, and the scheduler against LLMServingSim's stored outputs (`tests/test_vs_llmservingsim.py`) |
 
 How close it gets, and how that was measured: [docs/accuracy.md](docs/accuracy.md).

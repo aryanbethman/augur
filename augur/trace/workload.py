@@ -7,6 +7,8 @@ Every line is either a flat request or an agentic session (it has
 * A session's first call arrives at the session's ``arrival_time_ns``. Call
   ``i+1`` is released at call ``i``'s completion plus call ``i``'s
   ``tool_duration_ns`` (the wait *after* that call).
+* ``priority`` (optional, default 0; lower runs first under ``--scheduling-policy priority``) goes to vLLM with
+  the request; a session's calls each carry their own.
 * ``input_toks`` / ``output_toks`` set the prompt and output lengths.
   ``input_tok_ids`` drive prefix caching only: the prompt's ids are the
   recorded ones, and any tokens past them are filled with ids unique to the
@@ -43,6 +45,7 @@ class Call:
     output_ids: list[int]
     tool_wait_ns: int  # wait after this call before the session's next one
     after_step_start: bool = False  # replay only: reached the engine just after a step began
+    priority: int = 0  # vLLM request priority (only --scheduling-policy priority looks at it)
 
 
 @dataclass
@@ -87,10 +90,17 @@ class Workload:
     # Set to (at most) the model's regular vocabulary to keep filler ids valid
     # for a real server, e.g. 150000 for Qwen3 (its special tokens start at 151643).
     filler_vocab: int | None = None
+    # Output ids a real run generated (augur.verify.client --tokens-out), by call id: they replace the trace's
+    # (or the unique ids) so that calls whose generations coincide share prefix-cache blocks, as they did there.
+    output_tokens: str | None = None
     _filler: _Filler = field(default_factory=_Filler)
+    _generated: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self._filler = _Filler(self.filler_vocab)
+        if self.output_tokens:
+            with open(self.output_tokens) as f:
+                self._generated = {r["call_id"]: r["output_tok_ids"] for r in map(json.loads, f)}
 
     def entries(self) -> Iterator[Call | Session]:
         with open(self.path) as f:
@@ -120,11 +130,12 @@ class Workload:
         if len(rec_in) < n_in:
             rec_in += self._filler.ids(n_in - len(rec_in), call_id + "/in")
         rec_out = list(d.get("output_tok_ids") or ())[:n_out] if self.recorded_outputs else []
+        rec_out = self._generated.get(call_id, rec_out)[:n_out]
         if len(rec_out) < n_out:
             rec_out += self._filler.ids(n_out - len(rec_out), call_id + "/out")
         return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,
                     prompt_ids=rec_in, output_toks=n_out, output_ids=rec_out,
-                    tool_wait_ns=int(d.get("tool_duration_ns", 0) or 0))
+                    tool_wait_ns=int(d.get("tool_duration_ns", 0) or 0), priority=int(d.get("priority", 0) or 0))
 
     def next_call(self, s: Session, arrival_ns: int) -> Call:
         i = s.next_index

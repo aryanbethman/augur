@@ -169,3 +169,63 @@ def test_dp_replays_its_own_logs_exactly(tmp_path, sessions, mode, offload):
     if offload:
         assert sum("jobs" in json.loads(line) for p in glob.glob(str(tmp_path / "orig.e*.jsonl"))
                    for line in open(p)) > 0
+
+
+# ---- a real DP server's log: rounds recorded by the hooks, replayed per rank ------------------
+
+def test_real_dp_rank_logs_its_rounds_and_dummy_forwards(tmp_path, monkeypatch):
+    """The hooks' wrappers on vLLM's DP engine loop log one round per iteration, dummy forwards included,
+    from the previous iteration's end (while the group runs) or the first schedule / dummy (after an idle gap)."""
+    from vllm.v1.engine.core import DPEngineCoreProc
+    from augur.verify import hooks
+
+    class Sched(hooks.LoggingScheduler):
+        def __init__(self):  # no vLLM scheduler behind it
+            self._engine_tag, self._log = 1, hooks._StepLog(str(tmp_path / "steps"))
+
+    class Executor:
+        def execute_dummy_batch(self):
+            pass
+
+    clock = iter([100, 110, 130, 150, 170, 200])
+    monkeypatch.setattr(hooks, "CLOCK", lambda phase: next(clock))
+    monkeypatch.setattr(DPEngineCoreProc, "_augur_rounds", False, raising=False)
+    monkeypatch.setattr(DPEngineCoreProc, "execute_dummy_batch", lambda self: self.model_executor.execute_dummy_batch())
+    monkeypatch.setattr(DPEngineCoreProc, "_has_global_unfinished_reqs", lambda self, local: self.running.pop(0))
+    hooks._log_dp_rounds()
+    core = object.__new__(DPEngineCoreProc)
+    core.scheduler, core.model_executor, core.running = Sched(), Executor(), [True, True, False, True]
+    sch = core.scheduler
+    # iteration 1: a real step, scheduled at t=100 (as LoggingScheduler.schedule records it), its sync ends at 110
+    sch._round_t = hooks.CLOCK("sched")
+    assert core._has_global_unfinished_reqs(True) is True
+    # iteration 2: a dummy forward (starts at the previous end), sync ends at 130; the group then goes idle
+    core.execute_dummy_batch()
+    assert core._has_global_unfinished_reqs(True) is True
+    core.execute_dummy_batch()  # iteration 3: the last; nobody has work any more
+    assert core._has_global_unfinished_reqs(False) is False
+    assert sch._round_t is None  # idle: the next iteration starts at its own first schedule or dummy
+    core.execute_dummy_batch()  # iteration 4: a peer woke this rank
+    core._has_global_unfinished_reqs(False)
+    sch._log.flush()
+    rounds = [json.loads(line) for line in open(glob.glob(str(tmp_path / "steps.*.jsonl"))[0])]
+    assert [(r["t"], r["dur"], r["dummy"]) for r in rounds] == [(100, 10, False), (110, 20, True), (130, 20, True),
+                                                                 (170, 30, True)]
+
+
+def test_real_dp_logs_drop_the_rounds_nobody_needed(tmp_path):
+    """A real DP group keeps running dummy forwards on every rank until its next finish-sync; augur's does not."""
+    def log(path, rounds):
+        recs = [{"ev": "round", "t": 10 * i, "dur": d, "dummy": dummy} for i, (d, dummy) in enumerate(rounds)]
+        recs.insert(3, {"ev": "add", "t": 30, "rid": "cmpl-augur.req_0.-0-ab", "prompt": 4})  # after three rounds
+        path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+        return str(path)
+
+    a = log(tmp_path / "a.jsonl", [(5, False), (6, True), (7, True), (8, True)])
+    b = log(tmp_path / "b.jsonl", [(5, True), (6, False), (7, True), (8, True)])
+    costs = ReplayCost.from_logs([a, b])
+    assert [c.rounds for c in costs] == [[5, 6], [5, 6]]
+    assert [c.add_round for c in costs] == [{"req_0": 2}] * 2  # the call joins the third kept round: idle ones don't count
+    short = log(tmp_path / "c.jsonl", [(5, False)])
+    with pytest.raises(ValueError, match="different numbers of rounds"):
+        ReplayCost.from_logs([a, short])
