@@ -167,7 +167,17 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
 - [x] Tables for MoE (2026-11-21, b60b4cc): Qwen3-30B-A3B-Instruct-2507, RTX PRO 6000, TP1 and TP2, DP=1; byte-
       identical to the fork on SWE-bench (765/765), 1.6-2.2x faster whole runs. MoE block stored per token count (no
       scipy); TP2 via the fork's legacy table plus a fitted ASTRA-Sim communication correction
-- [ ] MoE TP4 (the TP2 correction does not carry over: 24-48 ns/step residual), DP+EP and EP on the tables
+- [x] MoE TP4 on the tables (2026-11-23): at TP4 ASTRA-Sim charges a MoE step min(M, max(H+A-B, min(M-B, H+A,
+      max(M-2B, 2A+H-2B)))) ns less than the dense form (H = M - M//2; nothing at T=0, where no MoE block is emitted),
+      fitted on a grid of A, B with M = 20/40/41/48 and exact on 2,000 random shapes over 8 cluster settings.
+      Shipped for the fork's projected bundle only: --tp 4 --profile-variant bf16-tp4proj (--cost tables/auto now
+      read shipped <variant>-tp<N> profiles). Whole SWE-bench run byte-identical to the fork, 9.0 s vs 21.2 s
+- [ ] DP+EP and EP on the tables. Looked at 2026-11-23: per MoE layer each rank's trace has an all-gather (tokens,
+      topk weights, topk ids, sized by the round's largest rank) and a reduce-scatter across the DP ranks, so ranks
+      meet four times a layer; moe_experts is priced at the round's summed token count by per-(TP, DP, rank)
+      native component tables under the balanced gate (serving/core/moe_execution.py). Needs those tables per
+      rank and a closed form for synchronized ring all-gather / reduce-scatter (ASTRA-Sim, ns-exact). MoE TP8:
+      no bundle to fit against
 - [x] TP>1 without the ASTRA binary (afa6a3b): closed form of the ring collectives in tables.py, identical to
       the fork on whole runs (8B TP2, 70B TP4, 4 x TP4); shipped 8B tp2, 70B tp4/tp8. Refuses settings where the
       form is not exact (2A > all-reduce step or 2B > last collective step)

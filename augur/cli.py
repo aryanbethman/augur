@@ -268,7 +268,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--profile-variant", default=None, metavar="NAME",
                    help="--cost llmservingsim: read the fork's profiles from the folder perf/<hardware>/<model>/NAME/ "
                         "(e.g. bf16-tp4proj, a projected TP4 bundle) instead of the one the model's dtype names; "
-                        "the fork's --profile-variant. --cost auto then uses llmservingsim (tables do not know variants)")
+                        "the fork's --profile-variant. --cost tables/auto read augur's shipped NAME-tp<N> profile "
+                        "when there is one (python -m augur.cost.profiles lists them), else --cost auto uses the fork")
     p.add_argument("--profile", default=None, help="profile file for --cost tables (default: the one shipped "
                                                    "for --hardware and --model; python -m augur.cost.profiles lists them)")
     p.add_argument("--fixed-step-ms", type=float, default=None, help="--cost fixed only: base step time (default 25)")
@@ -315,12 +316,13 @@ def _pick_cost(a, cpu_flags) -> str | None:
     profile = None
     if a.cost in ("tables", "auto"):
         from augur.cost.tables import bundled_profile
-        plain = a.dp == 1 and not a.enable_expert_parallel and not a.profile_variant
+        plain = a.dp == 1 and not a.enable_expert_parallel
+        variant = a.profile_variant or "bf16"
         if a.cost == "tables" or a.profile:
-            profile = a.profile or bundled_profile(a.hardware, a.model, a.tp)
+            profile = a.profile or bundled_profile(a.hardware, a.model, a.tp, variant)
         elif plain:
             try:
-                profile = bundled_profile(a.hardware, a.model, a.tp)
+                profile = bundled_profile(a.hardware, a.model, a.tp, variant)
                 if a.tp > 1:
                     _tp_params(a, *cpu_flags)  # a config the closed form does not cover: use the fork
             except FileNotFoundError:
@@ -413,9 +415,8 @@ def main(argv: list[str] | None = None) -> int:
         from augur.bench import main as bench_main
         return bench_main(args[1:])
     a = _parser().parse_args(argv)
-    if a.profile_variant and a.cost in ("tables", "fixed"):
-        print(f"augur: --profile-variant selects a profile folder of the fork: it needs --cost llmservingsim "
-              f"(or auto), not --cost {a.cost}", file=sys.stderr)
+    if a.profile_variant and a.cost == "fixed":
+        print("augur: --profile-variant names a profile: it does not apply to --cost fixed", file=sys.stderr)
         return 2
     if a.profile_variant and a.profile:
         print("augur: --profile (a --cost tables file) and --profile-variant (a fork folder) exclude each other",

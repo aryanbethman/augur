@@ -51,9 +51,15 @@ is deterministic in ``T``), so the profile stores it as a table of ``T`` and ``L
 
   The block is absent (0 ns) when ``T`` = 0.  Unlike the other tables it is not scaled by TP.
   This path has no collective of its own, but it changes what ASTRA-Sim charges for the others: the
-  per-step communication above is lower by ``max(0, min(M, A, max(M, A) - B))`` ns, M = the number of MoE
-  layers (``collectives.moe_layers``), found by fitting ASTRA-Sim runs and checked on random shapes.
-  It was fitted at TP2 only (at TP4 the residual has another form): a MoE profile at TP>2 is refused.
+  per-step communication above is lower by a few ns per MoE layer, M = the number of MoE layers
+  (``collectives.moe_layers``), found by fitting ASTRA-Sim runs and checked on random shapes::
+
+      TP2:  max(0, min(M, A, max(M, A) - B))
+      TP4:  min(M, max(H + A - B, min(M - B, H + A, max(M - 2B, 2A + H - 2B))))      H = M - M // 2, A >= B
+
+  (A and B as in the TP formula below.)  The TP4 form was fitted on a grid of A and B (0-100 ns) with M = 20,
+  40, 41 and 48 (MoE blocks removed from real traces), then checked on random shapes and cluster settings.
+  MoE at other TP sizes is refused.
 
 Tensor parallelism (TP = N > 1, one node, dense and MoE models; ASTRA-Sim FullyConnected topology, ring
 collectives).  Compute is priced exactly as above, on the profile's tpN tables.  The fork prices the
@@ -251,9 +257,9 @@ class TableCost:
             raise NotImplementedError("a MoE profile needs its 'moe' tables (python -m augur.cost.convert)")
         self.identity = ident
         self.tp = ident["tp"]
-        if self.tp > 2 and moe:
-            raise NotImplementedError(f"MoE at tp={self.tp}: the MoE communication correction was fitted at TP2 only "
-                                      "(use --cost llmservingsim)")
+        if moe and self.tp not in (1, 2, 4):
+            raise NotImplementedError(f"MoE at tp={self.tp}: the MoE communication correction was fitted at TP2 and "
+                                      "TP4 only (use --cost llmservingsim)")
         if self.tp > 1:
             coll = p.get("collectives")
             if not coll or any(not isinstance(coll.get(k), int) for k in
@@ -395,10 +401,20 @@ class TableCost:
                 f"{lat} ns, bandwidth {self.link_bw} GB/s); the closed form is not exact there. "
                 f"Use --cost llmservingsim")
         total = n * max(a, b) + min(a, b) + c["all_reduce_count"] * ar   # CPU memory: one FIFO queue per node
-        m = c.get("moe_layers", 0)
+        m = c.get("moe_layers", 0) if tokens > 0 else 0  # an empty step has no MoE block
         if m:  # see the MoE note in the module docstring
-            total -= max(0, min(m, a, max(m, a) - b))
+            total -= self._moe_comm_saving(m, a, b)
         return total + ag  # and the all-gather of the per-rank logits chunk
+
+    def _moe_comm_saving(self, m: int, a: int, b: int) -> int:
+        """How much less than the dense form ASTRA-Sim charges a MoE step at TP2 or TP4 (see the module docstring);
+        ``m`` MoE layers, ``a`` and ``b`` the CPU-memory times of the token ids and the sampled ids."""
+        if self.tp == 2:
+            return max(0, min(m, a, max(m, a) - b))
+        if b > a:  # never with 4-byte token ids and sampled ids (R <= T); the form was fitted for a >= b only
+            raise OutsideRegime(f"MoE TP4 step with sampled-id time {b} ns above the token-id time {a} ns")
+        h = m - m // 2
+        return min(m, max(h + a - b, min(m - b, h + a, max(m - 2 * b, 2 * a + h - 2 * b))))
 
     # --- MoE block, TP>1 legacy path ---------------------------------------
 

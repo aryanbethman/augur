@@ -1,4 +1,5 @@
-"""MoE models priced from the shipped tables (Qwen3-30B-A3B on an RTX PRO 6000, TP1 and TP2).
+"""MoE models priced from the shipped tables (Qwen3-30B-A3B on an RTX PRO 6000, TP1 and TP2; TP4 from the fork's
+projected bf16-tp4proj bundle).
 
 The first tests need no fork; the last ones compare with it (skipped without AUGUR_FORK): the MoE block at
 every token count, random step shapes, and whole runs, which must write the same bytes as --cost llmservingsim."""
@@ -22,7 +23,9 @@ needs_fork = pytest.mark.skipif(not os.path.isdir(os.path.join(FORK, "workloads"
                                 reason="LLMServingSim fork not found (AUGUR_FORK)")
 QWEN = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 TP2_CONFIG = os.path.join(os.path.dirname(__file__), "data", "llmservingsim", "qwen3moe_tp2.json")
+TP4_CONFIG = os.path.join(os.path.dirname(__file__), "data", "llmservingsim", "qwen3moe_tp4.json")
 TP1, TP2 = (bundled_profile("RTXPRO6000", QWEN, tp) for tp in (1, 2))
+TP4 = bundled_profile("RTXPRO6000", QWEN, 4, "bf16-tp4proj")
 
 
 def run_augur(*args, fork=None):
@@ -34,8 +37,9 @@ def run_augur(*args, fork=None):
 
 
 def test_moe_profiles_are_shipped_and_small():
-    assert {("RTXPRO6000", QWEN, "bf16", 1), ("RTXPRO6000", QWEN, "bf16", 2)} <= set(shipped())
-    for path in (TP1, TP2):
+    assert {("RTXPRO6000", QWEN, "bf16", 1), ("RTXPRO6000", QWEN, "bf16", 2),
+            ("RTXPRO6000", QWEN, "bf16-tp4proj", 4)} <= set(shipped())
+    for path in (TP1, TP2, TP4):
         assert path.stat().st_size < 100_000
         with gzip.open(path, "rt") as f:
             p = json.load(f)
@@ -61,12 +65,26 @@ def test_tp2_moe_has_no_block_for_an_empty_step_and_no_token_limit():
     assert cost.step_ns(StepShape()) < cost.step_ns(StepShape(padded_tokens=1))  # T = 0: the fork emits no expert row
 
 
-def test_moe_profile_beyond_tp2_is_refused(tmp_path):
+def test_tp4_moe_saving_is_bounded_and_needs_a_block():
+    cost = TableCost(TP4, **cluster_params(TP4_CONFIG))
+    m = cost._coll["moe_layers"]
+    for a in range(0, 120, 7):
+        for b in range(0, a + 1, 5):
+            assert m - m // 2 - b <= cost._moe_comm_saving(m, a, b) <= m
+    with pytest.raises(OutsideRegime):
+        cost._moe_comm_saving(m, 3, 4)
+    # an empty step emits no MoE block, so nothing is saved (the fork prices it as the dense form)
+    dense = TableCost(TP4, **cluster_params(TP4_CONFIG))
+    dense._coll = dict(dense._coll, moe_layers=0)
+    assert cost._comm_ns(0, 0) == dense._comm_ns(0, 0) and cost._comm_ns(1, 0) < dense._comm_ns(1, 0)
+
+
+def test_moe_profile_at_other_tp_is_refused(tmp_path):
     p = json.loads(gzip.decompress(TP2.read_bytes()))
-    q = dict(p, identity=dict(p["identity"], tp=4))
-    f = tmp_path / "tp4.json.gz"
+    q = dict(p, identity=dict(p["identity"], tp=8))
+    f = tmp_path / "tp8.json.gz"
     f.write_bytes(gzip.compress(json.dumps(q).encode()))
-    with pytest.raises(NotImplementedError, match="TP2 only"):
+    with pytest.raises(NotImplementedError, match="TP2 and TP4 only"):
         TableCost(f)
     q = dict(p)
     del q["moe"]
@@ -88,7 +106,9 @@ def test_no_scipy_or_fork_at_run_time(tmp_path):
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr[-2000:]
 
 
-@pytest.mark.parametrize("tp,extra", [(1, []), (2, ["--tp", "2", "--lss-cluster-config", TP2_CONFIG])])
+@pytest.mark.parametrize("tp,extra", [(1, []), (2, ["--tp", "2", "--lss-cluster-config", TP2_CONFIG]),
+                                      (4, ["--tp", "4", "--lss-cluster-config", TP4_CONFIG,
+                                           "--profile-variant", "bf16-tp4proj"])])
 def test_short_run_from_shipped_tables_without_the_fork(tmp_path, workload, tp, extra):
     """--cost auto picks the shipped tables for DP=1 (the fork path does not exist here: AUGUR_FORK is empty)."""
     out = tmp_path / "run.csv"
@@ -149,9 +169,40 @@ def test_live_against_fork_tp2():
     assert [(s, ref.step_ns(s), cost.step_ns(s)) for s in shapes if ref.step_ns(s) != cost.step_ns(s)] == []
 
 
+TP4_AGAINST_FORK = """
+import random, sys
+from augur.cost.convert import _moe_prices, cluster_params, random_shapes
+from augur.cost.llmservingsim import LLMServingSimCost
+from augur.cost.tables import TableCost
+fork, path, cfg, qwen = sys.argv[1:5]
+ref = LLMServingSimCost(fork, "RTXPRO6000", qwen, tp=4, cluster_config=cfg, profile_variant="bf16-tp4proj")
+cost = TableCost(path, **cluster_params(cfg))
+rng = random.Random(3)
+counts = list(range(1, 2100)) + rng.sample(range(2100, 60000), 150)
+bad = [t for t in counts if _moe_prices(ref, t, {"expert"}) != {"expert": cost._moe_ns("expert", t)}]
+assert bad == [], bad[:5]
+shapes = list(random_shapes(random.Random(20261123), 120))
+bad = [(s, ref.step_ns(s), cost.step_ns(s)) for s in shapes if ref.step_ns(s) != cost.step_ns(s)]
+assert bad == [], bad[:3]
+print("ok")
+"""
+
+
+@needs_fork
+def test_tp4_against_the_fork():
+    """The MoE block at every token count, and 120 fresh random shapes (about 110 ASTRA-Sim runs), on the projected
+    bundle. In a process of its own: the fork pins a --profile-variant per process (set_profile_variant_override),
+    and every later fork lookup in this one would read that variant's folder."""
+    r = subprocess.run([sys.executable, "-c", TP4_AGAINST_FORK, FORK, str(TP4), TP4_CONFIG, QWEN],
+                       capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)))
+    assert r.returncode == 0 and r.stdout.strip().endswith("ok"), r.stderr[-3000:]
+
+
 @needs_fork
 @pytest.mark.parametrize("tp,extra", [(1, ["--hbm-gb", "96"]),
-                                      (2, ["--kv-cache-gb", "30.95", "--tp", "2", "--lss-cluster-config", TP2_CONFIG])])
+                                      (2, ["--kv-cache-gb", "30.95", "--tp", "2", "--lss-cluster-config", TP2_CONFIG]),
+                                      (4, ["--tp", "4", "--lss-cluster-config", TP4_CONFIG,
+                                           "--profile-variant", "bf16-tp4proj"])])
 def test_whole_swe_bench_run_is_identical(tmp_path, tp, extra):
     """SWE-bench sessions (765 calls), sync: the CSV is the same bytes with the shipped tables as with the fork."""
     src = os.path.join(FORK, "workloads", "swe-bench-qwen3-30b-a3b-50-sps0.2.jsonl")
