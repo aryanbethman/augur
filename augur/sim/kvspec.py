@@ -83,11 +83,30 @@ def _on_meta_device(vllm_config):
         device_config.device = device
 
 
+_cache: dict[tuple, dict[str, KVCacheSpec]] = {}
+
+
+def _build_key(vllm_config) -> tuple:
+    """What layer construction reads: vLLM's own config hash (model, cache, parallel, attention and quantization
+    settings), plus the fields that fix the specs, spelled out. Engines of one run share it."""
+    mc, cc, pc = vllm_config.model_config, vllm_config.cache_config, vllm_config.parallel_config
+    return (vllm_config.compute_hash(), mc.hf_config.to_json_string(), str(mc.dtype), cc.cache_dtype, cc.block_size,
+            pc.tensor_parallel_size, pc.pipeline_parallel_size, pc.data_parallel_size, pc.enable_expert_parallel)
+
+
 def layer_kv_specs(vllm_config) -> dict[str, KVCacheSpec]:
     """{layer name: KV spec} of the model in ``vllm_config``, as vLLM's GPU model runner builds it.
 
-    Raises ValueError when vLLM's model class cannot be built here, or a layer answers with something that is not
-    a KV-cache spec."""
+    Built once per distinct model build (about 0.1 s each): engines that share it get copies of the same specs,
+    which are immutable. Raises ValueError when vLLM's model class cannot be built here, or a layer answers with
+    something that is not a KV-cache spec."""
+    key = _build_key(vllm_config)
+    if key not in _cache:
+        _cache[key] = _build(vllm_config)
+    return dict(_cache[key])
+
+
+def _build(vllm_config) -> dict[str, KVCacheSpec]:
     arch = vllm_config.model_config.architecture
     compilation = vllm_config.compilation_config
     registered, compilation.static_forward_context = compilation.static_forward_context, {}

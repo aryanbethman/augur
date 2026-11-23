@@ -12,12 +12,18 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, Slid
 
 from augur.cost import FixedCost
 from augur.sim.engine import EngineSpec, SimEngine
-from augur.sim.kvspec import layer_kv_specs
+from augur.sim.kvspec import _cache, layer_kv_specs
 from augur.trace.workload import Call
 
 DATA = os.path.join(os.path.dirname(__file__), "data", "kvspec")
 BLOCK, BF16 = 16, 2
 KV_BYTES = 8 << 20
+
+
+@pytest.fixture(autouse=True)
+def fresh_build():
+    """Every test builds the model itself rather than reading a cached build."""
+    _cache.clear()
 
 
 def model_dir(tmp_path, name, **changes):
@@ -122,3 +128,14 @@ def test_sliding_window_frees_blocks_behind_the_window(tmp_path):
     window = blocks_held_by_a_long_prompt(engine(tmp_path, "sliding"))
     assert full >= 480 // BLOCK  # the whole prompt (a block spans all layers)
     assert window <= 64 // BLOCK + 2  # a window's worth of blocks
+
+
+def test_engines_sharing_a_model_build_it_once_and_get_their_own_dict(tmp_path):
+    path = model_dir(tmp_path, "sliding")
+    first = layer_kv_specs(vllm_config(path))
+    first["draft.layers.0.self_attn.attn"] = None  # an engine adds its draft layers to its copy
+    assert "draft.layers.0.self_attn.attn" not in layer_kv_specs(vllm_config(path))
+    assert len(_cache) == 1
+    layer_kv_specs(vllm_config(path, kv_cache_dtype="fp8"))
+    layer_kv_specs(vllm_config(model_dir(tmp_path, "mla")))
+    assert len(_cache) == 3
