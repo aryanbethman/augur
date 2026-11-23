@@ -127,6 +127,7 @@ class Coordinator:
         self.dp_group = [e for e in engines if e.spec.data_parallel_size > 1]
         self.dp_rounds = 0
         self.dp_dummy_forwards = 0
+        self._dp_held: list[tuple[int, SimEngine, Call]] = []  # replay: calls waiting for their round
         self._dp_pending: dict[int, tuple] = {}  # engine_id -> (outputs, shape or None)
         self._dp_ready_at: int | None = None  # --lss-loop-compat only
         # DP + async scheduling
@@ -212,6 +213,11 @@ class Coordinator:
             self._admit(eng, call)
 
     def _admit(self, eng: SimEngine, call: Call) -> None:
+        # Replay of a DP run (sync scheduling): the call joins the round the log says, not the one this clock puts it in.
+        join = getattr(eng.ctx.cost, "add_round", {}).get(call.call_id, 0) if eng in self.dp_group and not self._dpa else 0
+        if join > self.dp_rounds:
+            self._dp_held.append((join, eng, call))
+            return
         if self.pd:
             eng.add(call, self.now, request_id=call.call_id + "@p", max_tokens=1,
                     kv_transfer_params={"do_remote_decode": True})
@@ -344,6 +350,9 @@ class Coordinator:
         EP collectives line up. The round starts once every rank has joined;
         each rank's outputs land when its own forward finishes."""
         g = self.dp_group
+        for held in [h for h in self._dp_held if h[0] <= self.dp_rounds]:
+            self._dp_held.remove(held)
+            self._admit(held[1], held[2])
         # Ranks free at the same instant join in descending rank order (the
         # order ASTRA-Sim polls NPUs in LLMServingSim); idle ranks join last
         # with a dummy. The last to join is handed the round first, which
