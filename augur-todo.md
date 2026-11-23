@@ -195,10 +195,12 @@ the tables; the sync replay difference fixed; DP2 + EP2 on the tables.
       round: token-id reads FIFO on the node's CPU memory (first member first); at each collective (hop h, duration
       D) the early rank leaves at t_late + D, the late one at t_late - min(gap, h) + D; sampled-id writes in
       finishing order. Exact on 480 random rounds over 6 cluster settings and 1,000 rounds from fork runs; ShareGPT
-      300 DP2+EP2 byte-identical sync and async, 8.4 s vs 34.8 s. --cost auto/tables use it for --dp 2
-      --enable-expert-parallel
-- [ ] DP+EP beyond DP2 + EP2 of TP1 ranks (needs native MoE tables in the fork for that layout; the collective rule
-      was derived for two ranks); MoE TP8 (no bundle to fit against)
+      300 DP2+EP2 byte-identical sync and async, 8.4 s vs 34.8 s; SWE-bench 11.1 s vs 159 s; with KV offload
+      12 s vs 103 s. --cost auto/tables use it for --dp 2 --enable-expert-parallel
+- [ ] DP+EP beyond DP2 + EP2 of TP1 ranks: the fork has no native MoE tables for them and falls back to its legacy
+      EP table ("DP/backend matching is not verified"; DP4+EP4: one all-gather on the dispatch marker, a whole-block
+      expert row, a reduce-scatter), so profile those layouts first; the collective rule was derived for two ranks.
+      MoE TP8: no bundle to fit against
 - [x] TP>1 without the ASTRA binary (afa6a3b): closed form of the ring collectives in tables.py, identical to
       the fork on whole runs (8B TP2, 70B TP4, 4 x TP4); shipped 8B tp2, 70B tp4/tp8. Refuses settings where the
       form is not exact (2A > all-reduce step or 2B > last collective step)

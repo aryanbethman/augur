@@ -183,16 +183,21 @@ def test_dp_rounds_live_against_the_fork():
 
 
 @needs_fork
-@pytest.mark.parametrize("sched", ["--no-async-scheduling", "--async-scheduling"])
-def test_whole_dp_ep_run_is_identical(tmp_path, sched):
-    """ShareGPT 300 on DP2 + EP2 (round-robin): the CSV is the same bytes from the tables as from the fork."""
+@pytest.mark.parametrize("sched,extra", [
+    ("--no-async-scheduling", []), ("--async-scheduling", []),
+    # KV offload: a 2 GiB GPU cache and a 16 GiB CPU tier, so DP rounds are priced while loads are in flight
+    ("--no-async-scheduling", ["--kv-cache-gb", "2", "--max-model-len", "16384", "--kv-offload-gib", "16",
+                               "--num-entries", "120"])])
+def test_whole_dp_ep_run_is_identical(tmp_path, sched, extra):
+    """ShareGPT on DP2 + EP2 (round-robin): the CSV is the same bytes from the tables as from the fork."""
     src = os.path.join(FORK, "workloads", "sharegpt-qwen3-30b-a3b-300-sps10.jsonl")
     if not os.path.exists(src):
         pytest.skip("fork has no ShareGPT Qwen3-30B-A3B workload")
 
     def run(cost):
         out = tmp_path / f"{cost}.csv"
-        r = run_augur("--cost", cost, "--hardware", "RTXPRO6000", "--workload", src, "--kv-cache-gb", "56.53",
+        r = run_augur("--cost", cost, "--hardware", "RTXPRO6000", "--workload", src,
+                      *(extra or ["--kv-cache-gb", "56.53"]),
                       "--dp", "2", "--enable-expert-parallel", "--router", "round-robin", "--lss-cluster-config",
                       DP_CONFIG, "--max-num-seqs", "128", "--max-num-batched-tokens", "2048", sched,
                       "--output", str(out), fork=FORK)

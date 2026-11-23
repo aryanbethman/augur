@@ -329,10 +329,14 @@ against 14.1 s (TP1), 8.6 s against 19.4 s (TP2) and 9.0 s against 21.2 s
 (TP4) per whole run. DP2 + EP2 rounds of TP1 ranks are priced from tables as
 well (a closed form of ASTRA-Sim's two-rank all-gathers and reduce-scatters,
 tables.py): exact on 480 random rounds over six cluster settings and on 1,000
-rounds taken from fork runs, and ShareGPT 300 on DP2 + EP2 writes the same
-bytes as through the fork, sync and async, in 8.4 s against 34.8 s. Other DP
-layouts still cost about 25 ms a round through the fork (chakra graph
-conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms).
+rounds taken from fork runs. Whole runs on DP2 + EP2 write the same bytes as
+through the fork: ShareGPT 300 sync and async (8.4 s against 34.8 s),
+SWE-bench sessions sync (11.1 s against 159 s), and ShareGPT with KV offload
+to a 16 GiB CPU tier from a 2 GiB GPU cache, sync and async (12 s against
+103 s). Other DP layouts still cost about 25 ms a round through the fork
+(chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms); for
+them the fork has no native MoE tables and falls back to its legacy EP table,
+which it flags as unverified.
 
 Multi-GPU timing has not been compared with real hardware: the collective
 model is ASTRA-Sim's (ring over point-to-point links), not a measurement. On the 4060 Ti
