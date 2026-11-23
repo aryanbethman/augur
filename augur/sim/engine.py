@@ -41,7 +41,9 @@ class EngineSpec:
     tensor_parallel_size: int = 1
     dtype: str = "bfloat16"
     enforce_eager: bool = False  # vLLM's default: CUDA graphs on, so steps are padded
-    scheduler_cls: str | None = None  # e.g. augur.verify.hooks.LoggingScheduler
+    scheduler_cls: str | type | None = None  # e.g. augur.verify.hooks.LoggingScheduler
+    scheduling_policy: str = "fcfs"  # vLLM's SchedulerConfig.policy: fcfs | priority
+    kv_cache_dtype: str = "auto"  # vLLM's cache dtype: auto (the model's) | fp8 | fp8_e4m3 | fp8_e5m2
     num_gpu_blocks: int | None = None  # vLLM's num_gpu_blocks_override (match a real run's KV cache)
     kv_role: str | None = None  # "kv_producer" (prefill) / "kv_consumer" (decode) for PD
     data_parallel_size: int = 1  # >1: this engine is one rank of a DP group (lockstep rounds)
@@ -59,11 +61,11 @@ class EngineSpec:
     kv_events: bool = False  # publish vLLM's KV cache events (BlockStored / BlockRemoved) to this engine's in-process queue
 
 
-def _simulated_gpu_batch_defaults(spec: EngineSpec):
+def _simulated_gpu_batch_defaults(hardware: str, hbm_gb: float):
     """vLLM's own batch-limit table, read for the simulated GPU instead of the
-    machine augur runs on. Called by: SimEngine.__init__."""
-    name = spec.hardware.lower()
-    gpu = SimpleNamespace(get_device_total_memory=lambda: int(spec.hbm_gb * GIB), get_device_name=lambda: name,
+    machine augur runs on. Called by: SimEngine.__init__, default_batch_limits."""
+    name = hardware.lower()
+    gpu = SimpleNamespace(get_device_total_memory=lambda: int(hbm_gb * GIB), get_device_name=lambda: name,
                           is_device_capability=lambda capability: "gb10" in name,
                           is_tpu=lambda: False, is_cpu=lambda: False)
 
@@ -71,6 +73,12 @@ def _simulated_gpu_batch_defaults(spec: EngineSpec):
         with patch.object(arg_utils, "current_platform", gpu):
             return EngineArgs.get_batch_defaults(world_size)
     return defaults
+
+
+def default_batch_limits(hardware: str, hbm_gb: float) -> tuple[int, int]:
+    """(max_num_batched_tokens, max_num_seqs) that `vllm serve` picks for the simulated GPU."""
+    tokens, seqs = _simulated_gpu_batch_defaults(hardware, hbm_gb)(1)
+    return tokens[UsageContext.OPENAI_API_SERVER], seqs[UsageContext.OPENAI_API_SERVER]
 
 
 class SimEngine:
@@ -100,6 +108,8 @@ class SimEngine:
             enable_chunked_prefill=spec.enable_chunked_prefill,
             async_scheduling=spec.async_scheduling,
             scheduler_cls=spec.scheduler_cls,
+            scheduling_policy=spec.scheduling_policy,
+            kv_cache_dtype=spec.kv_cache_dtype,
             num_gpu_blocks_override=spec.num_gpu_blocks,
             speculative_config=spec.speculative,
             distributed_executor_backend=make_sim_executor(self.ctx),
@@ -121,7 +131,7 @@ class SimEngine:
             self.ctx.spec_accept_rate = spec.spec_accept_rate
         usage_context = None
         if spec.hbm_gb is not None:
-            args.get_batch_defaults = _simulated_gpu_batch_defaults(spec)
+            args.get_batch_defaults = _simulated_gpu_batch_defaults(spec.hardware, spec.hbm_gb)
             usage_context = UsageContext.OPENAI_API_SERVER  # what `vllm serve` passes
         self.vllm_config = args.create_engine_config(usage_context=usage_context)
         from augur.verify import hooks as vllm_hooks
@@ -245,7 +255,7 @@ class SimEngine:
         req = EngineCoreRequest(
             request_id=rid, prompt_token_ids=call.prompt_ids, mm_features=None,
             sampling_params=sp, pooling_params=None, arrival_time=now_ns / 1e9,
-            lora_request=None, cache_salt=None, data_parallel_rank=None,
+            lora_request=None, cache_salt=None, data_parallel_rank=None, priority=call.priority,
         )
         self.ctx.output_ids[rid] = call.output_ids
         r, wave = self.core.preprocess_add_request(req)

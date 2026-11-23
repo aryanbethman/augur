@@ -88,3 +88,26 @@ def estimate_weight_bytes(config_json: str, dtype_bytes: int = 2, tp: int = 1, e
     embed = v * h * (1 if c.get("tie_word_embeddings") else 2)
     expert_split = ep if ep > 1 else tp
     return ((L * (attn + mlp) + embed) // tp + L * experts // expert_split) * dtype_bytes
+
+
+# estimate_reserve_bytes: CUDA context and library workspaces (non-torch memory: 0.15-0.17 GiB in 6 of 7 runs of
+# Qwen3-1.7B on an RTX 4060 Ti), the CUDA-graph pool (0.12 GiB there, in vLLM's peak-activation figure), and how many
+# fp32 [max_num_seqs, vocab] buffers the sampler's warm-up holds at once (fitted: 5 puts this model inside the range of
+# its 7 runs, 0.65-0.97 GiB; it is one calibration point, not a fit across models).
+_NON_TORCH_BYTES = 150 << 20
+_CUDA_GRAPH_BYTES = 120 << 20
+_SAMPLER_FP32_COPIES = 5
+
+
+def estimate_reserve_bytes(config_json: str, max_num_batched_tokens: int, max_num_seqs: int, tp: int = 1) -> int:
+    """Memory vLLM keeps besides weights and the KV cache (non-torch + peak activation) when no profile measured it:
+    the forward pass of max_num_batched_tokens tokens (MLP up-projection and two hidden-state buffers, bf16) and the
+    sampler's logits, plus the constants above."""
+    c = json.load(open(config_json))
+    c = c.get("text_config", c)
+    h = c["hidden_size"]
+    inter = (c["moe_intermediate_size"] * c["num_experts_per_tok"]
+             if (c.get("num_experts") or c.get("n_routed_experts")) else c["intermediate_size"])
+    forward = 2 * max_num_batched_tokens * (2 * inter // tp + 2 * h)
+    sampler = _SAMPLER_FP32_COPIES * 4 * max_num_seqs * c["vocab_size"] // tp
+    return _NON_TORCH_BYTES + _CUDA_GRAPH_BYTES + forward + sampler

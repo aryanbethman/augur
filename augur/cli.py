@@ -9,6 +9,7 @@ import os
 import sys
 
 from augur.cost.profiles import default_fork
+from augur.cost.tables import GPU_FACTS, gpu_mem_bw_gbps, measured_reserve_gib, profile_vllm_memory
 from augur.sim.router import ROUTERS, make_router
 
 
@@ -27,10 +28,32 @@ def pin_hash_seed(module: str) -> None:
     os.execv(sys.executable, [sys.executable, "-m", module, *sys.argv[1:]])
 
 
-def _scheduler_cls(a) -> str | None:
+def _scheduler_cls(a) -> str | type | None:
+    """The scheduler class of the run: --scheduler-cls (checked to be a vLLM scheduler of the run's sync / async
+    kind), with the step log added when --step-log-vllm is set; else the logging scheduler alone, or None for
+    vLLM's own. Raises ValueError. Called by: main."""
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    from vllm.v1.core.sched.scheduler import Scheduler
+    cls = None
+    if a.scheduler_cls:
+        try:
+            cls = resolve_obj_by_qualname(a.scheduler_cls)
+        except (ImportError, AttributeError, ValueError) as e:
+            raise ValueError(f"--scheduler-cls {a.scheduler_cls}: cannot import it ({e})") from None
+        if not (isinstance(cls, type) and issubclass(cls, Scheduler)):
+            raise ValueError(f"--scheduler-cls {a.scheduler_cls} is not a subclass of vLLM's Scheduler")
+        is_async = issubclass(cls, AsyncScheduler)
+        if is_async != a.async_scheduling:
+            fix = "pass --no-async-scheduling" if is_async else "pass --async-scheduling or subclass AsyncScheduler"
+            raise ValueError(f"--scheduler-cls {a.scheduler_cls} is {'an async' if is_async else 'a synchronous'} "
+                             f"scheduler but the run is {'async' if a.async_scheduling else 'synchronous'}: {fix}")
     if not a.step_log_vllm:
-        return None
+        return cls
     os.environ["AUGUR_STEP_LOG"] = a.step_log_vllm
+    if cls is not None:
+        from augur.verify.hooks import with_step_log
+        return with_step_log(cls)
     return ("augur.verify.hooks.LoggingAsyncScheduler" if a.async_scheduling
             else "augur.verify.hooks.LoggingScheduler")
 
@@ -184,11 +207,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="--cost tables at TP>1: GPU memory bandwidth, GB/s (default: the profile's, if the fork "
                         "defines one for the hardware, else augur's for it (H100: 3350, SXM); or the file's "
                         "npu_mem.mem_bw)")
-    p.add_argument("--hbm-gb", type=float, default=80.0, help="simulated GPU memory")
+    p.add_argument("--hbm-gb", type=float, default=None,
+                   help="simulated GPU memory in GiB as torch reports it (default: augur's for --hardware: "
+                        + ", ".join(f"{h} {f.mem_gib}" for h, f in GPU_FACTS.items()) + ")")
     p.add_argument("--mem-util", type=float, default=0.9, help="vLLM's --gpu-memory-utilization")
-    p.add_argument("--kv-reserve-gib", type=float, default=0.0,
-                   help="memory vLLM keeps besides weights (peak activations, non-torch, CUDA-graph pool); "
-                        "~0.9 GiB for Qwen3-1.7B on an RTX 4060 Ti. KV = hbm*mem_util - weights - this")
+    p.add_argument("--kv-reserve-gib", type=float, default=None,
+                   help="memory vLLM keeps besides weights (non-torch + peak activation, which holds the CUDA-graph "
+                        "estimate; 0.65-0.97 GiB for Qwen3-1.7B on an RTX 4060 Ti). KV = hbm*mem_util - weights - this "
+                        "(default: the profile's measured numbers, else an estimate from the model shape)")
     p.add_argument("--kv-cache-gb", type=float, default=None, help="override the KV-cache size per GPU")
     p.add_argument("--num-gpu-blocks", type=int, default=None,
                    help="exact KV-cache block count (vLLM num_gpu_blocks_override), e.g. from a real run's log")
@@ -198,6 +224,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help="default: what `vllm serve` picks for the simulated GPU (--hbm-gb, --hardware)")
     p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--scheduler-cls", default=None, metavar="DOTTED.PATH",
+                   help="a vLLM scheduler class (a Scheduler subclass, or AsyncScheduler with --async-scheduling) to "
+                        "decide every step; --step-log-vllm still logs (the class is wrapped)")
+    p.add_argument("--scheduling-policy", choices=("fcfs", "priority"), default="fcfs",
+                   help="vLLM's scheduling policy; priority orders requests by the workload's per-request "
+                        "\"priority\" (lower first, default 0)")
+    p.add_argument("--kv-cache-dtype", choices=("auto", "fp8", "fp8_e4m3", "fp8_e5m2"), default="auto",
+                   help="vLLM's KV cache dtype: fp8 halves a block's bytes, so the same memory holds twice the blocks "
+                        "(step prices stay bf16)")
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
     p.add_argument("--frontend-latency-ms", type=float, default=3.4,
@@ -368,6 +403,29 @@ def _pick_cost(a, cpu_flags) -> str | None:
     return profile
 
 
+def _kv_reserve_bytes(a, mdir, profile) -> int:
+    """What vLLM keeps from the KV cache besides the weights: --kv-reserve-gib, else the memory numbers measured with
+    the profile (python -m augur.profile), else an estimate from the model shape (warned once unless the KV size is
+    moot because of --num-gpu-blocks). Called by: main."""
+    if a.kv_reserve_gib is not None:
+        return int(a.kv_reserve_gib * 2**30)
+    from augur.sim.engine import default_batch_limits
+    from augur.sim.models import estimate_reserve_bytes
+    tokens, seqs = default_batch_limits(a.hardware, a.hbm_gb)
+    tokens, seqs = a.max_num_batched_tokens or tokens, a.max_num_seqs or seqs
+    mem = profile_vllm_memory(profile) if profile else None
+    if mem and "peak_activation_gib" in mem:
+        if mem.get("max_num_batched_tokens", tokens) != tokens and not a.num_gpu_blocks:
+            print(f"augur: the profile's vLLM memory was measured with --max-num-batched-tokens "
+                  f"{mem['max_num_batched_tokens']}, this run uses {tokens}: the reserve is not rescaled", file=sys.stderr)
+        return int(measured_reserve_gib(mem) * 2**30)
+    reserve = estimate_reserve_bytes(os.path.join(mdir, "config.json"), tokens, seqs, a.tp)
+    if not a.num_gpu_blocks:
+        print(f"augur: no measured vLLM memory for this profile: the reserve is estimated at {reserve / 2**30:.2f} GiB "
+              "(--kv-reserve-gib sets it; python -m augur.profile --stages memory measures it)", file=sys.stderr)
+    return reserve
+
+
 def _build_engines(a, spec, cost, replay_costs, topology) -> list:
     """The run's engines: DP ranks, prefill + decode engines, or colocated ones, with augur's per-step terms.
     Called by: main."""
@@ -479,6 +537,20 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as e:
         print(f"augur: {e}", file=sys.stderr)
         return 2
+    if a.hbm_gb is None:
+        if a.hardware not in GPU_FACTS:
+            print(f"augur: no GPU memory size known for --hardware {a.hardware} (known: {', '.join(GPU_FACTS)}): "
+                  "give --hbm-gb", file=sys.stderr)
+            return 2
+        a.hbm_gb = GPU_FACTS[a.hardware].mem_gib
+    try:
+        scheduler_cls = _scheduler_cls(a)
+    except ValueError as e:
+        print(f"augur: {e}", file=sys.stderr)
+        return 2
+    if a.kv_cache_dtype != "auto":
+        print(f"augur: --kv-cache-dtype {a.kv_cache_dtype}: the KV cache takes fp8 bytes, but attention is priced as "
+              "bf16 (the profiles were measured with a bf16 cache)", file=sys.stderr)
     if a.kv_cache_gb is not None:
         kv_bytes = int(a.kv_cache_gb * 2**30)
     else:
@@ -487,9 +559,11 @@ def main(argv: list[str] | None = None) -> int:
         if a.num_speculative_tokens and a.speculative_method != "ngram":
             from augur.sim.draft import draft_weight_bytes
             weights += draft_weight_bytes(os.path.join(mdir, "config.json"), a.speculative_method, tp=a.tp)
-        kv_bytes = int(a.hbm_gb * 2**30 * a.mem_util) - weights - int(a.kv_reserve_gib * 2**30)
+        reserve = _kv_reserve_bytes(a, mdir, profile)
+        kv_bytes = int(a.hbm_gb * 2**30 * a.mem_util) - weights - reserve
         if kv_bytes <= 0:
-            print(f"model weights ({weights / 2**30:.1f} GiB/GPU) do not fit in {a.hbm_gb} GB", file=sys.stderr)
+            print(f"augur: model weights ({weights / 2**30:.1f} GiB/GPU) and vLLM's reserve ({reserve / 2**30:.2f} GiB) "
+                  f"do not fit in {a.hbm_gb} GiB x {a.mem_util}", file=sys.stderr)
             return 2
 
     replay_costs = None
@@ -550,7 +624,8 @@ def main(argv: list[str] | None = None) -> int:
                       async_scheduling=a.async_scheduling,
                       speculative=speculative,
                       spec_accept_rate=a.spec_accept_rate,
-                      scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks,
+                      scheduler_cls=scheduler_cls, scheduling_policy=a.scheduling_policy,
+                      kv_cache_dtype=a.kv_cache_dtype, num_gpu_blocks=a.num_gpu_blocks,
                       kv_offload_gib=a.kv_offload_gib,
                       kv_offload_link=_offload_link(a, *cpu_flags) if a.kv_offload_gib else None,
                       kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware,
@@ -590,8 +665,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # no fork on this machine
                 hbm_bw = None
         if hbm_bw is None:
-            from augur.cost.tables import NPU_MEM_BW_GBPS
-            hbm_bw = NPU_MEM_BW_GBPS.get(a.hardware)
+            hbm_bw = gpu_mem_bw_gbps(a.hardware)
         if not hbm_bw:
             if a.hbm_interference is not None or a.hbm_interference_prefill is not None:
                 print("augur: --hbm-interference needs the GPU memory bandwidth: give --hbm-bw-gbps", file=sys.stderr)

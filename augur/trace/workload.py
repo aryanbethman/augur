@@ -7,6 +7,8 @@ Every line is either a flat request or an agentic session (it has
 * A session's first call arrives at the session's ``arrival_time_ns``. Call
   ``i+1`` is released at call ``i``'s completion plus call ``i``'s
   ``tool_duration_ns`` (the wait *after* that call).
+* ``priority`` (optional, default 0; lower runs first under ``--scheduling-policy priority``) goes to vLLM with
+  the request; a session's calls each carry their own.
 * ``input_toks`` / ``output_toks`` set the prompt and output lengths.
   ``input_tok_ids`` drive prefix caching only: the prompt's ids are the
   recorded ones, and any tokens past them are filled with ids unique to the
@@ -43,6 +45,7 @@ class Call:
     output_ids: list[int]
     tool_wait_ns: int  # wait after this call before the session's next one
     after_step_start: bool = False  # replay only: reached the engine just after a step began
+    priority: int = 0  # vLLM request priority (only --scheduling-policy priority looks at it)
 
 
 @dataclass
@@ -124,7 +127,7 @@ class Workload:
             rec_out += self._filler.ids(n_out - len(rec_out), call_id + "/out")
         return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,
                     prompt_ids=rec_in, output_toks=n_out, output_ids=rec_out,
-                    tool_wait_ns=int(d.get("tool_duration_ns", 0) or 0))
+                    tool_wait_ns=int(d.get("tool_duration_ns", 0) or 0), priority=int(d.get("priority", 0) or 0))
 
     def next_call(self, s: Session, arrival_ns: int) -> Call:
         i = s.next_index
