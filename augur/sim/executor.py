@@ -37,6 +37,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from augur.cost import CostModel, SeqWork, StepShape
 from augur.sim.draft import draft_kv_spec
 from augur.sim.kvspec import layer_kv_specs
+from augur.sim.ngram import Context, NgramDrafter
 from augur.trace.workload import call_id
 
 SYNTHETIC_TOKEN = 0  # emitted when the workload recorded no output IDs
@@ -57,6 +58,7 @@ class SimContext:
     hardware: SimHardware
     # req_id -> recorded output token ids (may be shorter than the output, or empty)
     output_ids: dict[str, list[int]] = field(default_factory=dict)
+    recorded: set[str] = field(default_factory=set)  # req_ids whose output_ids are all recorded (not filler)
     # Written by the executor after each step, read by the driver.
     last_step_ns: int = 0
     last_shape: StepShape | None = None
@@ -76,6 +78,7 @@ class SimContext:
     # this rate each; drafts handed to vLLM's scheduler via take_draft_token_ids.
     spec_k: int = 0
     spec_accept_rate: float = 0.0
+    spec_rate_only: bool = False  # ngram: use the rate even for recorded calls (else vLLM's drafter + exact check)
     # Per request verified with drafts, beyond the profile's price: rejection sampling and draft bookkeeping (real
     # ngram runs: ~100-200 us per request per step after attention is priced at the multi-token query length).
     # Added to the step's GPU time, so async scheduling does not hide it; not used when replaying logged durations.
@@ -131,6 +134,8 @@ class SimContext:
 class _ReqState:
     num_prompt: int
     num_output: int = 0
+    context: Context | None = None  # ngram, token-faithful: prompt + emitted ids
+    drafts: list[int] = field(default_factory=list)  # ngram, token-faithful: proposed after the last step
 
 
 class SimWorker:
@@ -154,6 +159,14 @@ class SimWorker:
             self.cudagraph = CudagraphDispatcher(vllm_config)
             self.cudagraph.initialize_cudagraph_keys(mode, uniform_decode_query_len=q)
         self._step = 0
+        sc = vllm_config.speculative_config
+        faithful = sc is not None and sc.method == "ngram" and not ctx.spec_rate_only
+        self.ngram = NgramDrafter(vllm_config) if faithful else None
+
+    def _track(self, rid: str, st: _ReqState, ids) -> None:
+        """Token-faithful ngram: follow the request's real context (``ids``: its prompt and the outputs so far)."""
+        if self.ngram is not None and rid in self.ctx.recorded:
+            st.context = Context(ids, spare=len(self.ctx.output_ids[rid]) - st.num_output + self.ngram.k)
 
     # ---- start-up -------------------------------------------------------
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -277,7 +290,8 @@ class SimWorker:
             # only once all of those are recomputed.
             n_prompt = len(nr.prompt_token_ids or ())
             n_known = len(nr.prefill_token_ids) if nr.prefill_token_ids else n_prompt
-            self.reqs[nr.req_id] = _ReqState(num_prompt=n_prompt, num_output=n_known - n_prompt)
+            self.reqs[nr.req_id] = st = _ReqState(num_prompt=n_prompt, num_output=n_known - n_prompt)
+            self._track(nr.req_id, st, nr.prefill_token_ids or nr.prompt_token_ids)
             work.append((nr.req_id, nr.num_computed_tokens, so.num_scheduled_tokens[nr.req_id]))
         cr = so.scheduled_cached_reqs
         for i, rid in enumerate(cr.req_ids):
@@ -288,12 +302,15 @@ class SimWorker:
                 n_out = cr.num_output_tokens[i]
                 n_prompt = (len(all_ids) - n_out) if all_ids is not None else st.num_prompt
                 st = self.reqs[rid] = _ReqState(num_prompt=n_prompt, num_output=n_out)
+                if all_ids is not None:
+                    self._track(rid, st, all_ids)
             work.append((rid, cr.num_computed_tokens[i], so.num_scheduled_tokens[rid]))
 
         req_ids: list[str] = []
         sampled: list[list[int]] = []
         seqs: list[SeqWork] = []
         drafts_next: dict[str, list[int]] = {}
+        proposing: list[tuple[str, _ReqState]] = []  # token-faithful ngram: requests that emit this step
         spec = so.scheduled_spec_decode_tokens or {}
         self._step += 1
         for rid, before, num_new in work:
@@ -315,9 +332,16 @@ class SimWorker:
                 # see content, so the rate is a parameter.
                 accepted = 0
                 replay = self._replay_step()
+                faithful = st.context is not None and replay is None
                 if replay is not None:
                     # Replay: the logged run's acceptance (content-dependent).
                     accepted = max(replay[0].get(call_id(rid), 1) - 1, 0)
+                elif faithful:
+                    # The drafts the runner's drafter made from the real context (the scheduler may hold placeholders,
+                    # and fewer than were made) are accepted up to the first one that is not the next recorded id.
+                    while (accepted < min(n_draft, len(st.drafts)) and st.num_output + accepted < len(rec)
+                           and st.drafts[accepted] == rec[st.num_output + accepted]):
+                        accepted += 1
                 elif n_draft:
                     rng = random.Random(zlib.crc32(f"{rid}/{self._step}".encode()))
                     while accepted < n_draft and rng.random() < self.ctx.spec_accept_rate:
@@ -329,7 +353,12 @@ class SimWorker:
                         for i in range(n_emit)]
                 st.num_output += n_emit
                 sampled.append(toks)
-                if self.ctx.spec_k:
+                if faithful:
+                    st.context.append(toks)
+                    st.drafts = []
+                    if st.num_output < len(rec):
+                        proposing.append((rid, st))
+                elif self.ctx.spec_k:
                     # The drafter proposes the request's next recorded tokens,
                     # so accepted drafts are the right tokens. It does not know
                     # max_tokens: near the end it still proposes k (vLLM stops
@@ -347,6 +376,9 @@ class SimWorker:
                         drafts_next[rid] = nxt
             else:
                 sampled.append([])
+        if proposing:
+            for (rid, st), drafts in zip(proposing, self.ngram.propose([st.context for _, st in proposing])):
+                st.drafts = drafts_next[rid] = drafts
         if self.ctx.spec_k:
             self.ctx.pending_drafts = DraftTokenIds(req_ids=list(drafts_next),
                                                     draft_token_ids=list(drafts_next.values()))
