@@ -126,14 +126,28 @@ def _pre_events_steps(path, idx):
     return out
 
 
+def _pre_events_csv(d, rows, pattern, col):
+    """Frontier's and Vidur's preemptions from their per-request metrics: (None, row) once per preemption, the step
+    unknown (their step files do not say which requests were preempted)."""
+    f = sorted(glob.glob(os.path.join(d, pattern)))
+    if not f:
+        return None
+    out = []
+    for r in csv.DictReader(open(f[-1])):
+        out += [(None, int(float(r["Request Id"])))] * int(float(r.get(col, 0) or 0))
+    return out
+
+
 def _preempt(events, real_events):
     if events is None:
         return None
     rows_ = {r for _, r in events}
     real_rows = {r for _, r in real_events}
-    return {"events": len(events), "requests": len(rows_), "first_step": min((s for s, _ in events), default=None),
+    known = all(s is not None for s, _ in events)
+    return {"events": len(events), "requests": len(rows_), "first_step": min((s for s, _ in events if s is not None), default=None),
             "real_requests_also": len(rows_ & real_rows) / len(real_rows) if real_rows else None,
-            "same_step_and_request": len(set(events) & set(real_events)) / len(real_events) if real_events else None}
+            "same_step_and_request": (len(set(events) & set(real_events)) / len(real_events) if real_events else None)
+            if known else None}
 
 
 _SESSION_RID = re.compile(r"session_(.*)_round_(\d+)_\d+$")
@@ -301,6 +315,11 @@ def compare(d):
         e = _pre_events_steps(os.path.join(d, f"blis_steps{v}.jsonl"), {r["call_id"]: i for i, r in enumerate(rows)})
         if e is not None:
             pre_ev["blis" + v] = e
+        for name, pat, col in (("frontier", f"frontier_out{v}/*/*/r/request_metrics.csv", "request_total_preemption_count"),
+                               ("vidur", f"vidur_out{v}/*/request_metrics.csv", "request_num_restarts")):
+            e = _pre_events_csv(d, rows, pat, col)
+            if e is not None:
+                pre_ev[name + v] = e
     real_eng = runs["real"][0]
     real_cl = _real_client(meta, rows) or _client_side(real_eng, rows)
     cl = {n: (m if n.endswith("_replay") else _client_side(m, rows)) for n, (m, _, _) in runs.items()}
@@ -378,9 +397,10 @@ def render(results):
             if p is None:
                 body += f"| {name} | {r['pre']} | n/a (no per-step record) | | | |\n"
             else:
-                body += (f"| {name} | {p['events']} | {p['requests']} | {p['first_step']} | "
+                body += (f"| {name} | {p['events']} | {p['requests']} | {_fmt(p['first_step'], 'd')} | "
                          f"{_fmt(None if p['real_requests_also'] is None else 100 * p['real_requests_also'], '.0f')}% | "
-                         f"{_fmt(None if p['same_step_and_request'] is None else 100 * p['same_step_and_request'], '.0f')}% |\n")
+                         f"{_fmt(None if p['same_step_and_request'] is None else 100 * p['same_step_and_request'], '.0f')}"
+                         f"{'' if p['same_step_and_request'] is None else '%'} |\n")
         out.append("Preemptions (the real run's from its step log, not client.csv):\n\n" + hdr + body)
     return "\n".join(out)
 

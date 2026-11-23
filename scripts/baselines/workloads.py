@@ -18,6 +18,7 @@ call, in arrival order, with
 * ``blocks``: the prompt's full 16-token blocks as chained hashes (vLLM's prefix-cache
   keys), from the workload's token ids;
 * ``prefix_group``, ``prefix_len``: the same sharing, as BLIS's trace states it (below);
+* ``priority``: the call's vLLM priority (the workload's ``priority``, 0 when it has none);
 * ``real``: first-token, finish and output-token numbers from the step log. Times are the
   engine's: a request's first token is the update of the step that emitted it.
 
@@ -32,11 +33,16 @@ Then one subcommand per simulator writes that simulator's input from requests.js
     python scripts/baselines/workloads.py frontier out/baselines/swe50     # frontier.csv
     python scripts/baselines/workloads.py blis    out/baselines/swe50      # blis.yaml, blis.csv, scen/scenario.yaml
 
+The engine settings come from the run's server.log (max-model-len, max-num-batched-tokens, max-num-seqs, KV blocks,
+async scheduling, prefix caching, scheduling policy); ``prepare`` takes ``--max-model-len``, ``--max-num-batched-tokens``,
+``--max-num-seqs``, ``--num-gpu-blocks``, ``--prefix-caching on|off``, ``--scheduling-policy fcfs|priority`` and
+``--async-scheduling sync|async`` to state them instead (a run directory without a server.log needs them all).
+
 How faithful each input is
-* Vidur has no prefix caching, no sessions and no token ids: arrival and the two lengths only.
+* Vidur has no prefix caching, no sessions, no token ids and no priority: arrival and the two lengths only.
 * Frontier takes ``block_hash_ids``, the prompt's chained block hashes: the same keys vLLM's
   prefix cache uses, so sharing is exact at block granularity. Sessions are flattened: each call
-  arrives at its recorded engine arrival.
+  arrives at its recorded engine arrival. Under the priority policy it also takes a ``priority`` column.
 * BLIS takes a ``prefix_group`` per request and prepends the group's one prefix (the first
   record's ``prefix_length``, the same for every member) to the request's ``input_tokens``. For
   flat requests we process them in arrival order, join the group of the earlier request with the
@@ -79,13 +85,16 @@ def _block_hashes(ids: list[int]) -> list[int]:
 
 
 def _server_meta(run_dir: str) -> dict:
-    text = open(os.path.join(run_dir, "server.log")).read()
+    path = os.path.join(run_dir, "server.log")
+    text = open(path).read() if os.path.exists(path) else ""
     m = re.search(r"non-default args: (\{.*\})", text)
     args = ast.literal_eval(m.group(1)) if m else {}
     kv = re.findall(r"GPU KV cache size: ([\d,]+) tokens", text)
     hit = re.findall(r"Prefix cache hit rate: ([\d.]+)%", text)
     spec = args.get("speculative_config") or {}
-    return {"max_model_len": args.get("max_model_len", 8192), "max_num_seqs": args.get("max_num_seqs", 128),
+    return {"prefix_caching": args.get("enable_prefix_caching", True),
+            "scheduling_policy": args.get("scheduling_policy", "fcfs"),
+            "max_model_len": args.get("max_model_len", 8192), "max_num_seqs": args.get("max_num_seqs", 128),
             "max_num_batched_tokens": args.get("max_num_batched_tokens", 2048),
             "kv_tokens": int(kv[-1].replace(",", "")) if kv else None,
             "num_gpu_blocks": int(kv[-1].replace(",", "")) // BLOCK if kv else None,
@@ -143,7 +152,17 @@ def prepare(a) -> int:
     log = sorted(glob.glob(os.path.join(a.run_dir, "steps.*.jsonl")))[-1]
     events = read_log(log)
     meta = _server_meta(a.run_dir)
-    meta.update(async_scheduling=is_async(events), step_log=os.path.abspath(log), workload=os.path.abspath(a.workload),
+    for k, v in (("max_model_len", a.max_model_len), ("max_num_batched_tokens", a.max_num_batched_tokens),
+                 ("max_num_seqs", a.max_num_seqs), ("num_gpu_blocks", a.num_gpu_blocks),
+                 ("scheduling_policy", a.scheduling_policy)):
+        if v is not None:
+            meta[k] = v
+    if a.num_gpu_blocks is not None:
+        meta["kv_tokens"] = a.num_gpu_blocks * BLOCK
+    if a.prefix_caching is not None:
+        meta["prefix_caching"] = a.prefix_caching == "on"
+    meta.update(async_scheduling=is_async(events) if a.async_scheduling is None else a.async_scheduling == "async")
+    meta.update(step_log=os.path.abspath(log), workload=os.path.abspath(a.workload),
                 run_dir=os.path.abspath(a.run_dir))
     wl = ReplayWorkload(a.workload, log_path=log, recorded_outputs=False, filler_vocab=150000)
     calls = list(wl.entries())  # arrival_ns: engine arrival, session chaining off
@@ -164,7 +183,8 @@ def prepare(a) -> int:
     for c in calls:
         fe = (a.frontend_latency_ms * 1e3 + a.frontend_us_per_token * len(c.prompt_ids)) / 1e6
         rows.append({"call_id": c.call_id, "arrival_s": c.arrival_ns / 1e9, "input": len(c.prompt_ids),
-                     "output": c.output_toks, "blocks": _block_hashes(c.prompt_ids), "real": real.get(c.call_id),
+                     "output": c.output_toks, "blocks": _block_hashes(c.prompt_ids), "priority": c.priority,
+                     "real": real.get(c.call_id),
                      # a flat request's and a session's first call's engine arrival in augur's normal run: sent at the
                      # trace's time, a front end earlier than it reaches the engine; None for a later call
                      "arrival_trace_s": sent[c.call_id] + fe if c.call_id in sent else None,
@@ -303,15 +323,17 @@ def vidur(a) -> int:
 
 
 def frontier(a) -> int:
-    rows, _ = _load(a.out)
+    rows, meta = _load(a.out)
+    prio = meta["scheduling_policy"] == "priority"
     for v in ("", "_replay"):
         sessions: dict[str, int] = {}
         with open(os.path.join(a.out, f"frontier{v}.csv"), "w") as f:
-            f.write("arrived_at,num_prefill_tokens,num_decode_tokens,session_id,block_hash_ids\n")
+            f.write("arrived_at,num_prefill_tokens,num_decode_tokens,session_id,block_hash_ids"
+                    + (",priority" if prio else "") + "\n")
             for i, r in enumerate(rows):
                 sid = r["call_id"].rsplit("#", 1)[0] if "#" in r["call_id"] else r["call_id"]
                 f.write(f"{_arrival(r, bool(v)):.9f},{r['input']},{r['output']},{sessions.setdefault(sid, len(sessions))},"
-                        f"{'|'.join(map(str, r['blocks']))}\n")
+                        f"{'|'.join(map(str, r['blocks']))}" + (f",{r['priority']}" if prio else "") + "\n")
     return 0
 
 
@@ -321,6 +343,8 @@ def blis(a) -> int:
     every call at its real arrival (``replay --session-mode fixed-accumulate`` for sessions)."""
     rows, meta = _load(a.out)
     sessions = any("#" in r["call_id"] for r in rows)
+    prio = meta["scheduling_policy"] == "priority"
+    cache = meta["prefix_caching"]
     for v in ("", "_replay"):
         replay = bool(v)
         think = sessions and not replay
@@ -357,15 +381,20 @@ def blis(a) -> int:
                         tail = f",{reset}"
                     last[sid] = r
                 else:
-                    # input_tokens is what follows the shared prefix (the replay prepends the group's prefix)
-                    n_in = r["input"] - r["prefix_len"]
-                f.write(f"{i},c,,,{sid},{rnd},{r['prefix_group']},{r['prefix_len']},false,{n_in},{r['output']},0,0,0,0,0,,0,"
+                    # input_tokens is what follows the shared prefix (the replay prepends the group's prefix); with
+                    # the prefix cache off nothing is shared, so no group
+                    n_in = r["input"] - (r["prefix_len"] if cache else 0)
+                grp, plen = (r["prefix_group"], r["prefix_len"]) if cache else ("", 0)
+                # a numeric SLO class is the request's vLLM priority (blis_priority.patch)
+                f.write(f"{i},c,,{r['priority'] if prio else ''},{sid},{rnd},{grp},{plen},false,{n_in},{r['output']},0,0,0,0,0,,0,"
                         f"{round(_arrival(r, replay) * 1e6)},0,0,ok{tail}\n")
     spec = ""
     if meta["spec_k"]:
         s = meta["spec"]
         spec = ("      speculative_config: {method: ngram, num_speculative_tokens: %d}\n"
                 % s["num_speculative_tokens"])
+    knobs = ("" if cache else "      enable_prefix_caching: false\n") + \
+        ("      scheduling_policy: priority\n" if prio else "")  # (the engine's defaults otherwise)
     offload, tiers = "", ""
     if meta["kv_offloading_gib"]:
         tiers = ", cost-model-offload-tiers"
@@ -397,7 +426,7 @@ pools:
       max_model_len: {meta['max_model_len']}
       gpu_memory_utilization: 0.85
       async_scheduling: {'true' if meta['async_scheduling'] else 'false'}
-{spec}{offload}""")
+{knobs}{spec}{offload}""")
     return 0
 
 
@@ -417,6 +446,14 @@ def main(argv=None) -> int:
     pr.add_argument("run_dir")
     pr.add_argument("workload")
     pr.add_argument("out")
+    # the run's settings, where they are not in its server.log (or to override it)
+    pr.add_argument("--max-model-len", type=int, default=None)
+    pr.add_argument("--max-num-batched-tokens", type=int, default=None)
+    pr.add_argument("--max-num-seqs", type=int, default=None)
+    pr.add_argument("--num-gpu-blocks", type=int, default=None)
+    pr.add_argument("--prefix-caching", choices=("on", "off"), default=None)
+    pr.add_argument("--scheduling-policy", choices=("fcfs", "priority"), default=None)
+    pr.add_argument("--async-scheduling", choices=("sync", "async"), default=None)
     # augur's front-end and delivery defaults (augur.cli), which its normal run applies to every call
     pr.add_argument("--frontend-latency-ms", type=float, default=3.4)
     pr.add_argument("--frontend-us-per-token", type=float, default=3.0)

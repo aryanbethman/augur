@@ -3,6 +3,13 @@
 # scripts/baselines/pricer.py. usage:  scripts/baselines/run.sh RUN [STAGE...]
 #   RUN    smoke sharegpt300 sharegpt300_async sharegpt300_spec sharegpt300_spec_async swe50 swe50_async
 #          swe50_offload16 swe50_offload16_async bench_r6   (the real runs under $AUGUR_OUT, default ~/augur/out)
+#          any other real run: AUGUR_RUN_DIR=<run dir> AUGUR_WORKLOAD=<workload jsonl> run.sh NAME [STAGE...]  (NAME is the
+#          directory under out/baselines/; the run dir holds steps.*.jsonl and, for the settings, server.log). The
+#          settings come from its server.log; these env vars state or override them: MAX_MODEL_LEN MAX_BATCHED_TOKENS
+#          MAX_NUM_SEQS NUM_GPU_BLOCKS PREFIX_CACHING=on|off SCHEDULING_POLICY=fcfs|priority ASYNC_SCHEDULING=sync|async.
+#          The workload's per-request "priority" goes to BLIS (blis_priority.patch, built into
+#          inference-sim-prio/blis-ext-prio) and Frontier; Vidur has none, so it is not run. Prefix caching off:
+#          BLIS and Frontier switch it off, Vidur has none.
 #   STAGE  prepare augur blis frontier vidur replay compare   (default: all of them; frontier and vidur only for runs
 #          they can take: they have no async scheduling, speculative decoding or KV offload, so those are skipped
 #          unless a stage is named: run.sh bench_r6 prepare augur blis frontier vidur compare)
@@ -26,8 +33,16 @@ case $run in
   sharegpt300*) dir=$OUTR/real/$run; wl=$SG;;
   swe50*) dir=$OUTR/real/$run; wl=$SW;;
   bench_r6) dir=$OUTR/bench/rand1024_r6_log; wl=$dir/requests.jsonl;;
-  *) echo "unknown run $run" >&2; exit 2;;
+  *) if [ -n "${AUGUR_RUN_DIR:-}" ] && [ -n "${AUGUR_WORKLOAD:-}" ]; then dir=$AUGUR_RUN_DIR; wl=$AUGUR_WORKLOAD
+     else echo "unknown run $run (or set AUGUR_RUN_DIR and AUGUR_WORKLOAD)" >&2; exit 2; fi;;
 esac
+# the run's settings stated from outside (else prepare reads them from its server.log)
+PREP=""
+for kv in max-model-len:MAX_MODEL_LEN max-num-batched-tokens:MAX_BATCHED_TOKENS max-num-seqs:MAX_NUM_SEQS \
+          num-gpu-blocks:NUM_GPU_BLOCKS prefix-caching:PREFIX_CACHING scheduling-policy:SCHEDULING_POLICY \
+          async-scheduling:ASYNC_SCHEDULING; do
+  v=${kv#*:}; [ -n "${!v:-}" ] && PREP="$PREP --${kv%%:*} ${!v}"
+done
 O=$W/out/baselines/$run
 get() { $PY $S/workloads.py get $O "$1"; }
 stages=${*:-prepare augur blis frontier vidur replay compare}
@@ -36,7 +51,7 @@ explicit=$([ -n "$*" ] && echo 1 || echo 0)
 V=""; PX=""   # variant suffix of the outputs, and extra pricer.py arguments (replay)
 
 prepare() {
-  $PY $S/workloads.py prepare $dir $wl $O > /dev/null && for s in vidur frontier blis; do $PY $S/workloads.py $s $O; done
+  $PY $S/workloads.py prepare $dir $wl $O $PREP > /dev/null && for s in vidur frontier blis; do $PY $S/workloads.py $s $O; done
   # what was run: the simulators' commits and BLIS's engine module, Go, and this checkout
   { echo "{"
     for d in vidur Frontier inference-sim; do echo "\"$d\": \"$(git -C $BASE/$d rev-parse HEAD)\","; done
@@ -47,7 +62,9 @@ prepare() {
 
 augur() {
   local extra=""
-  [ "$(get async_scheduling)" = true ] && extra="--async-scheduling" || extra="--no-async-scheduling"
+  [ "$(get prefix_caching)" = false ] && extra="--no-prefix-caching"
+  [ "$(get scheduling_policy)" = priority ] && extra="$extra --scheduling-policy priority"
+  [ "$(get async_scheduling)" = true ] && extra="$extra --async-scheduling" || extra="$extra --no-async-scheduling"
   local k=$(get spec_k); [ "$k" != 0 ] && extra="$extra --num-speculative-tokens $k --spec-accept-rate $(get acceptance.spec_p)"
   local g=$(get kv_offloading_gib); [ -n "$g" ] && extra="$extra --kv-offload-gib $g --kv-offload-gbps 12.7"
   rm -f $O/augur_steps.*.jsonl
@@ -69,8 +86,21 @@ blis_build() {
   rm -rf ${TMPDIR:-/tmp}/blis-gocache
 }
 
+# BLIS's host sends every request at priority 0 and refuses a priority policy: a copy of inference-sim with
+# blis_priority.patch (a numeric SLO class is the request's priority), built beside it in inference-sim-prio.
+blis_prio_build() {
+  local d=$BASE/inference-sim-prio
+  [ -x $d/blis-ext-prio ] && return
+  mkdir -p $d && (cd $BASE/inference-sim && git archive HEAD) | tar -x -C $d && (cd $d && patch -p1 < $S/blis_priority.patch) || return 1
+  (cd $d && PATH=$HOME/opt/go/bin:$PATH GOPATH=$BASE/inference-sim/.gopath GOCACHE=${TMPDIR:-/tmp}/blis-gocache GOTOOLCHAIN=local \
+    GOFLAGS=-mod=mod GOPROXY=off go build -p 4 -modfile=$BASE/go.ext.mod -o blis-ext-prio main.go)
+  rm -rf ${TMPDIR:-/tmp}/blis-gocache
+}
+
 blis() {
   blis_build || return 1
+  local bin=$BASE/inference-sim/blis-ext
+  [ "$(get scheduling_policy)" = priority ] && { blis_prio_build || return 1; bin=$BASE/inference-sim-prio/blis-ext-prio; }
   local mml=$(get max_model_len) flags="" k=$(get spec_k)
   # sessions: closed loop (think times in the trace) in the normal run, recorded arrivals in the replay
   if grep -q accumulate $O/blis$V.yaml; then
@@ -86,7 +116,7 @@ blis() {
   rm -f $O/blis_steps$V.jsonl
   BLIS_PRICER_CMD="env PYTHONPATH=$W VLLM_LOGGING_LEVEL=ERROR $PY $S/pricer.py serve --max-model-len $mml $PX" \
   BLIS_NUM_GPU_BLOCKS=$(get num_gpu_blocks) BLIS_STEP_LOG=$O/blis_steps$V.jsonl \
-    $BASE/inference-sim/blis-ext replay --scenarios $O/scen --scenario scenario.yaml --trace-header $O/blis$V.yaml \
+    $bin replay --scenarios $O/scen --scenario scenario.yaml --trace-header $O/blis$V.yaml \
       --trace-data $O/blis$V.csv $flags --output $O/blis_result$V.json > $O/blis$V.log 2>&1
   unset BLIS_SPEC_K BLIS_PRICER_NO_CPU BLIS_OFFLOAD_GBPS BLIS_OFFLOAD_BLOCK_BYTES
 }
@@ -107,7 +137,8 @@ frontier() {
       --vllm_v1_scheduler_config_max_model_len $mml --vllm_v1_scheduler_config_block_size 16 \
       --vllm_v1_scheduler_config_num_blocks_mode explicit --vllm_v1_scheduler_config_num_blocks $(get num_gpu_blocks) \
       --vllm_v1_scheduler_config_watermark_blocks_fraction 0 --vllm_v1_scheduler_config_enable_chunked_prefill \
-      --vllm_v1_scheduler_config_enable_prefix_caching --decode_cuda_graph_mode none \
+      --$([ "$(get prefix_caching)" = false ] && echo no-)vllm_v1_scheduler_config_enable_prefix_caching \
+      --vllm_v1_scheduler_config_scheduling_policy $(get scheduling_policy) --decode_cuda_graph_mode none \
       --request_generator_config_type trace_replay --trace_request_generator_config_trace_file $O/frontier$V.csv \
       --trace_request_generator_config_max_tokens $mml \
       --random_forrest_execution_time_predictor_config_enable_dummy_mode \
@@ -117,9 +148,11 @@ frontier() {
       --no-metrics_config_enable_chrome_trace --no-metrics_config_write_json_trace) > $O/frontier$V.log 2>&1
 }
 
-# Vidur: its sarathi scheduler (chunked prefill). Its vllm scheduler cannot take these runs: prompts above its
+# Vidur: its sarathi scheduler (chunked prefill; no priority, so a priority run is skipped, and no prefix cache, so a
+# run with it off is the same to it). Its vllm scheduler cannot take these runs: prompts above its
 # max_tokens_in_batch are never scheduled, and its padded batches fall outside the predictor's token grid.
 vidur() {
+  [ "$(get scheduling_policy)" = priority ] && { echo "vidur has no priority scheduling: not run" >&2; return 0; }
   local mml=$(get max_model_len)
   rm -rf $O/vidur_out$V
   (cd $BASE/vidur && . .venv/bin/activate && PYTHONPATH=$PWD WANDB_MODE=disabled AUGUR_WT=$W \
