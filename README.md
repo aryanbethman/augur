@@ -178,7 +178,10 @@ through a checkout of the fork
 `llmservingsim` extra): its profiles, model configs and ASTRA-Sim.
 `python -m augur.cost.convert` turns one of its dense profiles into a shipped
 one. `--model-config` takes any Hugging Face `config.json`, and
-`--cost fixed` runs any model with a constant step time.
+`--cost fixed` runs any model with a constant step time. `--cost roofline`
+prices any model on any GPU in `GPU_FACTS` (A100, L40S, H100, H200, B200 and
+others) from FLOPs, bytes and datasheet peaks, with no profile: a coarse
+fallback, 25-40% off end to end on a held-out GPU (docs/accuracy.md section 2).
 
 To add a GPU or model, run `python -m augur.profile --model M --hardware NAME
 --tp N` on that GPU: it profiles with the LLMServingSim fork's profiler (KV up

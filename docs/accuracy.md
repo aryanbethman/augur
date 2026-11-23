@@ -112,6 +112,18 @@ workloads below; measured with vLLM 0.33 on an i7-12700, and it will differ on
 other host CPUs). Under async scheduling vLLM hides this work behind the
 previous batch, and results do not move with it.
 
+**GPUs with no profile: `--cost roofline`.** Each operation takes max(FLOPs / (peak × efficiency), bytes /
+(bandwidth × efficiency)) plus a per-kernel overhead, from the model's config and the GPU's datasheet peaks
+(`GPU_FACTS`); ten parameters shared by all GPUs, fitted to the shipped profiles (`python -m
+augur.cost.roofline_fit fit`). It is a coarse fallback. With every profile of one GPU held out of the fit, median
+step error (GPU work only) is 3-13% for decode on the RTX PRO 6000 and H100 (GEMMs only: the H100 profile's
+attention and elementwise tables are not usable) but 13 / 47 / 26% for decode / prefill / mixed on the RTX 4060
+Ti, whose GEMMs reach 97% of datasheet peak against 77-80% elsewhere, which no shared efficiency captures. End to
+end on the real 4060 Ti runs with it held out: mean TTFT / TPOT / latency +27 / +22 / +25% (ShareGPT sync), +42 /
++29 / +37% (SWE-bench), and +268% mean TTFT at the 6 req/s knee, where slow steps grow the queue. The breakdown
+puts that error in step time (decisions within 2.3%), so comparisons that turn on scheduling hold under it. One
+measured GEMM rate and decode step for a new GPU (`--roofline-params FILE`) should cut the error most; untested.
+
 ## 3. End to end
 
 `augur bench` against real `vllm bench serve` with the same arguments

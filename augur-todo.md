@@ -118,9 +118,10 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     this is where the gap is. Measure BLIS's error against augur's on each
 21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
     effect; contrast with a port, which reproduces 57% of the steps of the same run
-22. [ ] Where BLIS is ahead: a pluggable timing model for GPUs nobody has profiled (a roofline pricer, or an adapter
-    to BLIS's timing, giving "vLLM's real decisions under any timing model"); measure augur's speed against BLIS's
-    at 256-1,024 GPUs and report it honestly
+22. [~] Where BLIS is ahead. Done: `--cost roofline` (7ebce16; docs/accuracy.md section 2), a coarse fallback for
+    unprofiled GPUs (held-out 4060 Ti: +22-42% end to end; 3-13% median decode step error on the PRO 6000 and H100).
+    Left: a one-point calibration for a new GPU; measure augur's speed against BLIS's at 256-1,024 GPUs on a quiet
+    host and report it honestly
 
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
 DP2 + EP2 on the tables, the sync offload replay difference fixed.
