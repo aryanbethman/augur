@@ -23,8 +23,6 @@ from typing import Any, Callable
 import random
 import zlib
 
-import torch
-
 from vllm.config import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorMetadata,
@@ -33,11 +31,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import OffloadingConnectorMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 
 from augur.cost import CostModel, SeqWork, StepShape
 from augur.sim.draft import draft_kv_spec
+from augur.sim.kvspec import layer_kv_specs
 from augur.trace.workload import call_id
 
 SYNTHETIC_TOKEN = 0  # emitted when the workload recorded no output IDs
@@ -157,24 +156,11 @@ class SimWorker:
         self._step = 0
 
     # ---- start-up -------------------------------------------------------
-    def get_kv_cache_spec(self) -> dict[str, FullAttentionSpec]:
-        mc = self.vllm_config.model_config
-        pc = self.vllm_config.parallel_config
-        num_layers = mc.get_num_layers(pc)
-        num_kv_heads = mc.get_num_kv_heads(pc)
-        head_size = mc.get_head_size()
-        dtype = self.vllm_config.cache_config.cache_dtype
-        torch_dtype = mc.dtype if dtype in ("auto", None) else _kv_dtype(dtype)
-        block_size = self.vllm_config.cache_config.block_size
-        spec = FullAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            dtype=torch_dtype,
-        )
-        self.ctx.kv_block_bytes = spec.page_size_bytes * num_layers
-        layers = {f"model.layers.{i}.self_attn.attn": spec for i in range(num_layers)}
-        draft = draft_kv_spec(self.vllm_config, spec)  # EAGLE / MTP layers take KV next to the target's
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        layers = layer_kv_specs(self.vllm_config)
+        self.ctx.kv_block_bytes = sum(spec.page_size_bytes for spec in layers.values())
+        # EAGLE / MTP layers take KV next to the target's.
+        draft = draft_kv_spec(self.vllm_config, layers)
         if draft is not None:
             draft_spec, n_draft = draft
             self.ctx.kv_block_bytes += draft_spec.page_size_bytes * n_draft
@@ -410,12 +396,6 @@ class SimWorker:
             sampled_token_ids=sampled,
             kv_connector_output=kvo,
         )
-
-
-def _kv_dtype(name: str) -> torch.dtype:
-    if name.startswith("fp8"):
-        return torch.float8_e4m3fn
-    return {"bfloat16": torch.bfloat16, "float16": torch.float16, "half": torch.float16}[name]
 
 
 def make_sim_executor(ctx: SimContext) -> type[Executor]:
