@@ -10,6 +10,7 @@ them is kept, with random shapes on top.  Example:
       --workload-json llama_sync.json llama_async.json --out tests/data/table_cost/llama-3.1-8b-rtxpro6000.json.gz
 
 TP>1: add --tp N --cluster-config FILE (the fork cluster config of the runs); no CPU-memory variant is built.
+--profile-variant NAME prices from the fork's perf/<hw>/<model>/NAME folder (the profile is then NAME-tp<N>).
 Workload shapes are priced by the fork during the collect run (its "prices"), random shapes here; shapes TableCost
 refuses (outside its regime) are skipped, and --random-pairs caps the distinct (tokens, sequences) pairs of the
 random shapes (each costs one ASTRA-Sim binary run).
@@ -60,16 +61,19 @@ def main():
     ap.add_argument("--workload-sample", type=int, default=3000, help="keep this many workload shapes, evenly spaced")
     ap.add_argument("--tp", type=int, default=1); ap.add_argument("--cluster-config", default=None)
     ap.add_argument("--random-pairs", type=int, default=0, help="TP>1: cap on distinct (tokens, sequences) pairs")
+    ap.add_argument("--profile-variant", default=None, help="the fork's profile folder (e.g. bf16-tp4proj)")
     a = ap.parse_args()
     fork = os.path.abspath(os.path.expanduser(a.fork))
     tp = a.tp
     from augur.cost.tables import OutsideRegime, TableCost
     if tp > 1:
-        ref = LLMServingSimCost(fork, a.hardware, a.model, tp=tp, cluster_config=os.path.abspath(a.cluster_config))
+        ref = LLMServingSimCost(fork, a.hardware, a.model, tp=tp, cluster_config=os.path.abspath(a.cluster_config),
+                                profile_variant=a.profile_variant)
         mine = TableCost(a.profile, **cluster_params(a.cluster_config))
     else:
-        ref = LLMServingSimCost(fork, a.hardware, a.model)
-        ref2 = LLMServingSimCost(fork, a.hardware, a.model, cpu_mem_bw_gbps=3.7, cpu_mem_latency_ns=123)
+        ref = LLMServingSimCost(fork, a.hardware, a.model, profile_variant=a.profile_variant)
+        ref2 = LLMServingSimCost(fork, a.hardware, a.model, cpu_mem_bw_gbps=3.7, cpu_mem_latency_ns=123,
+                                 profile_variant=a.profile_variant)
         mine = TableCost(a.profile)
 
     def accepts(s):  # shapes TableCost refuses (outside the guard's regime; MoE token counts the fork's tables lack)
@@ -106,6 +110,8 @@ def main():
            "row_layout": "[padded_tokens or -1, dummy, [chunk, history, ...], [decode kv, ...], decode q len, expected ns]",
            "workload_runs": runs, "workload_distinct_shapes": total, "workload": workload, "random_seed": a.seed, "random": rnd,
            "cpu_variant": {"cpu_mem_bw": 3.7, "cpu_mem_latency_ns": 123, "rows": cpu}}
+    if a.profile_variant:
+        out["variant"] = a.profile_variant
     if tp > 1:
         out["tp"] = tp
         out["params"] = {"link_bw": mine.link_bw, "link_latency_ns": mine.link_latency_ns, "npu_mem_bw": mine.npu_mem_bw,

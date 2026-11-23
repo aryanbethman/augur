@@ -9,10 +9,11 @@
 All timings use CUDA events; medians of repeats after warmups. Output: a table on stdout and --out JSON.
 usage: CUDA_VISIBLE_DEVICES=0 python scripts/contention_bench.py [--model Qwen/Qwen3-1.7B] [--out out/contention.json]
 
-Two-GPU mode (--two-gpu, needs both GPUs visible; copies only, no kernels): do two GPUs copying at once contend on the
-shared host side? One thread per (GPU, direction) with its own pinned host buffer and stream, started together after a
-barrier; cases: each GPU alone, both H2D, both D2H, GPU0 H2D + GPU1 D2H, all four directions, optionally with
---host-load N processes streaming memcpy on the host (host-memory contention). Prints per-GPU and aggregate GB/s.
+Two-GPU mode (--two-gpu; copies only, no kernels): do two GPUs copying at once contend on the shared host side?
+One thread per (GPU, direction) with its own pinned host buffer and stream, started together after a barrier;
+cases: each GPU alone, both H2D, both D2H, GPU0 H2D + GPU1 D2H, all four directions, GPU0 both directions,
+optionally with --host-load N processes streaming memcpy on the host (scripts/host_mem_load.py; host-memory
+contention). Prints per-GPU and aggregate GB/s. With one visible GPU only its own cases run.
 usage: python scripts/contention_bench.py --two-gpu [--host-load 4] [--out out/contention_2gpu.json]
 """
 import argparse
@@ -106,37 +107,24 @@ def kernel_fns(hidden, inter, batch):
     return run, 28 * layer_bytes
 
 
-def _host_load(n, stop):
-    import multiprocessing as mp
-    import numpy as np
-
-    def burn(ev):
-        a = np.ones(1 << 28, dtype=np.uint8); b = np.empty_like(a)  # 256 MB each: far beyond the caches
-        while not ev.is_set():
-            np.copyto(b, a)
-    evs = [mp.Event() for _ in range(n)]
-    ps = [mp.Process(target=burn, args=(e,), daemon=True) for e in evs]
-    for p in ps:
-        p.start()
-    stop.extend(evs)
-    return ps
-
-
 def two_gpu(a):
     """Concurrent copy cases over GPU 0 and GPU 1; see the module docstring."""
     n_gpu = torch.cuda.device_count()
-    if n_gpu < 2:
-        sys.exit("--two-gpu needs two visible GPUs")
-    R = {"devices": [torch.cuda.get_device_name(i) for i in (0, 1)], "cases": {}}
+    if n_gpu < 1:
+        sys.exit("--two-gpu needs a visible GPU")
+    R = {"devices": [torch.cuda.get_device_name(i) for i in range(min(n_gpu, 2))], "cases": {}}
     cases = [("g0 H2D alone", [(0, "h2d")]), ("g0 D2H alone", [(0, "d2h")]), ("g1 H2D alone", [(1, "h2d")]),
              ("g1 D2H alone", [(1, "d2h")]), ("both H2D", [(0, "h2d"), (1, "h2d")]),
              ("both D2H", [(0, "d2h"), (1, "d2h")]), ("g0 H2D + g1 D2H", [(0, "h2d"), (1, "d2h")]),
              ("g0 D2H + g1 H2D", [(0, "d2h"), (1, "h2d")]),
-             ("all four", [(0, "h2d"), (0, "d2h"), (1, "h2d"), (1, "d2h")])]
-    stop, procs = [], []
+             ("all four", [(0, "h2d"), (0, "d2h"), (1, "h2d"), (1, "d2h")]),
+             ("g0 H2D + g0 D2H", [(0, "h2d"), (0, "d2h")])]
+    cases = [(c, s) for c, s in cases if all(g < n_gpu for g, _ in s)]  # one GPU: its own cases only
+    from host_mem_load import start
     for load in ([0, a.host_load] if a.host_load else [0]):
+        halt = None
         if load:
-            procs = _host_load(load, stop)
+            halt = start(load)
             time.sleep(1.0)
         print(f"\nhost memcpy load: {load} processes  (uptime: {open('/proc/loadavg').read().split()[0]} load avg)")
         print(f"{'chunk':>9}  {'case':<18}{'per-stream GB/s':<34}{'sum GB/s':>10}")
@@ -173,9 +161,8 @@ def two_gpu(a):
                 lab = ", ".join(f"g{g} {d} {v:.2f}" for (g, d, *_), v in zip(bufs, per))
                 print(f"{cname:>9}  {case:<18}{lab:<34}{agg:>10.2f}")
                 R["cases"][f"{load}load/{cname}/{case}"] = {"per_stream": per, "aggregate": agg}
-        if load:
-            for e in stop:
-                e.set()
+        if halt:
+            halt()
     with open(a.out, "w") as f:
         json.dump(R, f, indent=1)
     print("wrote", a.out)
@@ -188,7 +175,7 @@ def main():
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--bulk-mb", type=int, default=512)
     ap.add_argument("--two-gpu", action="store_true", help="two-GPU copy contention mode (see module docstring)")
-    ap.add_argument("--host-load", type=int, default=0, help="two-GPU mode: also run with N host memcpy processes")
+    ap.add_argument("--host-load", type=int, default=0, help="--two-gpu mode: also run with N host memcpy processes")
     a = ap.parse_args()
     if a.two_gpu:
         return two_gpu(a)

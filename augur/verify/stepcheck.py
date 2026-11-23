@@ -74,7 +74,8 @@ def main(argv=None) -> int:
     p.add_argument("--max-num-seqs", type=int, default=128)
     p.add_argument("--max-num-batched-tokens", type=int, default=2048)
     p.add_argument("--max-model-len", type=int, default=8192)
-    p.add_argument("--csv", default=None, help="per-step rows: class, tokens, seqs, padded, measured, predicted")
+    p.add_argument("--csv", default=None, help="per-step rows: class, tokens, seqs, padded, measured, predicted, and the "
+                                               "offload bytes loaded and stored by transfers reported in the step")
     a = p.parse_args(argv)
 
     from augur.sim.engine import EngineSpec, SimEngine
@@ -101,12 +102,15 @@ def main(argv=None) -> int:
     disp = eng.core.model_executor.worker.cudagraph
 
     rows = []
-    for shape, measured in real_steps(read_log(a.log)):
+    events = read_log(a.log)
+    xfers = [u.get("xfer") or {} for _, u in steps(events)]  # same order as real_steps
+    for (shape, measured), x in zip(real_steps(events), xfers):
         uniform = all(x.num_new == 1 for x in shape.seqs)
         mode, desc = disp.dispatch(num_tokens=shape.total_tokens, uniform_decode=uniform)
         padded = StepShape(seqs=shape.seqs, padded_tokens=desc.num_tokens)
         rows.append((classify(shape), shape.total_tokens, len(shape.seqs), desc.num_tokens,
-                     mode != CUDAGraphMode.NONE, measured, cost.step_ns(padded)))
+                     mode != CUDAGraphMode.NONE, measured, cost.step_ns(padded),
+                     x.get("load", [0])[0], x.get("store", [0])[0]))
 
     m = np.array([r[5] for r in rows], dtype=float)
     pr = np.array([r[6] for r in rows], dtype=float)
@@ -130,7 +134,7 @@ def main(argv=None) -> int:
     print(json.dumps(report, indent=2))
     if a.csv:
         with open(a.csv, "w") as f:
-            f.write("class,tokens,seqs,padded,cudagraph,measured_ns,predicted_ns\n")
+            f.write("class,tokens,seqs,padded,cudagraph,measured_ns,predicted_ns,load_bytes,store_bytes\n")
             for r in rows:
                 f.write(",".join(str(int(x)) if isinstance(x, (bool, np.bool_)) else str(x) for x in r) + "\n")
     return 0

@@ -188,7 +188,24 @@ measured, and the runs to +1.9 / −5.8 / −1.3% (async) and −3.7 / −9.6 / 
 (sync). A further 160-210 us per request per step remains (rejection sampling,
 bookkeeping); `--spec-us-per-request` (default 100) adds it: +10.4 / +0.7 /
 +6.3% async, +3.6 / −3.8 / +0.6% sync. Decisions replay exactly (1,760 / 1,760
-and 1,653 / 1,653 steps). The shipped profile does not yet have the q=4 table.
+and 1,653 / 1,653 steps).
+
+The shipped profile now has attention at query lengths 1, 2 and 4 (since
+2026-11-23; fork e8625e0): the shipped q=1 tables and skew fit unchanged,
+plus the q=2 and q=4 attention and skew tables of the 2026-11-21 re-profile
+(query lengths in between use the nearer, ties going down). Prices of steps
+without speculation are identical to before. On the same two runs, with the
+defaults (`--spec-us-per-request` 100), mean TTFT / TPOT / latency:
+
+| Run | Shipped profile before (q=1) | Now (q=1,2,4) |
+| --- | --- | --- |
+| ngram k=3, async | −16.3 / −20.4 / −17.8% | +8.9 / −1.0 / +4.7% |
+| ngram k=3, sync | −21.0 / −23.3 / −21.6% | +2.2 / −5.4 / −0.9% |
+
+A wholly new profile from that run is no better: its other tables moved up
+to 5% from the shipped ones (run-to-run drift of the GPU) and step checks on
+the non-speculative runs got worse (predicted / measured 0.965 → 0.961
+ShareGPT, 0.973 → 0.955 SWE-bench), so only the q=2,4 tables were taken.
 
 **Knee TTFT** is the hardest metric. With the real engine arrivals held fixed
 (`--replay-arrivals`), median TTFT is 1,111 ms with the real step times and
@@ -226,14 +243,15 @@ measured, is reliable.
 | SWE-bench sessions, sync | session duration, median per-session error | 3.7% | 0.9% |
 | SWE-bench sessions, async | mean TTFT / TPOT / latency | −0.4 / −0.6 / −0.4% | −0.8 / +0.1 / −0.6% |
 | SWE-bench sessions, async | median per-call TTFT / TPOT / latency (absolute) | 8.7 / 8.2 / 6.1% | 9.1 / 7.0 / 6.1% |
-| ShareGPT 300, ngram k=3, async (shipped profile) | mean TPOT | −25.5% | −26.3% |
+| ShareGPT 300, ngram k=3, async (q=1 profile) | mean TPOT | −25.5% | −26.3% |
 | random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −1.2 / −1.9% |
 | random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −11.2 / −28.1%, −1.4% |
 | random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.4%, −2.1%, +2.0% |
 
 At 0.2 sessions/s the async SWE-bench engine is rarely saturated and the two
-schedulers agree. With speculation both price verification steps as
-one-token decodes (section 3).
+schedulers agree. With speculation and a q=1 profile both price verification
+steps as one-token decodes (section 3); the fork reads the shipped q=2,4
+tables as augur does.
 On sync runs and at light load augur is closer: LLMServingSim has no term for
 vLLM's CPU time, the API server or the client. On loaded async runs the two
 are equally close. LLMServingSim's async runs come out
@@ -251,8 +269,8 @@ time, to the ns:
 | Case | Identical calls |
 | --- | --- |
 | ShareGPT, Llama-3.1-8B, TP1 and TP2 | 300 / 300 |
-| SWE-bench, Qwen3-30B-A3B MoE, TP1 and TP2 | 765 / 765 |
-| ShareGPT, Qwen3-30B-A3B, DP2 + EP2 | 300 / 300 |
+| SWE-bench, Qwen3-30B-A3B MoE, TP1, TP2 and TP4 (projected bundle) | 765 / 765 |
+| ShareGPT, Qwen3-30B-A3B, DP2 + EP2 (fork or shipped tables) | 300 / 300 |
 | ShareGPT, 2 engines, round-robin | TPOT 300 / 300; others 150 / 300 |
 | ShareGPT, async scheduling | 128 / 300 TTFT |
 
@@ -305,11 +323,20 @@ ASTRA-priced runs are byte-identical to the table pricer and to each other,
 including when several run at once: each augur process runs ASTRA-Sim in its
 own directory. Before 2026-11-21 they shared the fork's serving/ folder through
 ASTRA-Sim's tmp__mem file, which could shift concurrent runs by a few ns or
-crash them. MoE (Qwen3-30B-A3B, TP1 and TP2) is priced from tables too:
-byte-identical to the fork on the SWE-bench runs, 8.7 s against 14.1 s (TP1)
-and 8.6 s against 19.4 s (TP2) per whole run. A DP round still costs about
-25 ms through the fork (chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace
-generation 4 ms).
+crash them. MoE (Qwen3-30B-A3B, TP1, TP2 and the projected TP4) is priced
+from tables too: byte-identical to the fork on the SWE-bench runs, 8.7 s
+against 14.1 s (TP1), 8.6 s against 19.4 s (TP2) and 9.0 s against 21.2 s
+(TP4) per whole run. DP2 + EP2 rounds of TP1 ranks are priced from tables as
+well (a closed form of ASTRA-Sim's two-rank all-gathers and reduce-scatters,
+tables.py): exact on 480 random rounds over six cluster settings and on 1,000
+rounds taken from fork runs. Whole runs on DP2 + EP2 write the same bytes as
+through the fork: ShareGPT 300 sync and async (8.4 s against 34.8 s),
+SWE-bench sessions sync (11.1 s against 159 s), and ShareGPT with KV offload
+to a 16 GiB CPU tier from a 2 GiB GPU cache, sync and async (12 s against
+103 s). Other DP layouts still cost about 25 ms a round through the fork
+(chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms); for
+them the fork has no native MoE tables and falls back to its legacy EP table,
+which it flags as unverified.
 
 Multi-GPU timing has not been compared with real hardware: the collective
 model is ASTRA-Sim's (ring over point-to-point links), not a measurement. On the 4060 Ti
@@ -375,10 +402,48 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   host-to-GPU runs (`--d2h-duplex-penalty`), two GPUs independent on an idle
   host, host memory shared under CPU load (`--host-mem-background-gbps`;
   aggregates of 14 and 24 GB/s reproduced, the per-GPU asymmetry is not). A
-  step beside transfers takes t x (1 + 1.4 x PCIe rate / GPU memory
-  bandwidth), sampled at its start (`--hbm-interference`; measured +7%, +5%,
-  +11-12%). With contention off, outputs and the real-GPU replays are
-  unchanged; with it on, own-log replay is exact.
+  step beside transfers takes t x (1 + K x PCIe rate / GPU memory
+  bandwidth), sampled at its start, with K = 1.1 for decode-only steps
+  (`--hbm-interference`) and 0.1 for steps with prefill tokens
+  (`--hbm-interference-prefill`), fitted on real vLLM steps (below). With
+  contention off, outputs and the real-GPU replays are unchanged; with it on,
+  own-log replay is exact.
+
+  Checked against real contended runs (2026-11-23, one RTX 4060 Ti,
+  `KV_GIB=4 scripts/real_offload_check.sh`): SWE-bench 50 sessions with a
+  16 GiB CPU tier and the GPU KV cache cut to 4 GiB (37,440 tokens), so
+  138 GB is loaded back and 341-348 GB stored per run. Transfers ran at the
+  idle-host rates (12.6-12.8 GB/s loads, 12.3-13.0 stores): the link itself
+  was not contended, and the fabric agrees (the same transfers with and
+  without it). What the real runs do show is the GPU slowing down beside
+  transfers. Replaying each run through the fabric gives every real step's
+  PCIe rate; against steps with none, measured / predicted rose by
+  4.4% (async) and 5.6% (sync) for decode steps beside a one-way transfer
+  (8.9-11% with both directions), and by 0.1-0.8% for steps with prefill
+  (`scripts/fit_hbm_interference.py`): K = 0.99 / 1.25 for decode and
+  0.17 / 0.03 with prefill. The microbenchmark's 1.4 (a memory-bound GEMV
+  kernel) was too high for real steps, and for compute-bound ones by far.
+  End to end, mean TTFT / TPOT / latency (K fitted on these runs, so this is
+  a calibration, not a held-out check):
+
+  | Run | Contention off | On, K = 1.4 (before) | On, fitted K |
+  | --- | --- | --- | --- |
+  | async | −1.1 / −0.8 / −1.0% | +2.4 / −0.2 / +2.0% | −0.1 / −0.8 / −0.2% |
+  | sync | −0.6 / −1.0 / −0.5% | −0.9 / −1.2 / −0.7% | −0.8 / −0.2 / −0.7% |
+
+  Decisions: both replay exactly (24,373 / 24,373 async, 24,195 / 24,195
+  sync). The sync run first differed in 4 steps: vLLM's worker submits a
+  step's async loads after the forward and polls only once its CPU has
+  launched the copies, so a large load (127 blocks, 233 MB) was reported in
+  the step that issued it, which took 71.5 ms against ~31. Replay now reports
+  such a job in its issuing step too. That CPU time is not priced in normal
+  runs: steps reporting loads ran 0.7 s (sync) and 0.3 s (async) longer than
+  priced over runs of 990 and 940 s. Four host
+  processes streaming memory barely slow one GPU's copies (H2D −2%, D2H 0%;
+  the losses of 11-56% need both GPUs copying), so a loaded-host run on one
+  GPU was not made. Before 2026-11-23 `--hardware RTX4060Ti` had no GPU
+  memory bandwidth, so interference was off for it unless `--hbm-bw-gbps` was
+  given; it now defaults to 288 GB/s.
 
   What it changes, on SWE-bench sessions compressed 500x on 8 engines per
   host (Qwen3-1.7B, 16 GiB CPU tier each): with 100 GB/s of host memory and
@@ -387,11 +452,13 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   steps differ and mean TTFT rises 3.2%; with prefill/decode (4+4) and KV
   pulls sharing NICs at 12.5 GB/s, 82% of steps differ and p99 TPOT rises from
   27.4 to 29.8 ms. Wall time +2 to +7%. Not checked against contended real
-  runs at 8 GPUs per host.
+  runs at 8 GPUs per host (these numbers predate the fitted K).
 
 ## Not modeled yet
 
 - Pipeline parallelism; LMCache; storage tiers (files, object stores) as
   anything but a slower memory tier.
 - API-server time as a function of prompt length (one constant now).
-- MoE at TP > 2 and DP + EP on the shipped tables (they use the fork).
+- On the shipped tables: MoE at TP 8, and DP layouts other than DP2 + EP2 of
+  TP1 ranks (they use the fork). TP4 is shipped for the projected bundle only
+  (bf16-tp4proj).

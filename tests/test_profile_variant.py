@@ -40,9 +40,12 @@ def run_augur(*args):
                           env=dict(os.environ, VLLM_LOGGING_LEVEL="WARNING"))
 
 
-def test_variant_needs_the_fork_pricer():
+def test_variant_with_tables_needs_a_shipped_profile_and_fixed_takes_none():
+    # --cost tables reads the shipped <variant>-tp<N> profile: there is a tp4 one for this variant, no tp1
     r = run_augur("--model", QWEN, "--workload", "x", "--cost", "tables", "--profile-variant", VARIANT)
-    assert r.returncode == 2 and "needs --cost llmservingsim" in r.stderr
+    assert r.returncode == 2 and "no bundled profile" in r.stderr and f"{VARIANT}-tp1" in r.stderr
+    r = run_augur("--model", QWEN, "--workload", "x", "--cost", "fixed", "--profile-variant", VARIANT)
+    assert r.returncode == 2 and "does not apply to --cost fixed" in r.stderr
 
 
 @pytest.mark.skipif(not os.path.isdir(os.path.join(PERF, VARIANT)), reason=f"fork has no {VARIANT} profile")

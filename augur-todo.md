@@ -6,7 +6,7 @@ inference experiments. Every item is judged by that.
 
 Order: top to bottom. Status: [ ] open, [~] in progress, [x] done.
 
-## Current state (2026-11-21)
+## Current state (2026-11-23)
 Merged on 2026-11-21: kv-aware router; KV offload with PD and DP (vLLM's MultiConnector); one step log per engine and
 exact replay of multi-engine runs (round-robin, PD, DP, with and without offload, sync and async); MoE
 (Qwen3-30B-A3B) priced from shipped tables at TP1/TP2; DP + async pays the CPU term; `cxl` tier preset; warning
@@ -16,6 +16,10 @@ run); ~10% faster step loop at 256 GPUs. Earlier: vLLM Router policies, KV offlo
 audit fixes (2026-11-18), --profile-variant (2026-11-19).
 
 Contention-aware co-simulation (design doc) is merged (2026-11-21), off by default (`--contention on`).
+
+2026-11-23 (branch feature/next-features-20261123): RTX 4060 Ti profile with q=1,2,4 attention (fork e8625e0, not
+pushed); MoE TP4 and DP2 + EP2 on the tables; contention checked against two real offload runs and
+--hbm-interference refitted (decode 1.1, prefill 0.1); exact replay of the sync 4 GiB-KV offload run.
 
 ## Verification runs, once the GPUs and CPUs are free
 1. [x] Rerun the PD async comparisons after the async loop fix: async PD moved 0.5% mean TTFT; sync identical
@@ -30,7 +34,16 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
    study; a short pilot on the RTX 4060 Ti first to shake out the memory probe
 
 ## Next features (proposed order, no runs needed)
-1. Contention: validate against real contended runs  2. Shipped profiles with decode query lengths 1,2,4  3. MoE TP4 and DP+EP on the tables
+First: push fork commit e8625e0 (the shipped 4060 Ti profile's provenance points at it).
+1. Automatic KV size from the memory accounting augur.profile records (now a manual --kv-reserve-gib; section 6)
+2. Pipeline parallelism (section 4; the fork has PP cluster configs to compare against)
+3. KV offload through the LMCache connector (section 4)
+4. Speculation: EAGLE with DP, MoE MTP pricing (section 4)
+5. Storage tiers (files, object stores) as more than a slow memory tier (section 4)
+6. Packaging: fork and ASTRA-Sim setup scripted, so the fork path installs like the tables path (section 3)
+
+Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
+DP2 + EP2 on the tables, the sync offload replay difference fixed.
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
@@ -82,30 +95,37 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
       as a one-token decode (1.4-1.9x), plus 160-210 us per request per step; the ngram proposer is 0.1-0.25 ms.
       --spec-us-per-request (default 100); stepcheck now prices spec steps as decodes. With a q=1,4 profile the real
       runs come to −1.3% (async) and +0.6% (sync) mean latency
-- [ ] Ship q=2,4 attention for RTX4060Ti Qwen3-1.7B (2026-11-22). Problem: the shipped profile times attention only
-      at 1 query per request, so ngram verification (1+k queries, 1.4-1.9x dearer) is priced as a plain decode and
-      real ngram runs come out too fast (mean latency −17.8% async, −21.6% sync; ShareGPT 300, GPU 0).
-      Re-profiled with --decode-q-lens 1,2,4 (anjuna3 out/profile_qlens, fork perf/RTX4060Ti_qlens). The full new
-      profile fixes ngram (+5.6% / −0.2%) but its other tables moved up to 5% from last week's (prefill 2048
-      −4.9%), and stepcheck predicted/measured got worse: ShareGPT 0.965→0.961, SWE 0.973→0.955, bench
-      0.990→0.982. So build a hybrid: the shipped profile plus only the q=2,4 attention and skew tables (local
-      branch profile-qlens on anjuna3, 2762287). Non-spec pricing is unchanged, six replays exact, ngram runs
-      +8.9/−1.0/+4.7% async, +2.2/−5.4/−0.9% sync (mean TTFT/TPOT/latency).
-      Blocker: test_regression_exact and test_live_against_fork need augur and the fork to price identically, and
-      the fork's RTX4060Ti data has no q=2,4 tables. Plan: add the q=2,4 rows to the fork's attention.csv,
-      skew.csv, skew_fit.csv and merge meta.yaml (attention_grid.decode_q_lens, sampling targets, skew
-      case_families and fits; keep q=1 entries); commit and push the fork; regenerate augur's profile from it with
-      convert; rebuild tests/data/table_cost/qwen3-1.7b-rtx4060ti with build_table_regression.py; full suite +
-      replays; update docs/accuracy.md section 3. Also: refit --spec-us-per-request on a quiet host and another GPU
+- [x] Ship q=2,4 attention for RTX4060Ti Qwen3-1.7B (2026-11-23). The shipped profile timed attention only at 1
+      query per request, so ngram verification (1+k queries, 1.4-1.9x dearer) was priced as a plain decode: real
+      ngram runs came out −17.8% (async) and −21.6% (sync) mean latency. A whole new profile (2026-11-21,
+      --decode-q-lens 1,2,4) drifted up to 5% elsewhere and made stepcheck worse, so the fork's RTX4060Ti bundle got
+      only its q=2,4 attention and skew rows (fork e8625e0, local on anjuna3, not pushed: q=1 rows and skew cells
+      unchanged, skew refit with refit-skew); augur's profile is converted from it (exact against the fork), the
+      regression data rebuilt (workload shapes now include an ngram run). Non-spec prices identical; ngram runs
+      +8.9/−1.0/+4.7% async, +2.2/−5.4/−0.9% sync (mean TTFT/TPOT/latency). 276 tests pass
+- [ ] Push the fork commit e8625e0 (feature/vllm-sim-20261114) from a machine with access; refit
+      --spec-us-per-request on a quiet host and another GPU
 - [x] Offload: GPU-to-CPU copies lose 15% when a load overlaps; decode is 7% slower during a copy: modeled by the
       fabric (--d2h-duplex-penalty, --hbm-interference)
 - [x] Contention-aware co-simulation (2026-11-21, feature/contention-20261121): augur/sim/fabric.py, `--contention
       on`, `--fabric`, `--host-mem-gbps`, `--host-mem-background-gbps`, `--pcie-root-gbps`, `--d2h-duplex-penalty`,
       `--hbm-interference`. Off by default and byte-identical (six real-GPU replays exact); own-log replay exact
       with it on. Matters little on an idle host; strongly for PD pulls on shared NICs and for a busy host memory
-- [ ] Contention: calibrate --hbm-interference (1.4, one 4060 Ti) and host memory on more hosts; two-socket hosts;
-      real contended offload/PD runs at several GPUs per host; poll-time waits use projected flow ends; host memory
-      shares fairly and does not reproduce the measured per-GPU asymmetry
+- [x] Contention against real contended runs (2026-11-23, one 4060 Ti, SWE-bench 50 sessions, 16 GiB CPU tier, GPU
+      KV cut to 4 GiB so 138 GB comes back from CPU per run; async and sync). Links ran at idle rates (fabric agrees).
+      Real steps beside a transfer are slower: decode +4.4/+5.6% one way, steps with prefill +0.1-0.8%. Fitted
+      --hbm-interference 1.1 for decode-only steps and the new --hbm-interference-prefill 0.1 (was 1.4 for all, from
+      a GEMV microbenchmark: async e2e +2.4% TTFT, now −0.1%). RTX4060Ti now has a 288 GB/s default (interference
+      was silently off for it). Scripts: real_offload_check.sh KV_GIB / HOST_LOAD, fit_hbm_interference.py,
+      step_xfer_slowdown.py, host_mem_load.py; stepcheck --csv records each step's transfer bytes
+- [x] Sync replay of the 4 GiB-KV offload run (2026-11-23): was 24,191 / 24,195 steps. vLLM's worker submits a step's
+      async loads after the forward and polls once its CPU has launched the copies, so a 127-block load was reported
+      in its own step (71.5 ms against ~31). Replay now reports a job in its issuing step when the log did: all four
+      real offload runs replay exactly. The launch's CPU time is not priced (0.07% of the sync run's time)
+- [ ] Contention: K and host memory on more hosts and GPUs (fitted on the same two runs, one 4060 Ti); two-socket
+      hosts; real contended runs at several GPUs per host (GPU 1 here is clock-locked); a transfer-bound run (here
+      transfers overlapped ~8% of steps); poll-time waits use projected flow ends; host memory shares fairly and
+      does not reproduce the measured per-GPU asymmetry
 - [~] Multi-GPU offload: two GPUs do not contend on an idle host, but under memory-bound CPU load aggregate copy
       bandwidth falls 25-33% (2026-11-21, two-GPU benchmark): the fabric models it as shared host memory
       (--host-mem-background-gbps); the per-GPU asymmetry is not reproduced
@@ -172,7 +192,23 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
 - [x] Tables for MoE (2026-11-21, b60b4cc): Qwen3-30B-A3B-Instruct-2507, RTX PRO 6000, TP1 and TP2, DP=1; byte-
       identical to the fork on SWE-bench (765/765), 1.6-2.2x faster whole runs. MoE block stored per token count (no
       scipy); TP2 via the fork's legacy table plus a fitted ASTRA-Sim communication correction
-- [ ] MoE TP4 (the TP2 correction does not carry over: 24-48 ns/step residual), DP+EP and EP on the tables
+- [x] MoE TP4 on the tables (2026-11-23): at TP4 ASTRA-Sim charges a MoE step min(M, max(H+A-B, min(M-B, H+A,
+      max(M-2B, 2A+H-2B)))) ns less than the dense form (H = M - M//2; nothing at T=0, where no MoE block is emitted),
+      fitted on a grid of A, B with M = 20/40/41/48 and exact on 2,000 random shapes over 8 cluster settings.
+      Shipped for the fork's projected bundle only: --tp 4 --profile-variant bf16-tp4proj (--cost tables/auto now
+      read shipped <variant>-tp<N> profiles). Whole SWE-bench run byte-identical to the fork, 9.0 s vs 21.2 s
+- [x] DP+EP on the tables (2026-11-23): DP2 + EP2 of TP1 ranks, the one DP layout the fork has native MoE tables
+      for (moe_components dp2_ep2_rank0/1). The TP1 profile carries per-rank gate / finalize (by the rank's tokens)
+      and experts (by the round's sum) read off the fork's traces, and TableCost.round_ns a closed form of ASTRA-Sim's
+      round: token-id reads FIFO on the node's CPU memory (first member first); at each collective (hop h, duration
+      D) the early rank leaves at t_late + D, the late one at t_late - min(gap, h) + D; sampled-id writes in
+      finishing order. Exact on 480 random rounds over 6 cluster settings and 1,000 rounds from fork runs; ShareGPT
+      300 DP2+EP2 byte-identical sync and async, 8.4 s vs 34.8 s; SWE-bench 11.1 s vs 159 s; with KV offload
+      12 s vs 103 s. --cost auto/tables use it for --dp 2 --enable-expert-parallel
+- [ ] DP+EP beyond DP2 + EP2 of TP1 ranks: the fork has no native MoE tables for them and falls back to its legacy
+      EP table ("DP/backend matching is not verified"; DP4+EP4: one all-gather on the dispatch marker, a whole-block
+      expert row, a reduce-scatter), so profile those layouts first; the collective rule was derived for two ranks.
+      MoE TP8: no bundle to fit against
 - [x] TP>1 without the ASTRA binary (afa6a3b): closed form of the ring collectives in tables.py, identical to
       the fork on whole runs (8B TP2, 70B TP4, 4 x TP4); shipped 8B tp2, 70B tp4/tp8. Refuses settings where the
       form is not exact (2A > all-reduce step or 2B > last collective step)
@@ -211,9 +247,10 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
       The fork's own LLMServingSim has the same race when two of its runs share a checkout
 - [x] Step loop skips idle engines' has_requests chain (a84b71a): ~10% faster at 256 GPUs, byte-identical
 - [x] Commit the PROGRESS.md notes (speed explanation, crash fix)
-- [ ] Faster DP rounds: per round 25 ms = chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms
+- [~] Faster DP rounds: per round 25 ms = chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms
       (2026-11-21). A cache cannot help (no round repeats; 5.7% of per-rank traces do). Per-rank worker processes
-      gave byte-identical output but no measurable speed-up on the loaded host
+      gave byte-identical output but no measurable speed-up on the loaded host. DP2 + EP2 now prices from tables
+      (2026-11-23); other layouts still pay this
 - [x] --profile-variant (2026-11-19): price from a named fork profile folder, e.g. the projected Qwen3-30B-A3B
       RTXPRO6000 bf16-tp4proj (rebuilt in the vllm-sim fork's format from its measured tp1/tp2; not the a4053bc
       bundle, which that fork cannot load)

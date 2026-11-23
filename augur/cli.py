@@ -36,7 +36,9 @@ def _scheduler_cls(a) -> str | None:
 
 
 def _tp_params(a, cpu_bw, cpu_lat) -> dict:
-    """TableCost keyword arguments for TP>1: flags, or the cluster config file (then a flag that contradicts it is an error)."""
+    """TableCost keyword arguments for TP>1 or a DP + EP group: flags, or the cluster config file (then a flag that
+    contradicts it is an error). With --dp N the file must hold one node of N TP instances in one DP group, expert
+    parallel over all of them."""
     flags = {"link_bw": a.tp_link_bw, "link_latency_ns": a.tp_link_latency_ns, "npu_mem_bw": a.npu_mem_bw,
              "cpu_mem_bw": cpu_bw, "cpu_mem_latency_ns": cpu_lat}
     if a.lss_cluster_config:
@@ -44,14 +46,20 @@ def _tp_params(a, cpu_bw, cpu_lat) -> dict:
             c = json.load(f)
         nodes = c.get("nodes") or []
         insts = nodes[0].get("instances") or [] if len(nodes) == 1 else []
-        inst = insts[0] if len(insts) == 1 else {}
+        inst = insts[0] if insts else {}
         bad = []
-        if len(nodes) != 1 or len(insts) != 1:
-            bad.append("not one node with one instance")
-        if inst.get("num_npus") != a.tp or inst.get("tp_size") != a.tp:
+        if len(nodes) != 1 or len(insts) != a.dp:
+            bad.append(f"not one node with {a.dp} instance(s)")
+        if any(i.get("num_npus") != a.tp or i.get("tp_size") != a.tp for i in insts):
             bad.append(f"num_npus/tp_size are not {a.tp}")
-        if inst.get("pd_type") or inst.get("dp_group") or (inst.get("pp_size") or 1) != 1:
-            bad.append("PD, DP or PP instance")
+        if any(i.get("pd_type") or (i.get("pp_size") or 1) != 1 for i in insts):
+            bad.append("PD or PP instance")
+        if a.dp == 1 and inst.get("dp_group"):
+            bad.append("DP instance")
+        if a.dp > 1 and (len({i.get("dp_group") for i in insts}) != 1 or not inst.get("dp_group")
+                         or any(i.get("ep_size") != a.dp * a.tp for i in insts)
+                         or any(i.get("npu_mem") != inst.get("npu_mem") for i in insts)):
+            bad.append(f"not one DP group of {a.dp} instances with ep_size {a.dp * a.tp} and equal npu_mem")
         if "collective_links" in c or "cxl_mem" in c:
             bad.append("collective_links / cxl_mem")
         for k in ("link_bw", "link_latency"):
@@ -59,7 +67,7 @@ def _tp_params(a, cpu_bw, cpu_lat) -> dict:
                 bad.append(f"{k} missing or not a number (the fork would take it from hardware.yaml)")
         if bad:
             raise ValueError(f"--lss-cluster-config {a.lss_cluster_config}: {'; '.join(bad)}: "
-                             "the closed-form TP pricer does not cover it (use --cost llmservingsim)")
+                             "the closed-form pricer does not cover it (use --cost llmservingsim)")
         cpu = nodes[0].get("cpu_mem") or {}
         fromfile = {"link_bw": c["link_bw"], "link_latency_ns": c["link_latency"],
                     "npu_mem_bw": (inst.get("npu_mem") or {}).get("mem_bw"),
@@ -244,9 +252,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="--contention on: host memory bandwidth other work takes (a loaded host); the default "
                         "assumes an idle host")
     p.add_argument("--hbm-interference", type=float, default=None, metavar="K",
-                   help="--contention on: a step runs t * (1 + K * r / HBM bandwidth) where r is what the GPU's PCIe "
-                        "flows move when the step starts (default 1.4, measured on an RTX 4060 Ti: +7%% under an H2D "
-                        "copy, +5%% D2H, +11-12%% both, at 288 GB/s; 0: none). Not applied in replays")
+                   help="--contention on: a decode-only step runs t * (1 + K * r / HBM bandwidth) where r is what the "
+                        "GPU's PCIe flows move when the step starts (default 1.1, fitted on two real vLLM offload runs "
+                        "on an RTX 4060 Ti, 288 GB/s: 0.99 async, 1.25 sync; 0: none). Not applied in replays")
+    p.add_argument("--hbm-interference-prefill", type=float, default=None, metavar="K",
+                   help="--contention on: K for steps with prefill tokens (default 0.1, fitted on the same runs: 0.17 "
+                        "async, 0.03 sync; compute-bound steps are hardly slowed; 0 when --hbm-interference is 0)")
     p.add_argument("--hbm-bw-gbps", type=float, default=None,
                    help="GPU memory bandwidth for --hbm-interference (default: --npu-mem-bw, else the fork's for --hardware)")
     p.add_argument("--replay-durations", default=None,
@@ -268,7 +279,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--profile-variant", default=None, metavar="NAME",
                    help="--cost llmservingsim: read the fork's profiles from the folder perf/<hardware>/<model>/NAME/ "
                         "(e.g. bf16-tp4proj, a projected TP4 bundle) instead of the one the model's dtype names; "
-                        "the fork's --profile-variant. --cost auto then uses llmservingsim (tables do not know variants)")
+                        "the fork's --profile-variant. --cost tables/auto read augur's shipped NAME-tp<N> profile "
+                        "when there is one (python -m augur.cost.profiles lists them), else --cost auto uses the fork")
     p.add_argument("--profile", default=None, help="profile file for --cost tables (default: the one shipped "
                                                    "for --hardware and --model; python -m augur.cost.profiles lists them)")
     p.add_argument("--fixed-step-ms", type=float, default=None, help="--cost fixed only: base step time (default 25)")
@@ -307,6 +319,13 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _has_dp_tables(profile, dp: int) -> bool:
+    """The profile file carries DP round tables for ``dp`` ranks (moe.dp). Called by: _pick_cost, main."""
+    import gzip
+    with gzip.open(profile, "rt", encoding="utf-8") as f:
+        return str(dp) in ((json.load(f).get("moe") or {}).get("dp") or {})
+
+
 def _pick_cost(a, cpu_flags) -> str | None:
     """--cost auto: the shipped tables when augur has a profile for --hardware, --model and --tp (no DP/EP and a TP
     config the closed form covers), else the fork, whose profile must exist. Sets ``a.cost``; returns the tables'
@@ -315,13 +334,17 @@ def _pick_cost(a, cpu_flags) -> str | None:
     profile = None
     if a.cost in ("tables", "auto"):
         from augur.cost.tables import bundled_profile
-        plain = a.dp == 1 and not a.enable_expert_parallel and not a.profile_variant
+        # one engine per profile, or a DP + EP group of TP1 ranks when the profile has its round tables
+        plain = (a.dp == 1 and not a.enable_expert_parallel) or (a.dp > 1 and a.enable_expert_parallel and a.tp == 1)
+        variant = a.profile_variant or "bf16"
         if a.cost == "tables" or a.profile:
-            profile = a.profile or bundled_profile(a.hardware, a.model, a.tp)
+            profile = a.profile or bundled_profile(a.hardware, a.model, a.tp, variant)
         elif plain:
             try:
-                profile = bundled_profile(a.hardware, a.model, a.tp)
-                if a.tp > 1:
+                profile = bundled_profile(a.hardware, a.model, a.tp, variant)
+                if a.dp > 1 and not _has_dp_tables(profile, a.dp):
+                    raise FileNotFoundError(profile)
+                if a.tp > 1 or a.dp > 1:
                     _tp_params(a, *cpu_flags)  # a config the closed form does not cover: use the fork
             except FileNotFoundError:
                 pass
@@ -413,9 +436,8 @@ def main(argv: list[str] | None = None) -> int:
         from augur.bench import main as bench_main
         return bench_main(args[1:])
     a = _parser().parse_args(argv)
-    if a.profile_variant and a.cost in ("tables", "fixed"):
-        print(f"augur: --profile-variant selects a profile folder of the fork: it needs --cost llmservingsim "
-              f"(or auto), not --cost {a.cost}", file=sys.stderr)
+    if a.profile_variant and a.cost == "fixed":
+        print("augur: --profile-variant names a profile: it does not apply to --cost fixed", file=sys.stderr)
         return 2
     if a.profile_variant and a.profile:
         print("augur: --profile (a --cost tables file) and --profile-variant (a fork folder) exclude each other",
@@ -485,12 +507,14 @@ def main(argv: list[str] | None = None) -> int:
         cost = FixedCost(base_ns=int(step_ms * 1e6), per_token_ns=int((a.fixed_per_token_us or 0.0) * 1e3))
     elif a.cost == "tables":
         from augur.cost.tables import TableCost
-        if a.dp != 1 or a.enable_expert_parallel:
-            print("augur: --cost tables prices TP without DP/EP only (use --cost llmservingsim)", file=sys.stderr)
+        if (a.dp != 1 or a.enable_expert_parallel) and not (a.dp > 1 and a.enable_expert_parallel and a.tp == 1
+                                                            and _has_dp_tables(profile, a.dp)):
+            print(f"augur: --cost tables prices DP only with expert parallelism over TP1 ranks and a profile with "
+                  f"DP{a.dp} round tables ({profile} has none; use --cost llmservingsim)", file=sys.stderr)
             return 2
         try:
-            kw = _tp_params(a, *cpu_flags) if a.tp > 1 else dict(cpu_mem_bw=a.cpu_mem_bw,
-                                                                   cpu_mem_latency_ns=a.cpu_mem_latency_ns)
+            kw = _tp_params(a, *cpu_flags) if a.tp > 1 or a.dp > 1 else dict(cpu_mem_bw=a.cpu_mem_bw,
+                                                                               cpu_mem_latency_ns=a.cpu_mem_latency_ns)
             cost = TableCost(profile, **kw)
             if cost.tp != a.tp:
                 raise ValueError(f"profile {profile} is tp={cost.tp}, --tp is {a.tp}")
@@ -553,7 +577,11 @@ def main(argv: list[str] | None = None) -> int:
         topology = Topology.build([(i, a.tp) for i in range(a.num_engines)], nic_gbps=a.pd_link_bw,
                                   pd_mode="decode-link")
     engines = _build_engines(a, spec, cost, replay_costs, topology)
-    if a.contention == "on" and a.hbm_interference != 0:
+    k_decode = 1.1 if a.hbm_interference is None else a.hbm_interference
+    k_prefill = a.hbm_interference_prefill
+    if k_prefill is None:  # --hbm-interference 0 alone turns interference off for every step
+        k_prefill = 0.0 if a.hbm_interference == 0 else 0.1
+    if a.contention == "on" and (k_decode or k_prefill):
         hbm_bw = a.hbm_bw_gbps or a.npu_mem_bw
         if hbm_bw is None:
             try:
@@ -561,16 +589,19 @@ def main(argv: list[str] | None = None) -> int:
                 hbm_bw = _npu_mem_bw_default(a.fork, a.hardware)
             except Exception:  # no fork on this machine
                 hbm_bw = None
+        if hbm_bw is None:
+            from augur.cost.tables import NPU_MEM_BW_GBPS
+            hbm_bw = NPU_MEM_BW_GBPS.get(a.hardware)
         if not hbm_bw:
-            if a.hbm_interference is not None:
+            if a.hbm_interference is not None or a.hbm_interference_prefill is not None:
                 print("augur: --hbm-interference needs the GPU memory bandwidth: give --hbm-bw-gbps", file=sys.stderr)
                 return 2
             print("augur: no GPU memory bandwidth known for --hardware %s: steps are not slowed by PCIe traffic "
                   "(give --hbm-bw-gbps to model it)" % a.hardware, file=sys.stderr)
         else:
-            k = 1.4 if a.hbm_interference is None else a.hbm_interference
             for e in engines:
-                e.ctx.hbm_interference, e.ctx.hbm_bw_gbps = k, float(hbm_bw)
+                e.ctx.hbm_interference, e.ctx.hbm_interference_prefill = k_decode, k_prefill
+                e.ctx.hbm_bw_gbps = float(hbm_bw)
     if hasattr(cost, "max_num_batched_tokens"):  # the fork's traces are built for the engine's real budget
         cost.max_num_batched_tokens = engines[0].vllm_config.scheduler_config.max_num_batched_tokens
     from augur.sim.coordinator import PDLink

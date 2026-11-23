@@ -1,4 +1,5 @@
-"""MoE models priced from the shipped tables (Qwen3-30B-A3B on an RTX PRO 6000, TP1 and TP2).
+"""MoE models priced from the shipped tables (Qwen3-30B-A3B on an RTX PRO 6000, TP1 and TP2; TP4 from the fork's
+projected bf16-tp4proj bundle).
 
 The first tests need no fork; the last ones compare with it (skipped without AUGUR_FORK): the MoE block at
 every token count, random step shapes, and whole runs, which must write the same bytes as --cost llmservingsim."""
@@ -22,7 +23,9 @@ needs_fork = pytest.mark.skipif(not os.path.isdir(os.path.join(FORK, "workloads"
                                 reason="LLMServingSim fork not found (AUGUR_FORK)")
 QWEN = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 TP2_CONFIG = os.path.join(os.path.dirname(__file__), "data", "llmservingsim", "qwen3moe_tp2.json")
+TP4_CONFIG = os.path.join(os.path.dirname(__file__), "data", "llmservingsim", "qwen3moe_tp4.json")
 TP1, TP2 = (bundled_profile("RTXPRO6000", QWEN, tp) for tp in (1, 2))
+TP4 = bundled_profile("RTXPRO6000", QWEN, 4, "bf16-tp4proj")
 
 
 def run_augur(*args, fork=None):
@@ -34,13 +37,16 @@ def run_augur(*args, fork=None):
 
 
 def test_moe_profiles_are_shipped_and_small():
-    assert {("RTXPRO6000", QWEN, "bf16", 1), ("RTXPRO6000", QWEN, "bf16", 2)} <= set(shipped())
-    for path in (TP1, TP2):
-        assert path.stat().st_size < 100_000
+    assert {("RTXPRO6000", QWEN, "bf16", 1), ("RTXPRO6000", QWEN, "bf16", 2),
+            ("RTXPRO6000", QWEN, "bf16-tp4proj", 4)} <= set(shipped())
+    for path in (TP1, TP2, TP4):
+        assert path.stat().st_size < (150_000 if path == TP1 else 100_000)  # TP1 also holds the DP2 round tables
         with gzip.open(path, "rt") as f:
             p = json.load(f)
         assert p["identity"]["kind"] == "moe" and p["moe"]
-    assert len(json.loads(gzip.decompress(TP1.read_bytes()))["moe"]["exact"]["moe_experts"]) == 2048
+    tp1 = json.loads(gzip.decompress(TP1.read_bytes()))
+    assert len(tp1["moe"]["exact"]["moe_experts"]) == 2048
+    assert [len(r["moe_experts"]) for r in tp1["moe"]["dp"]["2"]["ranks"]] == [4095, 4095]
 
 
 def test_tp1_moe_steps_and_limits():
@@ -61,12 +67,26 @@ def test_tp2_moe_has_no_block_for_an_empty_step_and_no_token_limit():
     assert cost.step_ns(StepShape()) < cost.step_ns(StepShape(padded_tokens=1))  # T = 0: the fork emits no expert row
 
 
-def test_moe_profile_beyond_tp2_is_refused(tmp_path):
+def test_tp4_moe_saving_is_bounded_and_needs_a_block():
+    cost = TableCost(TP4, **cluster_params(TP4_CONFIG))
+    m = cost._coll["moe_layers"]
+    for a in range(0, 120, 7):
+        for b in range(0, a + 1, 5):
+            assert m - m // 2 - b <= cost._moe_comm_saving(m, a, b) <= m
+    with pytest.raises(OutsideRegime):
+        cost._moe_comm_saving(m, 3, 4)
+    # an empty step emits no MoE block, so nothing is saved (the fork prices it as the dense form)
+    dense = TableCost(TP4, **cluster_params(TP4_CONFIG))
+    dense._coll = dict(dense._coll, moe_layers=0)
+    assert cost._comm_ns(0, 0) == dense._comm_ns(0, 0) and cost._comm_ns(1, 0) < dense._comm_ns(1, 0)
+
+
+def test_moe_profile_at_other_tp_is_refused(tmp_path):
     p = json.loads(gzip.decompress(TP2.read_bytes()))
-    q = dict(p, identity=dict(p["identity"], tp=4))
-    f = tmp_path / "tp4.json.gz"
+    q = dict(p, identity=dict(p["identity"], tp=8))
+    f = tmp_path / "tp8.json.gz"
     f.write_bytes(gzip.compress(json.dumps(q).encode()))
-    with pytest.raises(NotImplementedError, match="TP2 only"):
+    with pytest.raises(NotImplementedError, match="TP2 and TP4 only"):
         TableCost(f)
     q = dict(p)
     del q["moe"]
@@ -88,7 +108,9 @@ def test_no_scipy_or_fork_at_run_time(tmp_path):
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr[-2000:]
 
 
-@pytest.mark.parametrize("tp,extra", [(1, []), (2, ["--tp", "2", "--lss-cluster-config", TP2_CONFIG])])
+@pytest.mark.parametrize("tp,extra", [(1, []), (2, ["--tp", "2", "--lss-cluster-config", TP2_CONFIG]),
+                                      (4, ["--tp", "4", "--lss-cluster-config", TP4_CONFIG,
+                                           "--profile-variant", "bf16-tp4proj"])])
 def test_short_run_from_shipped_tables_without_the_fork(tmp_path, workload, tp, extra):
     """--cost auto picks the shipped tables for DP=1 (the fork path does not exist here: AUGUR_FORK is empty)."""
     out = tmp_path / "run.csv"
@@ -101,10 +123,87 @@ def test_short_run_from_shipped_tables_without_the_fork(tmp_path, workload, tp, 
     assert len(out.read_text().splitlines()) == 13
 
 
-def test_dp_ep_stays_on_the_fork(tmp_path, workload):
-    r = run_augur("--workload", workload, "--num-entries", "2", "--dp", "2", "--enable-expert-parallel",
-                  "--hardware", "RTXPRO6000", fork=str(tmp_path / "no-fork"))
-    assert r.returncode == 2 and "no step-time profile" in r.stderr
+DP_DATA = os.path.join(os.path.dirname(__file__), "data", "dp_rounds", "qwen3-30b-a3b-rtxpro6000-dp2.json.gz")
+DP_CONFIG = os.path.join(FORK, "configs", "cluster", "single_node_moe_dp_ep_instance.json")
+
+
+def dp_rounds_mismatching(cost, rounds):
+    from augur.cost.convert import shape_from_row
+    return [(rows, first, ns) for rows, first, ns in rounds
+            if cost.round_ns([shape_from_row(r) for r in rows], first_rank=first) != ns]
+
+
+def test_dp_rounds_against_the_forks_prices():
+    """DP2 + EP2 rounds priced by the fork through ASTRA-Sim (scripts/build_dp_regression.py): from augur runs on
+    the fork (ShareGPT sync and async, SWE-bench sync) and random, at the run's cluster settings and others."""
+    with gzip.open(DP_DATA, "rt") as f:
+        d = json.load(f)
+    assert len(d["workload"]) == len(d["random"]) == 1000 and len(d["other"]["rounds"]) >= 200
+    assert dp_rounds_mismatching(TableCost(TP1, **d["params"]), d["workload"] + d["random"]) == []
+    assert dp_rounds_mismatching(TableCost(TP1, **d["other"]["params"]), d["other"]["rounds"]) == []
+
+
+def test_dp_rounds_outside_the_tables_are_refused():
+    cost = TableCost(TP1)
+    one = StepShape(seqs=(SeqWork(1, 5, True),))
+    with pytest.raises(NotImplementedError, match="DP rounds"):
+        cost.round_ns([one, one, one])
+    with pytest.raises(OutsideRegime, match="1..2048"):
+        cost.round_ns([one, StepShape(seqs=(SeqWork(1, 5, True),), padded_tokens=4096)])
+    assert cost.round_ns([one, one], first_rank=1)[1] <= cost.round_ns([one, one], first_rank=0)[1]
+
+
+def test_dp_ep_runs_from_the_shipped_tables_without_the_fork(tmp_path, workload):
+    out = tmp_path / "dp.csv"
+    r = run_augur("--workload", workload, "--num-entries", "12", "--dp", "2", "--enable-expert-parallel",
+                  "--hbm-gb", "96", "--max-model-len", "8192", "--max-num-seqs", "16", "--max-num-batched-tokens", "512",
+                  "--hardware", "RTXPRO6000", "--output", str(out), fork=str(tmp_path / "no-fork"))
+    assert r.returncode == 0, r.stderr[-2000:]
+    summary = json.loads(r.stdout[r.stdout.index("{"):])
+    assert summary["steps"] > 0 and "astra_runs" not in summary
+    assert len(out.read_text().splitlines()) == 13
+    # DP without expert parallelism has no round tables (the fork's native MoE needs EP over every rank)
+    r = run_augur("--workload", workload, "--dp", "2", "--hardware", "RTXPRO6000", "--cost", "tables")
+    assert r.returncode == 2 and "expert parallelism" in r.stderr
+
+
+@needs_fork
+def test_dp_rounds_live_against_the_fork():
+    """60 fresh random DP2 rounds (60 ASTRA-Sim runs) at the fork's own DP + EP cluster config."""
+    from augur.cost.convert import shape_to_row
+    from augur.cost.llmservingsim import LLMServingSimCost
+    ref = LLMServingSimCost(FORK, "RTXPRO6000", QWEN, tp=1, cluster_config=DP_CONFIG, dp=2, ep=2)
+    cost = TableCost(TP1, **cluster_params(DP_CONFIG))
+    rng = random.Random(20261123)
+    shapes = [s for s in random_shapes(rng, 400) if 1 <= s.forward_tokens <= 2048]
+    rounds = [(shapes[2 * i:2 * i + 2], i % 2) for i in range(60)]
+    bad = [([shape_to_row(s) for s in sh], f) for sh, f in rounds
+           if ref.round_ns(sh, first_rank=f) != cost.round_ns(sh, first_rank=f)]
+    assert bad == []
+
+
+@needs_fork
+@pytest.mark.parametrize("sched,extra", [
+    ("--no-async-scheduling", []), ("--async-scheduling", []),
+    # KV offload: a 2 GiB GPU cache and a 16 GiB CPU tier, so DP rounds are priced while loads are in flight
+    ("--no-async-scheduling", ["--kv-cache-gb", "2", "--max-model-len", "16384", "--kv-offload-gib", "16",
+                               "--num-entries", "120"])])
+def test_whole_dp_ep_run_is_identical(tmp_path, sched, extra):
+    """ShareGPT on DP2 + EP2 (round-robin): the CSV is the same bytes from the tables as from the fork."""
+    src = os.path.join(FORK, "workloads", "sharegpt-qwen3-30b-a3b-300-sps10.jsonl")
+    if not os.path.exists(src):
+        pytest.skip("fork has no ShareGPT Qwen3-30B-A3B workload")
+
+    def run(cost):
+        out = tmp_path / f"{cost}.csv"
+        r = run_augur("--cost", cost, "--hardware", "RTXPRO6000", "--workload", src,
+                      *(extra or ["--kv-cache-gb", "56.53"]),
+                      "--dp", "2", "--enable-expert-parallel", "--router", "round-robin", "--lss-cluster-config",
+                      DP_CONFIG, "--max-num-seqs", "128", "--max-num-batched-tokens", "2048", sched,
+                      "--output", str(out), fork=FORK)
+        assert r.returncode == 0, r.stderr[-2000:]
+        return out.read_bytes()
+    assert run("tables") == run("llmservingsim")
 
 
 @needs_fork
@@ -149,9 +248,40 @@ def test_live_against_fork_tp2():
     assert [(s, ref.step_ns(s), cost.step_ns(s)) for s in shapes if ref.step_ns(s) != cost.step_ns(s)] == []
 
 
+TP4_AGAINST_FORK = """
+import random, sys
+from augur.cost.convert import _moe_prices, cluster_params, random_shapes
+from augur.cost.llmservingsim import LLMServingSimCost
+from augur.cost.tables import TableCost
+fork, path, cfg, qwen = sys.argv[1:5]
+ref = LLMServingSimCost(fork, "RTXPRO6000", qwen, tp=4, cluster_config=cfg, profile_variant="bf16-tp4proj")
+cost = TableCost(path, **cluster_params(cfg))
+rng = random.Random(3)
+counts = list(range(1, 2100)) + rng.sample(range(2100, 60000), 150)
+bad = [t for t in counts if _moe_prices(ref, t, {"expert"}) != {"expert": cost._moe_ns("expert", t)}]
+assert bad == [], bad[:5]
+shapes = list(random_shapes(random.Random(20261123), 120))
+bad = [(s, ref.step_ns(s), cost.step_ns(s)) for s in shapes if ref.step_ns(s) != cost.step_ns(s)]
+assert bad == [], bad[:3]
+print("ok")
+"""
+
+
+@needs_fork
+def test_tp4_against_the_fork():
+    """The MoE block at every token count, and 120 fresh random shapes (about 110 ASTRA-Sim runs), on the projected
+    bundle. In a process of its own: the fork pins a --profile-variant per process (set_profile_variant_override),
+    and every later fork lookup in this one would read that variant's folder."""
+    r = subprocess.run([sys.executable, "-c", TP4_AGAINST_FORK, FORK, str(TP4), TP4_CONFIG, QWEN],
+                       capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)))
+    assert r.returncode == 0 and r.stdout.strip().endswith("ok"), r.stderr[-3000:]
+
+
 @needs_fork
 @pytest.mark.parametrize("tp,extra", [(1, ["--hbm-gb", "96"]),
-                                      (2, ["--kv-cache-gb", "30.95", "--tp", "2", "--lss-cluster-config", TP2_CONFIG])])
+                                      (2, ["--kv-cache-gb", "30.95", "--tp", "2", "--lss-cluster-config", TP2_CONFIG]),
+                                      (4, ["--tp", "4", "--lss-cluster-config", TP4_CONFIG,
+                                           "--profile-variant", "bf16-tp4proj"])])
 def test_whole_swe_bench_run_is_identical(tmp_path, tp, extra):
     """SWE-bench sessions (765 calls), sync: the CSV is the same bytes with the shipped tables as with the fork."""
     src = os.path.join(FORK, "workloads", "swe-bench-qwen3-30b-a3b-50-sps0.2.jsonl")

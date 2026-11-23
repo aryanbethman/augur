@@ -22,7 +22,11 @@ kv_offload/cpu/gpu_worker.py):
 A transfer takes latency + bytes / bandwidth (``OffloadLink``), the cost
 LLMServingSim gives a kv_load / kv_evict row on its CPU memory. Lanes do not
 share bandwidth. With ``replay_done_ns`` (job id -> poll time in a real run's
-step log) a job finishes when the real one was reported.
+step log) a job finishes when the real one was reported. vLLM's worker polls
+only after its CPU has launched the step's copies, so a large load can be
+reported in the step that issued it (the launch outlasts the forward and the
+copy); ``replay_same_step(job id)`` says the logged one was, and the replay
+then reports it at that step's poll too.
 """
 
 from __future__ import annotations
@@ -57,6 +61,7 @@ class _Transfer:
     nbytes: int
     start_ns: int
     end_ns: int
+    in_fabric: bool = True  # with --contention on: a flow in the fabric (False: a replayed job done at submission)
 
 
 class _Lane:
@@ -78,10 +83,12 @@ class SimOffloadWorker:
     Called by: SimWorker.execute_model (pre_forward, post_forward),
     Coordinator (next_end, deliverable). Calls: OffloadLink."""
 
-    def __init__(self, link: OffloadLink, block_bytes: int, replay_done_ns: dict[int, int] | None = None, net=None):
+    def __init__(self, link: OffloadLink, block_bytes: int, replay_done_ns: dict[int, int] | None = None, net=None,
+                 replay_same_step=None):
         self.link = link
         self.block_bytes = block_bytes
         self.replay_done_ns = replay_done_ns or {}
+        self.replay_same_step = replay_same_step
         # With --contention on, ``net`` (augur.sim.fabric.Net) carries the transfers: each lane is a FIFO
         # stream of flows through the engine's PCIe links, root complex and host memory, sharing their
         # bandwidth with every other flow there. Without it a transfer takes link.transfer_ns alone.
@@ -166,13 +173,19 @@ class SimOffloadWorker:
 
     def _times(self, t: _Transfer) -> tuple[int, int]:
         """(start, end) of a transfer: exact, or in the fabric the end it has now (projected while it runs)."""
-        if self.net is None:
+        if self.net is None or not t.in_fabric:
             return t.start_ns, t.end_ns
         return self.net.fabric.info(("offload", self.net.engine_id, t.job_id))
 
     def _submit(self, lane: _Lane, jid: int, job: TransferJob, req_id: str | None, after_ns: int) -> int:
         gpu = job.src_spec if isinstance(job.src_spec, GPULoadStoreSpec) else job.dst_spec
         nbytes = len(gpu.block_ids) * self.block_bytes
+        if self.replay_same_step is not None and jid in self.replay_done_ns and self.replay_same_step(jid):
+            # The logged worker reported it in this step: done at this step's start, so this step's poll reports it.
+            done = self.replay_done_ns[jid]
+            lane.queue.append(_Transfer(jid, req_id, lane is not self.stores, nbytes, done, done, in_fabric=False))
+            self._inflight[jid] = lane.queue[-1]
+            return done
         if self.net is not None:
             is_load = lane is not self.stores
             lane_name = "stores" if lane is self.stores else ("loads" if lane is self.loads else "sync_loads")

@@ -397,7 +397,7 @@ class Coordinator:
         self._dp_pending.clear()
         final = self._round_shapes(shapes)
         replay = self._replay_rounds(g)
-        per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final, first_rank=first_rank))
+        per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final, first_rank=first_rank), final)
         # The ranks meet in the round's first collective, so the slowest rank's CPU time holds up all of them.
         cpu_ns = 0 if replay else max((e.ctx.cpu_fixed_ns + e.ctx.cpu_per_request_ns * len(s.seqs)
                                        + e.ctx.last_offload_wait_ns for e, s in zip(g, shapes) if s is not None), default=0)
@@ -451,11 +451,11 @@ class Coordinator:
                 log.write({"ev": "round", "t": self.now, "dur": ns, "dummy": bool(sh.dummy)})
 
     @staticmethod
-    def _scaled(g, per_rank):
+    def _scaled(g, per_rank, shapes):
         f = g[0].ctx.step_time_scale
         per_rank = per_rank if f == 1.0 else [round(ns * f) for ns in per_rank]
-        if any(e.ctx.hbm_interference for e in g):  # a rank's PCIe traffic slows its own forward
-            per_rank = [round(ns * e.ctx.interference_factor()) for e, ns in zip(g, per_rank)]
+        if any(e.ctx.net is not None for e in g):  # a rank's PCIe traffic slows its own forward
+            per_rank = [round(ns * e.ctx.interference_factor(sh)) for e, ns, sh in zip(g, per_rank, shapes)]
         return per_rank
 
     def _after_step(self, eng: SimEngine) -> None:
@@ -603,7 +603,7 @@ class Coordinator:
         g = self.dp_group
         final = self._round_shapes([shapes.get(e.engine_id) for e in g])
         replay = self._replay_rounds(g)
-        per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final))
+        per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final), final)
         self._log_round(g, final, per_rank)
         self.dp_rounds += 1
         self._dpa_running = x

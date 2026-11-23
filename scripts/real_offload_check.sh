@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Real vLLM run with KV offload to CPU (GPU 0), then augur's checks against it. Not run yet: needs a free GPU.
-# usage: [ASYNC=1] [SKIP_REAL=1] [AUGUR_VENV=.venv] [AUGUR_FORK=~/llmss-vllm-sim-20261114] scripts/real_offload_check.sh
+# Real vLLM run with KV offload to CPU (GPU 0), then augur's checks against it.
+# usage: [ASYNC=1] [SKIP_REAL=1] [KV_GIB=N] [HOST_LOAD=N] [HOST_MEM_BG=GBPS] [AUGUR_VENV=.venv]
+#        [AUGUR_FORK=~/llmss-vllm-sim-20261114] scripts/real_offload_check.sh
 #   (~15 min of GPU per run; 16 GiB pinned host memory)
+#   KV_GIB: GPU KV cache of N GiB (--kv-cache-memory-bytes) instead of what 0.85 of the GPU leaves, so more prefix
+#   hits come back from the CPU tier and transfers overlap more. HOST_LOAD: N processes stream host memory during the
+#   real run (scripts/host_mem_load.py); HOST_MEM_BG: what augur's fabric takes as their share of host memory.
 #   1. vllm serve Qwen3-1.7B, 16 GiB CPU tier, augur's logging scheduler (this checkout's hooks: they log offload jobs),
 #      the 50-session SWE-bench trace through augur.verify.client
 #   2. augur replay of that log: scheduling decisions must match step for step
@@ -11,6 +15,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 async=${ASYNC:-0}
 name=swe50_offload16; [ "$async" = 1 ] && name=${name}_async || true
+[ -n "${KV_GIB:-}" ] && name=${name}_kv${KV_GIB} || true
+[ "${HOST_LOAD:-0}" != 0 ] && name=${name}_load${HOST_LOAD} || true
 out=out/real/$name
 mkdir -p "$out"; [ "${SKIP_REAL:-0}" = 1 ] || rm -f "$out"/steps.*.jsonl
 VENV=${AUGUR_VENV:-$HOME/augur/.venv}
@@ -24,7 +30,8 @@ if [ "$async" = 1 ]; then sched="--async-scheduling --scheduler-cls augur.verify
 else sched="--no-async-scheduling --scheduler-cls augur.verify.hooks.LoggingScheduler"; fi
 "$VENV/bin/vllm" serve Qwen/Qwen3-1.7B --port 8013 --seed 0 \
   --max-num-seqs 128 --max-num-batched-tokens 2048 --max-model-len 24576 --gpu-memory-utilization 0.85 \
-  --kv-offloading-size 16 --kv-offloading-backend native $sched > "$out/server.log" 2>&1 &
+  --kv-offloading-size 16 --kv-offloading-backend native $sched \
+  ${KV_GIB:+--kv-cache-memory-bytes $((KV_GIB * 1073741824))} > "$out/server.log" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null; wait $srv 2>/dev/null || true' EXIT
 for i in $(seq 1 300); do
@@ -32,8 +39,16 @@ for i in $(seq 1 300); do
   kill -0 $srv 2>/dev/null || { echo "server died"; tail -30 "$out/server.log"; exit 1; }
   sleep 2
 done
+load=
+if [ "${HOST_LOAD:-0}" != 0 ]; then
+  $P scripts/host_mem_load.py "$HOST_LOAD" & load=$!
+  trap 'kill $srv $load 2>/dev/null; wait $srv $load 2>/dev/null || true' EXIT
+fi
+uptime > "$out/uptime_start.txt"
 $P -m augur.verify.client --url http://localhost:8013 --model Qwen/Qwen3-1.7B --workload "$W" \
   --filler-vocab 150000 --output "$out/client.csv" --tokens-out "$out/tokens.jsonl" > "$out/client.json"
+uptime > "$out/uptime_end.txt"
+[ -n "$load" ] && { kill $load; wait $load 2>/dev/null || true; }
 kill $srv; wait $srv 2>/dev/null || true; trap - EXIT
 fi
 
@@ -66,4 +81,14 @@ echo "measured GPU<->CPU GB/s (slower direction): $gbps"
 
 # 4. end to end at that bandwidth
 $P -m augur.cli "${common[@]}" --kv-offload-gbps "$gbps" --output $out/augur.csv
+
+# 5. end to end at the idle host's PCIe rates (12.7 GB/s H2D, 13.15 D2H; scripts/contention_bench.py), so any
+#    slowdown must come from the model: contention off (each transfer has the link to itself) and on (augur's fabric:
+#    duplex penalty, HBM interference, host memory less HOST_MEM_BG)
+echo '{"resources": {"gpu0.d2h": 13.15}}' > $out/fabric.json
+$P -m augur.cli "${common[@]}" --kv-offload-gbps 12.7 --output $out/augur_idle_off.csv
+$P -m augur.cli "${common[@]}" --kv-offload-gbps 12.7 --contention on --fabric $out/fabric.json \
+  --host-mem-background-gbps "${HOST_MEM_BG:-0}" --output $out/augur_idle_on.csv
+$P scripts/compare_real_sim.py $out/client.csv $out/augur_idle_off.csv $out/augur_idle_on.csv --real-log "$log" \
+  --labels real,contention_off,contention_on | tee $out/compare_contention.txt
 echo "done: $out"

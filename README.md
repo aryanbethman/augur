@@ -142,7 +142,13 @@ to the fork; a setting outside the range where that form is exact (CPU-memory
 access longer than half a ring step) is refused, not approximated.
 
 Qwen3-30B-A3B (MoE) is shipped for the RTX PRO 6000 at TP1 and TP2, priced
-from tables as well. DP/EP, MoE at TP > 2 and other profiles go through a checkout of the fork
+from tables as well, and at TP4 from the fork's projected bundle
+(`--tp 4 --profile-variant bf16-tp4proj`: rebuilt from the measured TP1 and
+TP2 tables, not measured at TP4). Its DP2 + EP2 rounds (`--dp 2
+--enable-expert-parallel`, TP1 ranks: the one DP layout the fork has native
+MoE tables for) are priced from the TP1 profile too, byte-identical to the
+fork. Other DP/EP layouts, MoE at other TP sizes and other profiles go
+through a checkout of the fork
 (`--fork` or `AUGUR_FORK`, default `~/llmss-vllm-sim-20261114`; install the
 `llmservingsim` extra): its profiles, model configs and ASTRA-Sim.
 `python -m augur.cost.convert` turns one of its dense profiles into a shipped

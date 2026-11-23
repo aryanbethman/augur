@@ -49,7 +49,7 @@ def mismatches(cost, rows):
 def test_regression_exact(name):
     d = load(name)
     tp = d.get("tp", 1)
-    path = bundled_profile(d["hardware"], d["model"], tp)
+    path = bundled_profile(d["hardware"], d["model"], tp, d.get("variant", "bf16"))
     assert hashlib.sha256(gzip.decompress(path.read_bytes())).hexdigest() == d["profile_sha256"], \
         "profile changed since the regression data was priced: rebuild it (scripts/build_table_regression.py)"
     if tp > 1:
