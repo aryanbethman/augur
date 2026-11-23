@@ -313,13 +313,16 @@ def _parser() -> argparse.ArgumentParser:
                    help="requests reach the engine when this vLLM step log says, steps priced by --cost "
                         "(separates arrival timing from step pricing)")
     p.add_argument("--enforce-eager", action="store_true", help="no CUDA graphs, so no step padding")
-    p.add_argument("--cost", default="auto", choices=["fixed", "tables", "llmservingsim", "auto"],
+    p.add_argument("--cost", default="auto", choices=["fixed", "tables", "llmservingsim", "roofline", "auto"],
                    help="step prices. auto (default): tables when augur ships a profile for --hardware, "
                         "--model and --tp (no DP/EP), else llmservingsim. "
                         "tables: a profile shipped with augur (dense models, any TP it ships, one node, no DP/EP; "
                         "no fork needed). At TP>1 a step whose CPU-memory accesses are long next to a ring step "
                         "(see augur/cost/tables.py) is refused. "
                         "llmservingsim: the fork's profiles and ASTRA-Sim (MoE, TP>1, DP). "
+                        "roofline: no profile; FLOPs and bytes against the GPU's peak bf16 FLOP/s and memory "
+                        "bandwidth (augur/cost/roofline.py), for GPUs and models nobody profiled; never chosen by auto "
+                        "(dense and routed-expert MoE with GQA attention, no DP). "
                         "fixed: one constant step time (--fixed-step-ms, --fixed-per-token-us), no profile")
     p.add_argument("--profile-variant", default=None, metavar="NAME",
                    help="--cost llmservingsim: read the fork's profiles from the folder perf/<hardware>/<model>/NAME/ "
@@ -328,6 +331,12 @@ def _parser() -> argparse.ArgumentParser:
                         "when there is one (python -m augur.cost.profiles lists them), else --cost auto uses the fork")
     p.add_argument("--profile", default=None, help="profile file for --cost tables (default: the one shipped "
                                                    "for --hardware and --model; python -m augur.cost.profiles lists them)")
+    p.add_argument("--roofline-params", default=None, metavar="JSON",
+                   help="--cost roofline: efficiency and overhead parameters from `python -m augur.cost.roofline_fit "
+                        "fit --out JSON` (default: the ones fitted on all shipped profiles)")
+    p.add_argument("--peak-tflops", type=float, default=None,
+                   help="--cost roofline: the GPU's peak dense bf16 TFLOP/s (default: augur's for --hardware; "
+                        "--npu-mem-bw sets the bandwidth)")
     p.add_argument("--fixed-step-ms", type=float, default=None, help="--cost fixed only: base step time (default 25)")
     p.add_argument("--fixed-per-token-us", type=float, default=None,
                    help="--cost fixed only: added per batched token (default 0)")
@@ -377,6 +386,8 @@ def _pick_cost(a, cpu_flags) -> str | None:
     profile (None for the fork). Raises FileNotFoundError. Called by: main."""
     auto = a.cost == "auto"
     profile = None
+    if a.cost == "roofline":
+        return None
     if a.cost in ("tables", "auto"):
         from augur.cost.tables import bundled_profile
         # one engine per profile, or a DP + EP group of TP1 ranks when the profile has its round tables
@@ -605,6 +616,23 @@ def main(argv: list[str] | None = None) -> int:
         except (NotImplementedError, ValueError) as e:
             hint = "" if "--cost llmservingsim" in str(e) else " (use --cost llmservingsim)"
             print(f"augur: {e}{hint}", file=sys.stderr)
+            return 2
+    elif a.cost == "roofline":
+        from augur.cost.roofline import DEFAULT_PARAMS, RooflineCost, RooflineParams
+        if a.dp != 1 or a.enable_expert_parallel:
+            print("augur: --cost roofline prices one engine per replica: no --dp or expert parallelism",
+                  file=sys.stderr)
+            return 2
+        try:
+            params = DEFAULT_PARAMS
+            if a.roofline_params:
+                with open(a.roofline_params, encoding="utf-8") as f:
+                    params = RooflineParams.from_json(json.load(f))
+            kw = _tp_params(a, *cpu_flags) if a.tp > 1 else dict(cpu_mem_bw=a.cpu_mem_bw, npu_mem_bw=a.npu_mem_bw,
+                                                                  cpu_mem_latency_ns=a.cpu_mem_latency_ns)
+            cost = RooflineCost(os.path.join(mdir, "config.json"), a.hardware, a.tp, params, a.peak_tflops, **kw)
+        except (NotImplementedError, ValueError, OSError) as e:
+            print(f"augur: {e}", file=sys.stderr)
             return 2
     else:
         from augur.cost.llmservingsim import LLMServingSimCost
