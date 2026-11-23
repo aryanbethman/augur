@@ -49,6 +49,18 @@ ids carry a random per-run suffix, so replay now reuses the logged ids).
 speculative runs; `tests/test_multi_replay.py` for several engines,
 prefill/decode and DP, with and without offload.
 
+**KV cache size.** Decisions also depend on how many KV blocks the engine
+has. Without `--num-gpu-blocks`, augur sizes the cache as vLLM 0.33 does
+(GPU memory × utilization − weights − non-torch − peak activation), with the
+reserve vLLM measured at start-up (median of the seven real non-speculative
+runs, shipped with the 4060 Ti profile). Against vLLM's "GPU KV cache size" in
+those seven runs (85,552 tokens for all of them in augur): −2.4% to +1.0%. vLLM's
+own reserve moved 0.65-0.97 GiB from run to run, worth about 3.5% of the cache.
+With no measured reserve, augur's estimate from the model shape gives −0.2% to
++3.3%. Weights: 3.20 GiB estimated, 3.22 GiB loaded. Not modeled: the larger
+reserve of ngram runs (0.79-1.36 GiB), so augur's cache is up to 5.5% larger
+there.
+
 ## 2. Step times: the profile
 
 Profile: Qwen3-1.7B TP1, RTX 4060 Ti, with the attention skew sweep (fork
@@ -230,6 +242,42 @@ far each metric moves. On this benchmark:
 
 A large spread marks an operating point where no single number, simulated or
 measured, is reliable.
+
+**Where the error comes from** (`python -m augur.verify.breakdown`). For each
+real run, augur's error (its normal run minus the real one) splits exactly into
+three parts, from three more runs of the same requests: the real log replayed
+with its step durations (decisions identical); the logged schedule re-timed
+with augur's step prices and CPU terms (no decisions taken); and augur's own
+run with the first calls reaching the engine when they did in the real run.
+
+- **Outside the step loop:** front end, delivery, the client, the arrival process.
+- **Step time:** the re-timed schedule minus the replay.
+- **Decisions:** augur's own batches, preemptions and prefix hits minus the re-timed schedule.
+
+Every simulated run is measured on the client's side, and a session's later
+calls follow augur's own loop. Mean TTFT / TPOT / latency, % of the real value:
+
+| Run | Total | Outside | Step time | Decisions |
+| --- | --- | --- | --- | --- |
+| ShareGPT 300, sync | +0.4 / −0.4 / +0.1 | +0.2 / −0.2 / 0.0 | +0.3 / −0.2 / +0.1 | −0.1 / 0.0 / 0.0 |
+| ShareGPT 300, async | +1.7 / +1.1 / +1.5 | −0.1 / 0.0 / 0.0 | +1.7 / +0.9 / +1.3 | +0.1 / +0.2 / +0.2 |
+| ngram k=3, sync (GPU 0) | −10.2 / −14.7 / −11.9 | 0.0 / 0.0 / 0.0 | −7.3 / −7.5 / −7.4 | −2.9 / −7.1 / −4.5 |
+| ngram k=3, async (GPU 0) | −4.2 / −11.1 / −7.1 | −0.2 / −0.2 / −0.2 | −4.2 / −4.3 / −4.2 | +0.1 / −6.6 / −2.7 |
+| SWE-bench 50, sync | +0.1 / −0.3 / −0.2 | −0.8 / +0.4 / −0.4 | +0.2 / −0.3 / 0.0 | +0.7 / −0.4 / +0.2 |
+| SWE-bench 50, async | −0.8 / +0.1 / −0.6 | −0.7 / +0.4 / −0.3 | +0.2 / −0.3 / 0.0 | −0.3 / 0.0 / −0.4 |
+| SWE-bench 50, offload, sync | −3.4 / −2.3 / −3.0 | +1.2 / +0.2 / +0.9 | −2.2 / −2.0 / −2.2 | −2.3 / −0.5 / −1.7 |
+| SWE-bench 50, offload, async | −2.8 / −0.2 / −2.1 | −0.5 / +0.6 / −0.1 | −1.5 / −1.5 / −1.5 | −0.8 / +0.7 / −0.4 |
+| bench 1,024/128 at 6 req/s | −10.0 / −1.4 / −2.6 | −0.5 / 0.0 / −0.1 | −7.0 / −0.7 / −1.6 | −2.5 / −0.6 / −0.9 |
+
+Without speculation, step time and decisions each stay within about 2% of the
+mean. The ngram runs are the exception. Their step-time error (−4 to −7.5%)
+is the price of the verification steps. Decisions
+dominate their tails (median TTFT −24 / −22%, p99 TPOT −16 / −14%) because
+augur draws accepted drafts from a rate, not from the tokens. In the offload
+runs, transfer stalls are not re-timed, so they count under decisions.
+The re-timed schedule had to wait for a request the real engine already had
+in one step of three runs (14-447 ms), and in no other run. p50/p90/p99 rows
+are in the tool's CSV.
 
 ## 4. Against LLMServingSim
 

@@ -39,20 +39,23 @@ GPU 1 of the test host is clock-locked, which spoils timing but not scheduling d
 for decision checks. The test host has ~14 GB of disk free.
 
 Fixes
-1. [ ] KV size: `--hardware` sets GPU memory (a preset per GPU; `--hbm-gb` stays as an override) and the KV cache is
-   sized from the memory accounting augur.profile records; checked against the 7 real 4060 Ti logs (vLLM's own
-   reserve moves 0.65-0.97 GiB run to run). Next-features 1; section 6
-2. [ ] Flags for vLLM options that change scheduling: --scheduler-cls (EngineSpec has the field, no flag reaches
-   it), --scheduling-policy priority with a priority per request in traces, --kv-cache-dtype fp8 (KV bytes per
-   block; step prices stay bf16, with a warning)
+1. [x] KV size (c7ab353): GPU_FACTS in cost/tables.py gives each --hardware its memory (--hbm-gb overrides); the
+   reserve is vLLM 0.33's (non-torch + peak activation, which holds the CUDA-graph estimate) from the profile's
+   measured vllm_memory, else estimated from the model shape with a warning. Against the 7 real 4060 Ti logs:
+   −2.4% to +1.0% (estimate: −0.2% to +3.3%). Open: the H100 and RTX PRO 6000 totals are from public logs, not
+   measured here; ngram runs' larger reserve (0.79-1.36 GiB) is not modeled
+2. [x] Flags (2a0dc58): --scheduler-cls (wrapped so --step-log-vllm still logs), --scheduling-policy priority with a
+   per-request "priority" in workloads (the client sends it when non-zero; untested against a real server),
+   --kv-cache-dtype fp8 (block count doubles; prices stay bf16, warned)
 3. [ ] Real DP runs replayable: log DP dummy rounds, which run outside the scheduler (section 4)
 
 Additions
 4. [ ] Same-step-time test: Vidur, BLIS (inference-sim), Frontier and LLMServingSim priced with augur's step times
    on the real runs; what error is left comes from their copies of vLLM's scheduler. Decides whether decision
    fidelity leads the paper
-5. [ ] Error breakdown per real run into front end / CPU, step time and decisions (logged decisions with logged
-   durations; logged decisions with augur's prices; full simulation)
+5. [x] Error breakdown (206a5a4): `python -m augur.verify.breakdown`, results in docs/accuracy.md section 3. Outside
+   the step loop, step time and decisions each within ~2% of the mean on the non-speculative runs; ngram decisions
+   dominate their tails (median TTFT −24%): acceptance is a rate, not token content
 6. [ ] Custom-scheduler example through --scheduler-cls (e.g. shortest job first)
 7. [ ] KV cache spec from vLLM's own model definition (meta device) for sliding-window, MLA and hybrid models;
    decisions checked on a small sliding-window model on the 4060 Ti
@@ -259,7 +262,7 @@ DP2 + EP2 on the tables, the sync offload replay difference fixed.
       --frontend-latency-ms 3.4 + --frontend-us-per-token 3.0 (6.5 ms at 1,024 tokens as before)
 - [ ] Front end: token-id prompts (the trace client) and other hosts
 - [x] Run-to-run noise: covered by the +-1% sensitivity range in augur bench
-- [~] Automatic KV size from memory accounting (now a manual --kv-reserve-gib). Looked at 2026-11-18: in the 7
+- [x] Automatic KV size from memory accounting (done 2026-11-23, plan item 1). Looked at 2026-11-18: in the 7
       real 4060 Ti logs (same model and config) vLLM's own reserve moves 0.65-0.97 GiB run to run (peak
       activation alone 0.50-0.82), so one model/GPU cannot fit a formula. Better done in the profiling pipeline:
       record weights / non-torch / peak activation / CUDA-graph memory when a GPU is profiled. augur.profile now
