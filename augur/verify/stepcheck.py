@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -65,6 +66,49 @@ def classify(shape: StepShape) -> str:
     return "prefill" if shape.num_decode == 0 else "mixed"
 
 
+@dataclass
+class PricedStep:
+    shape: StepShape  # padded as the run's CUDA-graph dispatcher pads it
+    graph: bool  # the step runs a CUDA graph
+    measured_ns: int
+    predicted_ns: int  # the cost model's GPU time for ``shape``
+    xfer: dict  # offload transfers reported in the step: {"load": [bytes, s, n], "store": [...]}
+
+
+def make_pricer(model, hardware, fork, max_num_seqs, max_num_batched_tokens, max_model_len):
+    """(cost model, CUDA-graph dispatcher) of a run's engine settings. Raises FileNotFoundError without a profile."""
+    from augur.sim.engine import EngineSpec, SimEngine
+    from augur.cost.llmservingsim import LLMServingSimCost
+    from augur.cost.tables import TableCost, bundled_profile
+    from augur.sim.models import model_dir
+
+    try:  # as augur --cost auto: the profile shipped with augur, else the fork's
+        profile = bundled_profile(hardware, model)
+    except FileNotFoundError:
+        profile = None
+    mdir = model_dir(fork, model, os.path.expanduser("~/.cache/augur/models"), None, profile)
+    cost = TableCost(profile) if profile else LLMServingSimCost(
+        fork_root=fork, hardware=hardware, model=model, max_num_batched_tokens=max_num_batched_tokens)
+    # Only for vLLM's CUDA-graph dispatcher under the same engine settings.
+    eng = SimEngine(0, EngineSpec(model_dir=mdir, model_name=model, kv_cache_bytes=8 << 30, max_model_len=max_model_len,
+                                  max_num_batched_tokens=max_num_batched_tokens, max_num_seqs=max_num_seqs), cost)
+    return cost, eng.core.model_executor.worker.cudagraph
+
+
+def price_steps(events, cost, disp) -> list[PricedStep]:
+    """Every step of a log, measured and priced. Called by: main, augur.verify.breakdown."""
+    from vllm.config import CUDAGraphMode
+
+    xfers = [u.get("xfer") or {} for _, u in steps(events)]  # same order as real_steps
+    out = []
+    for (shape, measured), x in zip(real_steps(events), xfers):
+        uniform = all(x.num_new == 1 for x in shape.seqs)
+        mode, desc = disp.dispatch(num_tokens=shape.total_tokens, uniform_decode=uniform)
+        padded = StepShape(seqs=shape.seqs, padded_tokens=desc.num_tokens)
+        out.append(PricedStep(padded, mode != CUDAGraphMode.NONE, measured, cost.step_ns(padded), x))
+    return out
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="augur.verify.stepcheck")
     p.add_argument("log")
@@ -78,39 +122,14 @@ def main(argv=None) -> int:
                                                "offload bytes loaded and stored by transfers reported in the step")
     a = p.parse_args(argv)
 
-    from augur.sim.engine import EngineSpec, SimEngine
-    from augur.cost.llmservingsim import LLMServingSimCost
-    from augur.cost.tables import TableCost, bundled_profile
-    from augur.sim.models import model_dir
-    from vllm.config import CUDAGraphMode
-
     try:
-        try:  # as augur --cost auto: the profile shipped with augur, else the fork's
-            profile = bundled_profile(a.hardware, a.model)
-        except FileNotFoundError:
-            profile = None
-        mdir = model_dir(a.fork, a.model, os.path.expanduser("~/.cache/augur/models"), None, profile)
-        cost = TableCost(profile) if profile else LLMServingSimCost(
-            fork_root=a.fork, hardware=a.hardware, model=a.model, max_num_batched_tokens=a.max_num_batched_tokens)
+        cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len)
     except FileNotFoundError as e:
         print(f"augur.verify.stepcheck: {e}", file=sys.stderr)
         return 2
-    # Only for vLLM's CUDA-graph dispatcher under the same engine settings.
-    eng = SimEngine(0, EngineSpec(model_dir=mdir, model_name=a.model, kv_cache_bytes=8 << 30,
-                                  max_model_len=a.max_model_len, max_num_batched_tokens=a.max_num_batched_tokens,
-                                  max_num_seqs=a.max_num_seqs), cost)
-    disp = eng.core.model_executor.worker.cudagraph
-
-    rows = []
-    events = read_log(a.log)
-    xfers = [u.get("xfer") or {} for _, u in steps(events)]  # same order as real_steps
-    for (shape, measured), x in zip(real_steps(events), xfers):
-        uniform = all(x.num_new == 1 for x in shape.seqs)
-        mode, desc = disp.dispatch(num_tokens=shape.total_tokens, uniform_decode=uniform)
-        padded = StepShape(seqs=shape.seqs, padded_tokens=desc.num_tokens)
-        rows.append((classify(shape), shape.total_tokens, len(shape.seqs), desc.num_tokens,
-                     mode != CUDAGraphMode.NONE, measured, cost.step_ns(padded),
-                     x.get("load", [0])[0], x.get("store", [0])[0]))
+    rows = [(classify(p.shape), p.shape.total_tokens, len(p.shape.seqs), p.shape.padded_tokens, p.graph,
+             p.measured_ns, p.predicted_ns, p.xfer.get("load", [0])[0], p.xfer.get("store", [0])[0])
+            for p in price_steps(read_log(a.log), cost, disp)]
 
     m = np.array([r[5] for r in rows], dtype=float)
     pr = np.array([r[6] for r in rows], dtype=float)
