@@ -77,6 +77,34 @@ Real runs on the test host
 Needs the repo owner: push fork commit e8625e0 (the shipped 4060 Ti profile's provenance points at it); pick a
 license; ask Revati's authors for code; decide whether to report the tiering livelock (section 4) upstream.
 
+## Next: what only running vLLM's own code can do (added 2026-11-23; after the plan above)
+Why: BLIS (inference-sim) ports vLLM 0.33's scheduler to Go and checks it step by step against vLLM's classes. With
+real step durations it reproduced the first 835 of 3,402 steps of ShareGPT 300 and came within 0.3% end to end, so
+accuracy alone will not set augur apart from it on ordinary workloads. These items rest on what a port cannot do.
+The paper's lead claim is still open: lead with these (accuracy against ports as support), or lead with accuracy
+against ports, decided after the heavy-preemption runs (plan item 13).
+
+16. [ ] Token-faithful simulation: with recorded outputs, the simulated model emits the real tokens; vLLM's own ngram
+    proposer is verified against them (exact acceptance per request and step for greedy decoding, instead of
+    --spec-accept-rate), and prefix hits on generated text are the real ones (identical generations share blocks).
+    Check on the existing ngram runs, whose decision error is −24% median TTFT today (plan item 5). No GPU
+17. [ ] Plugin case study: a KV eviction or offload policy (or a scheduler) written as a vLLM plugin, ranked against
+    alternatives at hundreds of GPUs in augur, then the same code run on the 4060 Ti to confirm the ranking; BLIS
+    would need it rewritten in Go first
+18. [ ] vLLM version study (plan item 15, moved up): the lines changed to move augur to the next release, a decision
+    change between the two versions that only the new code produces, and what each of BLIS's ports took (lines,
+    days after the vLLM release) from its history
+19. [ ] Third-party and unreleased code on day one: LMCache unmodified (plan item 14) and a vLLM release candidate or
+    open pull request run without changes to augur
+20. [ ] Workloads where a port's inputs lose information: prompts that overlap in part (shared system prompts,
+    few-shot, RAG), which BLIS encodes as prefix groups; plus the heavy-preemption runs of plan item 13. Measure
+    BLIS's error against augur's on each
+21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
+    effect; contrast with a port, which reproduces 57% of the steps of the same run
+22. [ ] Where BLIS is ahead: a pluggable timing model for GPUs nobody has profiled (a roofline pricer, or an adapter
+    to BLIS's timing, giving "vLLM's real decisions under any timing model"); measure augur's speed against BLIS's
+    at 256-1,024 GPUs and report it honestly
+
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
 DP2 + EP2 on the tables, the sync offload replay difference fixed.
 
