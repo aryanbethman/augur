@@ -59,11 +59,11 @@ class EngineSpec:
     kv_events: bool = False  # publish vLLM's KV cache events (BlockStored / BlockRemoved) to this engine's in-process queue
 
 
-def _simulated_gpu_batch_defaults(spec: EngineSpec):
+def _simulated_gpu_batch_defaults(hardware: str, hbm_gb: float):
     """vLLM's own batch-limit table, read for the simulated GPU instead of the
-    machine augur runs on. Called by: SimEngine.__init__."""
-    name = spec.hardware.lower()
-    gpu = SimpleNamespace(get_device_total_memory=lambda: int(spec.hbm_gb * GIB), get_device_name=lambda: name,
+    machine augur runs on. Called by: SimEngine.__init__, default_batch_limits."""
+    name = hardware.lower()
+    gpu = SimpleNamespace(get_device_total_memory=lambda: int(hbm_gb * GIB), get_device_name=lambda: name,
                           is_device_capability=lambda capability: "gb10" in name,
                           is_tpu=lambda: False, is_cpu=lambda: False)
 
@@ -71,6 +71,12 @@ def _simulated_gpu_batch_defaults(spec: EngineSpec):
         with patch.object(arg_utils, "current_platform", gpu):
             return EngineArgs.get_batch_defaults(world_size)
     return defaults
+
+
+def default_batch_limits(hardware: str, hbm_gb: float) -> tuple[int, int]:
+    """(max_num_batched_tokens, max_num_seqs) that `vllm serve` picks for the simulated GPU."""
+    tokens, seqs = _simulated_gpu_batch_defaults(hardware, hbm_gb)(1)
+    return tokens[UsageContext.OPENAI_API_SERVER], seqs[UsageContext.OPENAI_API_SERVER]
 
 
 class SimEngine:
@@ -121,7 +127,7 @@ class SimEngine:
             self.ctx.spec_accept_rate = spec.spec_accept_rate
         usage_context = None
         if spec.hbm_gb is not None:
-            args.get_batch_defaults = _simulated_gpu_batch_defaults(spec)
+            args.get_batch_defaults = _simulated_gpu_batch_defaults(spec.hardware, spec.hbm_gb)
             usage_context = UsageContext.OPENAI_API_SERVER  # what `vllm serve` passes
         self.vllm_config = args.create_engine_config(usage_context=usage_context)
         from augur.verify import hooks as vllm_hooks

@@ -89,6 +89,38 @@ def test_batch_limit_flags_win_over_the_defaults(tmp_path):
     assert (limits.max_num_batched_tokens, limits.max_num_seqs) == (2048, 128)
 
 
+def _kv_run(workload, *args):
+    r = subprocess.run([sys.executable, "-m", "augur.cli", "--model", MODEL, "--workload", workload, "--num-entries", "1",
+                        "--max-model-len", "8192", "--max-num-seqs", "128", "--max-num-batched-tokens", "2048",
+                        "--mem-util", "0.85", "--quiet", *args], capture_output=True, text=True,
+                       env=dict(os.environ, VLLM_LOGGING_LEVEL="WARNING"))
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout[r.stdout.index("{"):])["num_gpu_blocks"] * 16, r.stderr
+
+
+def test_kv_size_follows_the_hardware_and_matches_real_vllm_runs(workload):
+    # Real vLLM 0.33 on an RTX 4060 Ti, same model and flags (out/real/*/server.log, 7 runs without speculation):
+    # "GPU KV cache size" 84,704-87,680 tokens, the reserve moving 0.65-0.97 GiB from run to run.
+    tokens, err = _kv_run(workload, "--hardware", "RTX4060Ti")  # reserve measured by the profile
+    assert 84_704 <= tokens <= 87_680 and "estimated" not in err
+    tokens, err = _kv_run(workload, "--hardware", "RTX4060Ti", "--cost", "fixed")  # reserve estimated, warned once
+    assert 84_704 <= tokens <= 87_680 and err.count("estimated") == 1
+
+
+def test_hbm_gb_overrides_the_hardware_preset_and_unknown_hardware_needs_it(workload, capsys):
+    small, _ = _kv_run(workload, "--hardware", "RTX4060Ti", "--hbm-gb", "10")
+    assert small < 45_000  # 10 GiB: ~4.4 GiB of KV
+    assert main(["--model", MODEL, "--workload", workload, "--hardware", "A6000", "--cost", "fixed"]) == 2
+    assert "give --hbm-gb" in capsys.readouterr().err
+    assert _kv_run(workload, "--hardware", "A6000", "--cost", "fixed", "--hbm-gb", "48")[0] > 100_000
+
+
+def test_kv_reserve_flag_overrides_the_measured_reserve(workload):
+    base, _ = _kv_run(workload, "--hardware", "RTX4060Ti", "--kv-reserve-gib", "0")
+    measured, _ = _kv_run(workload, "--hardware", "RTX4060Ti")
+    assert 0.85 * 2**30 // 1_835_008 * 16 < base - measured < 0.95 * 2**30 // 1_835_008 * 16  # 0.90 GiB, 1.75 MiB/block
+
+
 def _latency(tmp_path, workload, name, *args):
     out = tmp_path / f"{name}.csv"
     r = augur("--workload", workload, "--num-entries", "6", "--output", str(out), "--no-async-scheduling", *args)
