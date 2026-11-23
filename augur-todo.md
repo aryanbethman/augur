@@ -98,10 +98,12 @@ accuracy alone will not set augur apart from it on ordinary workloads. These ite
 The paper's lead claim is still open: lead with these (accuracy against ports as support), or lead with accuracy
 against ports, decided after the heavy-preemption runs (plan item 13).
 
-16. [ ] Token-faithful simulation: with recorded outputs, the simulated model emits the real tokens; vLLM's own ngram
-    proposer is verified against them (exact acceptance per request and step for greedy decoding, instead of
-    --spec-accept-rate), and prefix hits on generated text are the real ones (identical generations share blocks).
-    Check on the existing ngram runs, whose decision error is −24% median TTFT today (plan item 5). No GPU
+16. [x] Token-faithful simulation (a640abe; docs/accuracy.md section 3): with known output tokens the model emits
+    them; drafts are the V2 runner's (numpy mirror of its Triton n-gram kernels, tested against the kernels in
+    Triton's CPU interpreter), verified greedily. Accepted counts match the real logs on every request-step (88,640
+    sync, 88,562 async; the CPU NgramProposer 89%); the decisions part of the ngram runs fell from +6-9% to +0.1-0.6%
+    of mean latency. Left: the verification steps' price (step time −7.6% sync, −3.7% async); only ngram k=3 on
+    ShareGPT checked against real logs
 17. [ ] Plugin case study: a KV eviction or offload policy (or a scheduler) written as a vLLM plugin, ranked against
     alternatives at hundreds of GPUs in augur, then the same code run on the 4060 Ti to confirm the ranking; BLIS
     would need it rewritten in Go first

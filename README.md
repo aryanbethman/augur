@@ -69,7 +69,9 @@ tier), prefill/decode
 `--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33), speculative decoding
 (`--speculative-method ngram|eagle|eagle3|mtp --num-speculative-tokens k
 --spec-accept-rate p`, not with `--dp`; EAGLE and MTP run vLLM's drafter path without weights,
-the drafter priced from the target's per-layer profile), KV
+the drafter priced from the target's per-layer profile; ngram is token-faithful when a call's output
+tokens are known, from the trace or `--replay-tokens`: vLLM's own drafts, verified against the real
+next tokens, and the rate only for calls without them), KV
 offload to CPU memory (`--kv-offload-gib`, vLLM's `--kv-offloading-size`;
 transfer cost from `--kv-offload-gbps` / `--kv-offload-latency-ns`, by default
 the CPU memory's, as LLMServingSim prices KV loads), and secondary tiers behind

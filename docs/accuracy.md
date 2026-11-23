@@ -289,9 +289,24 @@ calls follow augur's own loop. Mean TTFT / TPOT / latency, % of the real value:
 
 Without speculation, step time and decisions each stay within about 2% of the
 mean. The ngram runs are the exception. Their step-time error (−4 to −7.5%)
-is the price of the verification steps. Decisions
-dominate their tails (median TTFT −24 / −22%, p99 TPOT −16 / −14%) because
-augur draws accepted drafts from a rate, not from the tokens. In the offload
+is the price of the verification steps. With acceptance drawn from a rate
+(the table above), decisions dominate their tails (median TTFT −24 / −22%, p99
+TPOT −16 / −14%).
+
+**Token-faithful speculation.** When a call's output tokens are known (recorded
+in the trace, or `--replay-tokens` from a real run), the simulated model emits
+them, and the drafts are those vLLM 0.33's V2 runner makes (a numpy mirror of
+its two Triton n-gram kernels, checked against the kernels run in Triton's CPU
+interpreter), verified greedily against the real next tokens. Over every logged
+decode step of the two real ngram runs, it reproduces each request's accepted
+count exactly: 88,640 / 88,640 request-steps (sync) and 88,562 / 88,562 (async);
+vLLM's CPU NgramProposer, which takes the earliest of equal matches where the
+kernel takes the latest, matches 89%. With it, the decisions part of the two
+runs falls to +0.1 / +0.2 / +0.1% (sync) and +0.6 / +0.3 / +0.4% (async) of
+mean TTFT / TPOT / latency (from +9.2 / +2.3 / +6.4% and +12.9 / +3.4 / +8.8%
+with the rate), every p50/p90/p99 within ±1.5%, and the error left is step
+time: mean latency −7.6% (sync) and −3.7% (async). The rate-based totals were
+closer only because the two errors cancelled. In the offload
 runs, transfer stalls are not re-timed, so they count under decisions.
 On the five runs at the end of the section 1 table (KV cut down, priority, prefix caching off), decisions stay
 within ±1.3% of every mean and step time carries the error: mean latency +5.1 / +1.2% with 520 KV blocks (sync /
