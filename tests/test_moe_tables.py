@@ -40,11 +40,13 @@ def test_moe_profiles_are_shipped_and_small():
     assert {("RTXPRO6000", QWEN, "bf16", 1), ("RTXPRO6000", QWEN, "bf16", 2),
             ("RTXPRO6000", QWEN, "bf16-tp4proj", 4)} <= set(shipped())
     for path in (TP1, TP2, TP4):
-        assert path.stat().st_size < 100_000
+        assert path.stat().st_size < (150_000 if path == TP1 else 100_000)  # TP1 also holds the DP2 round tables
         with gzip.open(path, "rt") as f:
             p = json.load(f)
         assert p["identity"]["kind"] == "moe" and p["moe"]
-    assert len(json.loads(gzip.decompress(TP1.read_bytes()))["moe"]["exact"]["moe_experts"]) == 2048
+    tp1 = json.loads(gzip.decompress(TP1.read_bytes()))
+    assert len(tp1["moe"]["exact"]["moe_experts"]) == 2048
+    assert [len(r["moe_experts"]) for r in tp1["moe"]["dp"]["2"]["ranks"]] == [4095, 4095]
 
 
 def test_tp1_moe_steps_and_limits():
@@ -121,10 +123,82 @@ def test_short_run_from_shipped_tables_without_the_fork(tmp_path, workload, tp, 
     assert len(out.read_text().splitlines()) == 13
 
 
-def test_dp_ep_stays_on_the_fork(tmp_path, workload):
-    r = run_augur("--workload", workload, "--num-entries", "2", "--dp", "2", "--enable-expert-parallel",
-                  "--hardware", "RTXPRO6000", fork=str(tmp_path / "no-fork"))
-    assert r.returncode == 2 and "no step-time profile" in r.stderr
+DP_DATA = os.path.join(os.path.dirname(__file__), "data", "dp_rounds", "qwen3-30b-a3b-rtxpro6000-dp2.json.gz")
+DP_CONFIG = os.path.join(FORK, "configs", "cluster", "single_node_moe_dp_ep_instance.json")
+
+
+def dp_rounds_mismatching(cost, rounds):
+    from augur.cost.convert import shape_from_row
+    return [(rows, first, ns) for rows, first, ns in rounds
+            if cost.round_ns([shape_from_row(r) for r in rows], first_rank=first) != ns]
+
+
+def test_dp_rounds_against_the_forks_prices():
+    """DP2 + EP2 rounds priced by the fork through ASTRA-Sim (scripts/build_dp_regression.py): from augur runs on
+    the fork (ShareGPT sync and async, SWE-bench sync) and random, at the run's cluster settings and others."""
+    with gzip.open(DP_DATA, "rt") as f:
+        d = json.load(f)
+    assert len(d["workload"]) == len(d["random"]) == 1000 and len(d["other"]["rounds"]) >= 200
+    assert dp_rounds_mismatching(TableCost(TP1, **d["params"]), d["workload"] + d["random"]) == []
+    assert dp_rounds_mismatching(TableCost(TP1, **d["other"]["params"]), d["other"]["rounds"]) == []
+
+
+def test_dp_rounds_outside_the_tables_are_refused():
+    cost = TableCost(TP1)
+    one = StepShape(seqs=(SeqWork(1, 5, True),))
+    with pytest.raises(NotImplementedError, match="DP rounds"):
+        cost.round_ns([one, one, one])
+    with pytest.raises(OutsideRegime, match="1..2048"):
+        cost.round_ns([one, StepShape(seqs=(SeqWork(1, 5, True),), padded_tokens=4096)])
+    assert cost.round_ns([one, one], first_rank=1)[1] <= cost.round_ns([one, one], first_rank=0)[1]
+
+
+def test_dp_ep_runs_from_the_shipped_tables_without_the_fork(tmp_path, workload):
+    out = tmp_path / "dp.csv"
+    r = run_augur("--workload", workload, "--num-entries", "12", "--dp", "2", "--enable-expert-parallel",
+                  "--hbm-gb", "96", "--max-model-len", "8192", "--max-num-seqs", "16", "--max-num-batched-tokens", "512",
+                  "--hardware", "RTXPRO6000", "--output", str(out), fork=str(tmp_path / "no-fork"))
+    assert r.returncode == 0, r.stderr[-2000:]
+    summary = json.loads(r.stdout[r.stdout.index("{"):])
+    assert summary["steps"] > 0 and "astra_runs" not in summary
+    assert len(out.read_text().splitlines()) == 13
+    # DP without expert parallelism has no round tables (the fork's native MoE needs EP over every rank)
+    r = run_augur("--workload", workload, "--dp", "2", "--hardware", "RTXPRO6000", "--cost", "tables")
+    assert r.returncode == 2 and "expert parallelism" in r.stderr
+
+
+@needs_fork
+def test_dp_rounds_live_against_the_fork():
+    """60 fresh random DP2 rounds (60 ASTRA-Sim runs) at the fork's own DP + EP cluster config."""
+    from augur.cost.convert import shape_to_row
+    from augur.cost.llmservingsim import LLMServingSimCost
+    ref = LLMServingSimCost(FORK, "RTXPRO6000", QWEN, tp=1, cluster_config=DP_CONFIG, dp=2, ep=2)
+    cost = TableCost(TP1, **cluster_params(DP_CONFIG))
+    rng = random.Random(20261123)
+    shapes = [s for s in random_shapes(rng, 400) if 1 <= s.forward_tokens <= 2048]
+    rounds = [(shapes[2 * i:2 * i + 2], i % 2) for i in range(60)]
+    bad = [([shape_to_row(s) for s in sh], f) for sh, f in rounds
+           if ref.round_ns(sh, first_rank=f) != cost.round_ns(sh, first_rank=f)]
+    assert bad == []
+
+
+@needs_fork
+@pytest.mark.parametrize("sched", ["--no-async-scheduling", "--async-scheduling"])
+def test_whole_dp_ep_run_is_identical(tmp_path, sched):
+    """ShareGPT 300 on DP2 + EP2 (round-robin): the CSV is the same bytes from the tables as from the fork."""
+    src = os.path.join(FORK, "workloads", "sharegpt-qwen3-30b-a3b-300-sps10.jsonl")
+    if not os.path.exists(src):
+        pytest.skip("fork has no ShareGPT Qwen3-30B-A3B workload")
+
+    def run(cost):
+        out = tmp_path / f"{cost}.csv"
+        r = run_augur("--cost", cost, "--hardware", "RTXPRO6000", "--workload", src, "--kv-cache-gb", "56.53",
+                      "--dp", "2", "--enable-expert-parallel", "--router", "round-robin", "--lss-cluster-config",
+                      DP_CONFIG, "--max-num-seqs", "128", "--max-num-batched-tokens", "2048", sched,
+                      "--output", str(out), fork=FORK)
+        assert r.returncode == 0, r.stderr[-2000:]
+        return out.read_bytes()
+    assert run("tables") == run("llmservingsim")
 
 
 @needs_fork

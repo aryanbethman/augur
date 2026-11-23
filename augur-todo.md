@@ -18,8 +18,8 @@ audit fixes (2026-11-18), --profile-variant (2026-11-19).
 Contention-aware co-simulation (design doc) is merged (2026-11-21), off by default (`--contention on`).
 
 2026-11-23 (branch feature/next-features-20261123): RTX 4060 Ti profile with q=1,2,4 attention (fork e8625e0, not
-pushed); MoE TP4 on the tables (projected bundle); contention checked against two real offload runs and
---hbm-interference refitted (decode 1.1, prefill 0.1).
+pushed); MoE TP4 and DP2 + EP2 on the tables; contention checked against two real offload runs and
+--hbm-interference refitted (decode 1.1, prefill 0.1); exact replay of the sync 4 GiB-KV offload run.
 
 ## Verification runs, once the GPUs and CPUs are free
 1. [x] Rerun the PD async comparisons after the async loop fix: async PD moved 0.5% mean TTFT; sync identical
@@ -35,7 +35,7 @@ pushed); MoE TP4 on the tables (projected bundle); contention checked against tw
 
 ## Next features (proposed order, no runs needed)
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 on
-the tables; the sync replay difference fixed. Left: DP+EP on the tables (section 6).
+the tables; the sync replay difference fixed; DP2 + EP2 on the tables.
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
@@ -189,12 +189,16 @@ the tables; the sync replay difference fixed. Left: DP+EP on the tables (section
       fitted on a grid of A, B with M = 20/40/41/48 and exact on 2,000 random shapes over 8 cluster settings.
       Shipped for the fork's projected bundle only: --tp 4 --profile-variant bf16-tp4proj (--cost tables/auto now
       read shipped <variant>-tp<N> profiles). Whole SWE-bench run byte-identical to the fork, 9.0 s vs 21.2 s
-- [ ] DP+EP and EP on the tables. Looked at 2026-11-23: per MoE layer each rank's trace has an all-gather (tokens,
-      topk weights, topk ids, sized by the round's largest rank) and a reduce-scatter across the DP ranks, so ranks
-      meet four times a layer; moe_experts is priced at the round's summed token count by per-(TP, DP, rank)
-      native component tables under the balanced gate (serving/core/moe_execution.py). Needs those tables per
-      rank and a closed form for synchronized ring all-gather / reduce-scatter (ASTRA-Sim, ns-exact). MoE TP8:
-      no bundle to fit against
+- [x] DP+EP on the tables (2026-11-23): DP2 + EP2 of TP1 ranks, the one DP layout the fork has native MoE tables
+      for (moe_components dp2_ep2_rank0/1). The TP1 profile carries per-rank gate / finalize (by the rank's tokens)
+      and experts (by the round's sum) read off the fork's traces, and TableCost.round_ns a closed form of ASTRA-Sim's
+      round: token-id reads FIFO on the node's CPU memory (first member first); at each collective (hop h, duration
+      D) the early rank leaves at t_late + D, the late one at t_late - min(gap, h) + D; sampled-id writes in
+      finishing order. Exact on 480 random rounds over 6 cluster settings and 1,000 rounds from fork runs; ShareGPT
+      300 DP2+EP2 byte-identical sync and async, 8.4 s vs 34.8 s. --cost auto/tables use it for --dp 2
+      --enable-expert-parallel
+- [ ] DP+EP beyond DP2 + EP2 of TP1 ranks (needs native MoE tables in the fork for that layout; the collective rule
+      was derived for two ranks); MoE TP8 (no bundle to fit against)
 - [x] TP>1 without the ASTRA binary (afa6a3b): closed form of the ring collectives in tables.py, identical to
       the fork on whole runs (8B TP2, 70B TP4, 4 x TP4); shipped 8B tp2, 70B tp4/tp8. Refuses settings where the
       form is not exact (2A > all-reduce step or 2B > last collective step)
@@ -233,9 +237,10 @@ the tables; the sync replay difference fixed. Left: DP+EP on the tables (section
       The fork's own LLMServingSim has the same race when two of its runs share a checkout
 - [x] Step loop skips idle engines' has_requests chain (a84b71a): ~10% faster at 256 GPUs, byte-identical
 - [x] Commit the PROGRESS.md notes (speed explanation, crash fix)
-- [ ] Faster DP rounds: per round 25 ms = chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms
+- [~] Faster DP rounds: per round 25 ms = chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms
       (2026-11-21). A cache cannot help (no round repeats; 5.7% of per-rank traces do). Per-rank worker processes
-      gave byte-identical output but no measurable speed-up on the loaded host
+      gave byte-identical output but no measurable speed-up on the loaded host. DP2 + EP2 now prices from tables
+      (2026-11-23); other layouts still pay this
 - [x] --profile-variant (2026-11-19): price from a named fork profile folder, e.g. the projected Qwen3-30B-A3B
       RTXPRO6000 bf16-tp4proj (rebuilt in the vllm-sim fork's format from its measured tp1/tp2; not the a4053bc
       bundle, which that fork cannot load)

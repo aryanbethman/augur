@@ -61,6 +61,21 @@ is deterministic in ``T``), so the profile stores it as a table of ``T`` and ``L
   40, 41 and 48 (MoE blocks removed from real traces), then checked on random shapes and cluster settings.
   MoE at other TP sizes is refused.
 
+Data parallelism with expert parallelism (``round_ns``; DP2 + EP2 of TP1 ranks, ``moe.dp``, the only DP layout the
+fork has native MoE tables for).  Each rank runs its own trace: the embedding, then per decoder layer the layers
+before the MoE block, ``moe_gate_routing`` (priced at the rank's token count T_r), three all-gathers (hidden states,
+top-k weights, top-k ids; bytes = per-token sizes x the round's largest T), ``moe_experts`` (at the round's summed
+count, per rank), a reduce-scatter (2 x largest T x hidden bytes), ``moe_finalize_copy`` (at T_r); then the head.
+ASTRA-Sim runs both ranks together, which the closed form reproduces (fitted on probes, exact on 360 random rounds
+over six cluster settings):
+
+* start: both ranks read their token ids from the node's one CPU memory, the round's first member first (a FIFO:
+  the second finishes at A_first + A_second);
+* a collective of ring hop h = int(lat + msg / bw) and duration D (all-gather: h + 20; reduce-scatter of S bytes:
+  msg = S / 2, h + 3 int(msg / HBM) + 20) entered at t_late >= t_early: the early rank leaves at t_late + D, the late
+  one at t_late - min(t_late - t_early, h) + D (it already holds the early rank's data);
+* end: the sampled ids (a dummy rank writes 0 bytes) are written to the CPU memory in finishing order.
+
 Tensor parallelism (TP = N > 1, one node, dense and MoE models; ASTRA-Sim FullyConnected topology, ring
 collectives).  Compute is priced exactly as above, on the profile's tpN tables.  The fork prices the
 rest by running ASTRA-Sim; for a dense step it has this closed form (``_comm_ns``, with the ASTRA-Sim
@@ -284,6 +299,13 @@ class TableCost:
         self._skew = p["skew"]
         self._moe_exact = (moe or {}).get("exact", {})
         self._moe_balanced = (moe or {}).get("balanced", {})
+        self._moe_dp = (moe or {}).get("dp", {})
+        if self._moe_dp and self.tp == 1:  # DP rounds run collectives between the ranks: link and HBM bandwidth
+            npu = npu_mem_bw if npu_mem_bw is not None else (p.get("hardware") or {}).get("npu_mem_bw_gbps")
+            npu = NPU_MEM_BW_GBPS.get(ident.get("hardware")) if npu is None else npu
+            if npu is None or int(npu) < 1 or int(cpu_mem_bw) < 1 or link_bw <= 0 or link_latency_ns < 0:
+                raise ValueError("DP rounds need npu_mem_bw >= 1, cpu_mem_bw >= 1, link_bw > 0, link_latency_ns >= 0")
+            self.link_bw, self.link_latency_ns, self.npu_mem_bw = link_bw, link_latency_ns, npu
         lay = p["layers"]
         self._prologue, self._head, self._repeat = lay["prologue"], lay["head"], lay["repeat"]
         self._block = {}
@@ -515,8 +537,62 @@ class TableCost:
 
     # --- step ------------------------------------------------------------
 
-    def round_ns(self, shapes, first_rank: int = 0):
-        raise NotImplementedError("TableCost does not price DP rounds (EP collectives)")
+    def round_ns(self, shapes, first_rank: int = 0) -> list[int]:
+        """One DP round (see the module docstring): each rank's time from the round's first handover to its last
+        CPU-memory write, as LLMServingSim's ASTRA-Sim run of the round. Called by: Coordinator (DP groups)."""
+        spec = self._moe_dp.get(str(len(shapes)))
+        if spec is None or self.tp != 1:
+            raise NotImplementedError(f"TableCost prices DP rounds of {sorted(self._moe_dp) or 'no'} TP1 ranks; this "
+                                      f"profile at tp={self.tp} has none for {len(shapes)} (use --cost llmservingsim)")
+        counts = [s.forward_tokens for s in shapes]
+        top = spec["max_tokens"]
+        if min(counts) < 1 or max(counts) > top:
+            raise OutsideRegime(f"DP round with forward token counts {counts}: the MoE tables cover 1..{top} per rank")
+        summed, largest = sum(counts), max(counts)
+        cpu_bw, lat = int(self.cpu_mem_bw), self.cpu_mem_latency_ns
+        # collectives: (ring hop, duration) of the all-gathers and of the reduce-scatter
+        bw = self.link_bw * (1 << 30) / 1000000000          # NetworkFunction.cpp, as _ring_ns
+        local = int(self.npu_mem_bw) * 1000000000
+        gathers = []
+        for per_token in spec["all_gather_bytes_per_token"]:
+            h = int(self.link_latency_ns + per_token * largest / bw)
+            gathers.append((h, h + 20))
+        msg = (2 * largest * spec["reduce_scatter_bytes_per_token"]) // 2
+        h = int(self.link_latency_ns + msg / bw)
+        scatter = [(h, h + 3 * int(msg / local * 1e9) + 20)]
+        segments, reads, writes = [], [], []
+        for rank, shape in enumerate(shapes):
+            rows = 0 if shape.dummy else len(shape.seqs)
+            t = counts[rank]
+            price = self._pricer(self._batch_key(shape), t, rows)
+            tab = spec["ranks"][rank]
+            gate, fin, experts = tab["moe_gate_routing"][t - 1], tab["moe_finalize_copy"][t - 1], tab["moe_experts"][summed - 2]
+            pre = sum(price(n) for n in spec["pre"]) + gate
+            head = sum(price(n) for n in spec["tail"] if rows > 0 or n not in self._per_seq)
+            seg = [sum(price(n) for n in self._prologue) + pre]
+            for layer in range(spec["layers"]):
+                seg += [experts, fin + (pre if layer < spec["layers"] - 1 else head)]
+            segments.append(seg)
+            reads.append(lat + int(self._in_bytes_per_token * t / cpu_bw))
+            writes.append(lat + int(self._out_bytes_per_seq * rows / cpu_bw))
+        n = len(shapes)
+        t = [0] * n
+        busy = 0
+        for r in [first_rank] + [r for r in range(n) if r != first_rank]:  # token ids in, first member first
+            busy += reads[r]
+            t[r] = busy
+        for k in range(len(segments[0])):
+            t = [t[r] + segments[r][k] for r in range(n)]
+            for h, d in (gathers if k % 2 == 0 else scatter) if k < len(segments[0]) - 1 else ():
+                late = max(range(n), key=lambda r: (t[r], r))
+                end, gap = t[late], max(t) - min(t)
+                t = [end + d if r != late else end - min(gap, h) + d for r in range(n)]
+        busy = 0
+        for r in sorted(range(n), key=lambda r: (t[r], r)):  # sampled ids out, in finishing order
+            busy = max(busy, t[r]) + writes[r]
+            t[r] = busy
+        self.steps += n
+        return t
 
     def step_ns(self, shape: StepShape) -> int:
         batch = self._batch_key(shape)

@@ -372,7 +372,129 @@ def _moe_section(cost, tg, db, config, names):
     return {"exact": table}
 
 
-def build_profile(fork, hardware, model, tp=1, cluster_config=None, variant=None, provenance=None) -> dict:
+DP_MOE = ("moe_gate_routing", "moe_experts", "moe_finalize_copy")
+
+
+def _dp_rank_rows(ref, counts, rank):
+    """One rank's trace rows in a DP round whose ranks run prefills of ``counts`` tokens (the fork's DP path)."""
+    from augur.cost import SeqWork, StepShape
+    shapes = [StepShape(seqs=(SeqWork(c, 0, False),)) for c in counts]
+    inst = ref.oracle.cluster["instances"][rank]
+    cwd = os.getcwd()
+    os.chdir(ref._run_dir)
+    try:
+        tr = ref._tg.generate_trace(ref._batch(shapes[rank]), ref.hardware, inst["tp_size"], inst.get("pp_size", 1),
+                                    inst["local_ep"], inst["ep_total"], max_num_batched_tokens=ref.max_num_batched_tokens,
+                                    dtype=ref.dtype, placement=ref._placement, enable_block_copy=True,
+                                    tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                    dp_sum_total_len=sum(counts), dp_min_total_len=min(counts),
+                                    dp_token_counts=tuple(counts), dp_rank=rank)
+    finally:
+        os.chdir(cwd)
+    return [r for r in tr.rows if not (len(r) == 11 and r[0] in ("kv_load", "kv_evict"))]
+
+
+def _dp_layout(rows):
+    """(MoE prices {name: ns}, per-layer names before the MoE block, all-gather sizes, reduce-scatter size) of a DP
+    rank's trace; refuses a trace whose layers differ or whose block is not gate | all-gathers | experts |
+    reduce-scatter | finalize."""
+    prices, pre, ag, rs, layer, seq = {}, None, None, None, [], []
+    for r in rows:
+        if len(r) == 11:
+            if r[0] in DP_MOE and prices.setdefault(r[0], int(r[1])) != int(r[1]):
+                raise Refused("DP MoE layers differ within one step")
+            seq.append(r[0])
+        elif r[0].startswith("EXPERT END") and r[0] != "EXPERT END NONE 0":
+            f = r[0].split()[2:]
+            kinds = [(f[k].split(":")[0], int(f[k + 1])) for k in range(0, len(f), 2)]
+            if all(k == "ALLGATHER" for k, _ in kinds):
+                if ag not in (None, [b for _, b in kinds]):
+                    raise Refused("DP all-gathers differ between layers")
+                ag = [b for _, b in kinds]
+                seq.append("|AG")
+            elif [k for k, _ in kinds] == ["REDUCESCATTER"]:
+                if rs not in (None, kinds[0][1]):
+                    raise Refused("DP reduce-scatters differ between layers")
+                rs = kinds[0][1]
+                seq.append("|RS")
+            else:
+                raise Refused(f"unexpected DP collectives {kinds}")
+    try:
+        g = seq.index("moe_gate_routing")
+    except ValueError:
+        raise Refused("no moe_gate_routing in the DP trace") from None
+    pre = seq[1:g]  # after the embedding
+    unit = pre + ["moe_gate_routing", "|AG", "moe_experts", "|RS", "moe_finalize_copy"]
+    body = seq[1:]
+    n = body.count("moe_experts")
+    if body[:len(unit) * n] != unit * n:
+        raise Refused("DP trace layers are not [pre, gate, all-gathers, experts, reduce-scatter, finalize] each")
+    return prices, pre, ag, rs, n, body[len(unit) * n:]
+
+
+def _dp_section(fork, hardware, model, dp_cluster_config, variant=None):
+    """DP2 + EP2 (TP1 ranks) tables for ``TableCost.round_ns``: per rank, the gate and finalize at its own token
+    count (1..2048) and the experts at the round's summed count (2..4096), read off the fork's traces, and the
+    collectives' bytes per token. Every value is checked to depend on those counts only."""
+    from augur.cost.llmservingsim import LLMServingSimCost
+    with open(dp_cluster_config, encoding="utf-8") as f:
+        c = json.load(f)
+    insts = [i for node in c["nodes"] for i in node["instances"]]
+    if len(c["nodes"]) != 1 or len(insts) != 2 or any(i.get("tp_size", 1) != 1 or i.get("ep_size") != 2
+                                                      or (i.get("pp_size") or 1) != 1 for i in insts):
+        raise Refused("--dp-cluster-config: one node with two TP1 instances of ep_size 2 (DP2 + EP2)")
+    ref = LLMServingSimCost(fork, hardware, model, tp=1, cluster_config=os.path.abspath(dp_cluster_config), dp=2,
+                            ep=2, profile_variant=variant)
+    top = 2048
+    ranks = [{n: [None] * (top if n != "moe_experts" else 2 * top - 1) for n in DP_MOE} for _ in range(2)]
+    layout = None
+    for rank in (0, 1):
+        def counts(mine, other):
+            return (mine, other) if rank == 0 else (other, mine)
+        for t in range(1, top + 1):
+            prices, *lay = _dp_layout(_dp_rank_rows(ref, counts(t, 1), rank))
+            if layout is None:
+                layout = lay
+            ranks[rank]["moe_gate_routing"][t - 1] = prices["moe_gate_routing"]
+            ranks[rank]["moe_finalize_copy"][t - 1] = prices["moe_finalize_copy"]
+            ranks[rank]["moe_experts"][t - 1] = prices["moe_experts"]  # summed count t + 1
+        for u in range(2, top + 1):
+            prices, *_ = _dp_layout(_dp_rank_rows(ref, counts(top, u), rank))
+            ranks[rank]["moe_experts"][top + u - 2] = prices["moe_experts"]  # summed count top + u
+    pre, ag, rs, layers, tail = layout
+    probe = _dp_layout(_dp_rank_rows(ref, (37, 5), 0))
+    if len(ag) != 3 or any(b % 37 for b in probe[2]) or probe[3] % (2 * 37):
+        raise Refused("DP collective sizes are not proportional to the round's largest token count")
+    return {"2": {"tp": 1, "ep": 2, "pre": pre, "layers": layers, "tail": tail,
+                  "all_gather_bytes_per_token": [b // 37 for b in probe[2]],
+                  "reduce_scatter_bytes_per_token": probe[3] // (2 * 37), "max_tokens": top,
+                  "ranks": ranks}}
+
+
+def check_dp_section(profile, fork, hardware, model, dp_cluster_config, n=400, seed=11, variant=None):
+    """Random (count, count) pairs: every MoE row of both ranks' traces against the profile's DP tables. Returns
+    the mismatches."""
+    from augur.cost.llmservingsim import LLMServingSimCost
+    ref = LLMServingSimCost(fork, hardware, model, tp=1, cluster_config=os.path.abspath(dp_cluster_config), dp=2,
+                            ep=2, profile_variant=variant)
+    spec = profile["moe"]["dp"]["2"]
+    rng = random.Random(seed)
+    bad = []
+    for _ in range(n):
+        cs = (rng.randint(1, 2048), rng.randint(1, 2048))
+        for rank in (0, 1):
+            prices, pre, ag, rs, layers, tail = _dp_layout(_dp_rank_rows(ref, cs, rank))
+            want = {"moe_gate_routing": spec["ranks"][rank]["moe_gate_routing"][cs[rank] - 1],
+                    "moe_finalize_copy": spec["ranks"][rank]["moe_finalize_copy"][cs[rank] - 1],
+                    "moe_experts": spec["ranks"][rank]["moe_experts"][sum(cs) - 2]}
+            if prices != want or ag != [b * max(cs) for b in spec["all_gather_bytes_per_token"]] or \
+                    rs != 2 * max(cs) * spec["reduce_scatter_bytes_per_token"] or pre != spec["pre"]:
+                bad.append((cs, rank, prices, want))
+    return bad
+
+
+def build_profile(fork, hardware, model, tp=1, cluster_config=None, variant=None, provenance=None,
+                  dp_cluster_config=None) -> dict:
     fork = os.path.abspath(fork)
     cost, db, config, tables, tg = load_fork(fork, hardware, model, tp, cluster_config, variant)
     variant = db["variant"]
@@ -425,6 +547,21 @@ def build_profile(fork, hardware, model, tp=1, cluster_config=None, variant=None
             extra["hardware"] = {"npu_mem_bw_gbps": bw}
     if is_moe:
         extra["moe"] = _moe_section(cost, tg, db, config, moe_names)
+        if dp_cluster_config:
+            if tp != 1:
+                raise Refused("DP tables are built from the TP1 profile (--tp 1)")
+            dp = _dp_section(fork, hardware, model, dp_cluster_config, variant)
+            if dp["2"]["tail"] != seq["head"] or dp["2"]["layers"] != seq["repeat"]:
+                raise Refused("DP trace layers differ from the single-engine trace's")
+            extra["moe"]["dp"] = dp
+            bw = _npu_mem_bw_default(fork, hardware)  # the reduce-scatter's reduction runs at it
+            if bw is not None:
+                extra["hardware"] = {"npu_mem_bw_gbps": bw}
+            for name in ("dp2_ep2_rank0_sp0", "dp2_ep2_rank1_sp0"):
+                path = os.path.join(fork, rel1, "moe_components", name, "components.csv")
+                if os.path.isfile(path):
+                    sources[os.path.join("tp1", "moe_components", name, "components.csv")] = _sha256(path)
+            prov["dp_cluster_config"] = os.path.basename(dp_cluster_config)
     return {**extra, **{
         "format_version": 1,
         "identity": {"hardware": hardware, "model": model, "variant": variant, "tp": tp,
@@ -637,6 +774,9 @@ def main(argv=None) -> int:
                          "distinct (tokens, sequences) pair costs one ASTRA-Sim binary run)")
     ap.add_argument("--profile-variant", default=None,
                     help="the fork's profile folder (e.g. bf16-tp4proj); name the output <variant>-tp<N>.json.gz")
+    ap.add_argument("--dp-cluster-config", default=None,
+                    help="MoE at --tp 1: also build the DP2 + EP2 round tables from this fork cluster config (one node, "
+                         "two TP1 instances with ep_size 2) and check them against the fork's traces")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--provenance-json", default=None,
                     help="JSON object merged into the profile's provenance (augur.profile writes the measured "
@@ -649,7 +789,7 @@ def main(argv=None) -> int:
         with open(a.provenance_json, encoding="utf-8") if a.provenance_json else open(os.devnull) as f:
             extra_prov = json.load(f) if a.provenance_json else None
         profile = build_profile(fork, a.hardware, a.model, a.tp, a.cluster_config, a.profile_variant,
-                                provenance=extra_prov)
+                                provenance=extra_prov, dp_cluster_config=a.dp_cluster_config)
     except Refused as e:
         print(f"convert: refused: {e}", file=sys.stderr)
         return 2
@@ -668,6 +808,12 @@ def main(argv=None) -> int:
         for m in mbad[:5]:
             print("  ", m)
     failures += len(mbad)
+    if a.dp_cluster_config:
+        dbad = check_dp_section(profile, fork, a.hardware, a.model, a.dp_cluster_config, variant=a.profile_variant)
+        print(f"DP MoE tables, random round counts against the fork's traces: {'OK' if not dbad else 'MISMATCH'}")
+        for m in dbad[:5]:
+            print("  ", m)
+        failures += len(dbad)
     if a.tp > 1:
         try:
             mism, refused, runs = spot_check_tp(a.out, fork, a.hardware, a.model, a.tp, a.cluster_config,

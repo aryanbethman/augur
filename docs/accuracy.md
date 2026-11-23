@@ -270,7 +270,7 @@ time, to the ns:
 | --- | --- |
 | ShareGPT, Llama-3.1-8B, TP1 and TP2 | 300 / 300 |
 | SWE-bench, Qwen3-30B-A3B MoE, TP1, TP2 and TP4 (projected bundle) | 765 / 765 |
-| ShareGPT, Qwen3-30B-A3B, DP2 + EP2 | 300 / 300 |
+| ShareGPT, Qwen3-30B-A3B, DP2 + EP2 (fork or shipped tables) | 300 / 300 |
 | ShareGPT, 2 engines, round-robin | TPOT 300 / 300; others 150 / 300 |
 | ShareGPT, async scheduling | 128 / 300 TTFT |
 
@@ -326,9 +326,13 @@ ASTRA-Sim's tmp__mem file, which could shift concurrent runs by a few ns or
 crash them. MoE (Qwen3-30B-A3B, TP1, TP2 and the projected TP4) is priced
 from tables too: byte-identical to the fork on the SWE-bench runs, 8.7 s
 against 14.1 s (TP1), 8.6 s against 19.4 s (TP2) and 9.0 s against 21.2 s
-(TP4) per whole run. A DP round still costs about
-25 ms through the fork (chakra graph conversion 13 ms, ASTRA-Sim 6 ms, trace
-generation 4 ms).
+(TP4) per whole run. DP2 + EP2 rounds of TP1 ranks are priced from tables as
+well (a closed form of ASTRA-Sim's two-rank all-gathers and reduce-scatters,
+tables.py): exact on 480 random rounds over six cluster settings and on 1,000
+rounds taken from fork runs, and ShareGPT 300 on DP2 + EP2 writes the same
+bytes as through the fork, sync and async, in 8.4 s against 34.8 s. Other DP
+layouts still cost about 25 ms a round through the fork (chakra graph
+conversion 13 ms, ASTRA-Sim 6 ms, trace generation 4 ms).
 
 Multi-GPU timing has not been compared with real hardware: the collective
 model is ASTRA-Sim's (ring over point-to-point links), not a measurement. On the 4060 Ti
@@ -451,5 +455,6 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
 - Pipeline parallelism; LMCache; storage tiers (files, object stores) as
   anything but a slower memory tier.
 - API-server time as a function of prompt length (one constant now).
-- MoE at TP 8 and DP + EP on the shipped tables (they use the fork). TP4 is
-  shipped for the projected bundle only (bf16-tp4proj).
+- On the shipped tables: MoE at TP 8, and DP layouts other than DP2 + EP2 of
+  TP1 ranks (they use the fork). TP4 is shipped for the projected bundle only
+  (bf16-tp4proj).

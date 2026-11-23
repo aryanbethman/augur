@@ -36,7 +36,9 @@ def _scheduler_cls(a) -> str | None:
 
 
 def _tp_params(a, cpu_bw, cpu_lat) -> dict:
-    """TableCost keyword arguments for TP>1: flags, or the cluster config file (then a flag that contradicts it is an error)."""
+    """TableCost keyword arguments for TP>1 or a DP + EP group: flags, or the cluster config file (then a flag that
+    contradicts it is an error). With --dp N the file must hold one node of N TP instances in one DP group, expert
+    parallel over all of them."""
     flags = {"link_bw": a.tp_link_bw, "link_latency_ns": a.tp_link_latency_ns, "npu_mem_bw": a.npu_mem_bw,
              "cpu_mem_bw": cpu_bw, "cpu_mem_latency_ns": cpu_lat}
     if a.lss_cluster_config:
@@ -44,14 +46,20 @@ def _tp_params(a, cpu_bw, cpu_lat) -> dict:
             c = json.load(f)
         nodes = c.get("nodes") or []
         insts = nodes[0].get("instances") or [] if len(nodes) == 1 else []
-        inst = insts[0] if len(insts) == 1 else {}
+        inst = insts[0] if insts else {}
         bad = []
-        if len(nodes) != 1 or len(insts) != 1:
-            bad.append("not one node with one instance")
-        if inst.get("num_npus") != a.tp or inst.get("tp_size") != a.tp:
+        if len(nodes) != 1 or len(insts) != a.dp:
+            bad.append(f"not one node with {a.dp} instance(s)")
+        if any(i.get("num_npus") != a.tp or i.get("tp_size") != a.tp for i in insts):
             bad.append(f"num_npus/tp_size are not {a.tp}")
-        if inst.get("pd_type") or inst.get("dp_group") or (inst.get("pp_size") or 1) != 1:
-            bad.append("PD, DP or PP instance")
+        if any(i.get("pd_type") or (i.get("pp_size") or 1) != 1 for i in insts):
+            bad.append("PD or PP instance")
+        if a.dp == 1 and inst.get("dp_group"):
+            bad.append("DP instance")
+        if a.dp > 1 and (len({i.get("dp_group") for i in insts}) != 1 or not inst.get("dp_group")
+                         or any(i.get("ep_size") != a.dp * a.tp for i in insts)
+                         or any(i.get("npu_mem") != inst.get("npu_mem") for i in insts)):
+            bad.append(f"not one DP group of {a.dp} instances with ep_size {a.dp * a.tp} and equal npu_mem")
         if "collective_links" in c or "cxl_mem" in c:
             bad.append("collective_links / cxl_mem")
         for k in ("link_bw", "link_latency"):
@@ -59,7 +67,7 @@ def _tp_params(a, cpu_bw, cpu_lat) -> dict:
                 bad.append(f"{k} missing or not a number (the fork would take it from hardware.yaml)")
         if bad:
             raise ValueError(f"--lss-cluster-config {a.lss_cluster_config}: {'; '.join(bad)}: "
-                             "the closed-form TP pricer does not cover it (use --cost llmservingsim)")
+                             "the closed-form pricer does not cover it (use --cost llmservingsim)")
         cpu = nodes[0].get("cpu_mem") or {}
         fromfile = {"link_bw": c["link_bw"], "link_latency_ns": c["link_latency"],
                     "npu_mem_bw": (inst.get("npu_mem") or {}).get("mem_bw"),
@@ -311,6 +319,13 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _has_dp_tables(profile, dp: int) -> bool:
+    """The profile file carries DP round tables for ``dp`` ranks (moe.dp). Called by: _pick_cost, main."""
+    import gzip
+    with gzip.open(profile, "rt", encoding="utf-8") as f:
+        return str(dp) in ((json.load(f).get("moe") or {}).get("dp") or {})
+
+
 def _pick_cost(a, cpu_flags) -> str | None:
     """--cost auto: the shipped tables when augur has a profile for --hardware, --model and --tp (no DP/EP and a TP
     config the closed form covers), else the fork, whose profile must exist. Sets ``a.cost``; returns the tables'
@@ -319,14 +334,17 @@ def _pick_cost(a, cpu_flags) -> str | None:
     profile = None
     if a.cost in ("tables", "auto"):
         from augur.cost.tables import bundled_profile
-        plain = a.dp == 1 and not a.enable_expert_parallel
+        # one engine per profile, or a DP + EP group of TP1 ranks when the profile has its round tables
+        plain = (a.dp == 1 and not a.enable_expert_parallel) or (a.dp > 1 and a.enable_expert_parallel and a.tp == 1)
         variant = a.profile_variant or "bf16"
         if a.cost == "tables" or a.profile:
             profile = a.profile or bundled_profile(a.hardware, a.model, a.tp, variant)
         elif plain:
             try:
                 profile = bundled_profile(a.hardware, a.model, a.tp, variant)
-                if a.tp > 1:
+                if a.dp > 1 and not _has_dp_tables(profile, a.dp):
+                    raise FileNotFoundError(profile)
+                if a.tp > 1 or a.dp > 1:
                     _tp_params(a, *cpu_flags)  # a config the closed form does not cover: use the fork
             except FileNotFoundError:
                 pass
@@ -489,12 +507,14 @@ def main(argv: list[str] | None = None) -> int:
         cost = FixedCost(base_ns=int(step_ms * 1e6), per_token_ns=int((a.fixed_per_token_us or 0.0) * 1e3))
     elif a.cost == "tables":
         from augur.cost.tables import TableCost
-        if a.dp != 1 or a.enable_expert_parallel:
-            print("augur: --cost tables prices TP without DP/EP only (use --cost llmservingsim)", file=sys.stderr)
+        if (a.dp != 1 or a.enable_expert_parallel) and not (a.dp > 1 and a.enable_expert_parallel and a.tp == 1
+                                                            and _has_dp_tables(profile, a.dp)):
+            print(f"augur: --cost tables prices DP only with expert parallelism over TP1 ranks and a profile with "
+                  f"DP{a.dp} round tables ({profile} has none; use --cost llmservingsim)", file=sys.stderr)
             return 2
         try:
-            kw = _tp_params(a, *cpu_flags) if a.tp > 1 else dict(cpu_mem_bw=a.cpu_mem_bw,
-                                                                   cpu_mem_latency_ns=a.cpu_mem_latency_ns)
+            kw = _tp_params(a, *cpu_flags) if a.tp > 1 or a.dp > 1 else dict(cpu_mem_bw=a.cpu_mem_bw,
+                                                                               cpu_mem_latency_ns=a.cpu_mem_latency_ns)
             cost = TableCost(profile, **kw)
             if cost.tp != a.tp:
                 raise ValueError(f"profile {profile} is tp={cost.tp}, --tp is {a.tp}")
