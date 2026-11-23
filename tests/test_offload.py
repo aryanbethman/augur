@@ -104,6 +104,17 @@ def test_replayed_completion_times_override_the_link():
     assert done(step(w, meta(), now=5 * MS)[0]) == ({"a"}, {1})
 
 
+def test_a_replayed_job_the_real_worker_reported_in_its_own_step_is_reported_there_too():
+    # vLLM polls after its CPU has launched the step's copies; for a large load that can outlast the forward and
+    # the copy, so the real worker reported job 1 in the step that issued it (a sync run on the RTX 4060 Ti)
+    same = {1}
+    w = SimOffloadWorker(LINK, BLOCK_BYTES, replay_done_ns={1: 0, 2: 10 * MS}, replay_same_step=lambda j: j in same)
+    assert done(step(w, meta(loads={1: load("a", 2)}), now=0, gpu_ns=10 * MS)[0]) == ({"a"}, {1})
+    # a job the real worker reported later keeps its logged time, behind this step's forward
+    step(w, meta(loads={2: load("b", 2)}), now=10 * MS, gpu_ns=10 * MS)
+    assert w.next_end() == 20 * MS
+
+
 def test_reports_bytes_and_time_moved():
     w = SimOffloadWorker(LINK, BLOCK_BYTES)
     step(w, meta(loads={1: load("a", 2)}), now=0)

@@ -146,7 +146,8 @@ class SimEngine:
             # The connector's scheduler half is vLLM's; this is its worker half.
             # kv_block_bytes was set while EngineCore sized the KV cache.
             self.ctx.offload = SimOffloadWorker(spec.kv_offload_link, self.ctx.kv_block_bytes,
-                                                replay_done_ns=getattr(cost, "kv_done", None), net=net)
+                                                replay_done_ns=getattr(cost, "kv_done", None), net=net,
+                                                replay_same_step=getattr(cost, "reported_this_step", None))
         self.busy = False
         self.admitting = 0  # calls routed here that are still in the API server (--frontend-latency-ms)
         self.xfer_wake_at: int | None = None  # offload: the poll already queued for a finishing transfer

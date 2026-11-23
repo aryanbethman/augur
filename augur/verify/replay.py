@@ -91,6 +91,8 @@ class ReplayCost:
     round_k: int = 0
     # call id -> the request id the logged engine used (augur.sim.coordinator.Coordinator.request_ids)
     rids: dict[str, str] = field(default_factory=dict)
+    # KV offload: job id -> index (in durations) of the step whose output carried it
+    kv_done_step: dict[int, int] = field(default_factory=dict)
 
     def next_round_ns(self) -> int:
         if self.round_k >= len(self.rounds):
@@ -120,6 +122,7 @@ class ReplayCost:
         toks = [{call_id(r): n for r, n in s["tok"].items()} for s, _ in st]
         sched_t = {e["k"]: e["t"] for e in ev if e["ev"] == "sched"}
         kv_done = {jid: sched_t[e["k"]] - t0 for e in ev if e["ev"] == "upd" for jid in e.get("jobs", ())}
+        kv_done_step = {jid: i for i, (_, u) in enumerate(st) for jid in u.get("jobs", ())}
         sched_times = sorted(t - t0 for t in sched_t.values())
         rounds = [e["dur"] for e in ev if e["ev"] == "round"]
         rids = {call_id(e["rid"]): e["rid"] for e in ev if e["ev"] == "add"}
@@ -136,14 +139,21 @@ class ReplayCost:
             # like the last one.
             for _ in range(_unlogged_tail(ev) if d else 0):
                 d.append(d[-1])
-            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds, rids=rids)
+            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds, rids=rids,
+                   kv_done_step=kv_done_step)
         d = []
         for i, (s, u) in enumerate(st):
             if u["left"] > 0 and i + 1 < len(st):
                 d.append(st[i + 1][0]["t"] - s["t"])
             else:
                 d.append(u["t"] - s["t"])
-        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds, rids=rids)
+        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds, rids=rids,
+                   kv_done_step=kv_done_step)
+
+    def reported_this_step(self, job_id: int) -> bool:
+        """The logged worker reported offload job ``job_id`` in the step being replayed now (the last one priced).
+        Called by: SimOffloadWorker (through SimEngine)."""
+        return self.kv_done_step.get(job_id) == self.k - 1
 
     def step_ns(self, shape: StepShape) -> int:
         if self.k >= len(self.durations):

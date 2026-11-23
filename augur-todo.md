@@ -35,7 +35,7 @@ pushed); MoE TP4 on the tables (projected bundle); contention checked against tw
 
 ## Next features (proposed order, no runs needed)
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 on
-the tables. Left: DP+EP on the tables (section 6), the sync replay difference (section 4).
+the tables; the sync replay difference fixed. Left: DP+EP on the tables (section 6).
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
@@ -110,9 +110,10 @@ the tables. Left: DP+EP on the tables (section 6), the sync replay difference (s
       a GEMV microbenchmark: async e2e +2.4% TTFT, now −0.1%). RTX4060Ti now has a 288 GB/s default (interference
       was silently off for it). Scripts: real_offload_check.sh KV_GIB / HOST_LOAD, fit_hbm_interference.py,
       step_xfer_slowdown.py, host_mem_load.py; stepcheck --csv records each step's transfer bytes
-- [ ] Sync replay of the 4 GiB-KV offload run: 24,191 / 24,195 steps (two requests whose CPU loads finished in real
-      step 2341 are scheduled a step apart; augur-next-20261123/augur-src/out/real/swe50_offload16_kv4 on anjuna3).
-      Async replays exactly
+- [x] Sync replay of the 4 GiB-KV offload run (2026-11-23): was 24,191 / 24,195 steps. vLLM's worker submits a step's
+      async loads after the forward and polls once its CPU has launched the copies, so a 127-block load was reported
+      in its own step (71.5 ms against ~31). Replay now reports a job in its issuing step when the log did: all four
+      real offload runs replay exactly. The launch's CPU time is not priced (0.07% of the sync run's time)
 - [ ] Contention: K and host memory on more hosts and GPUs (fitted on the same two runs, one 4060 Ti); two-socket
       hosts; real contended runs at several GPUs per host (GPU 1 here is clock-locked); a transfer-bound run (here
       transfers overlapped ~8% of steps); poll-time waits use projected flow ends; host memory shares fairly and

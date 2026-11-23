@@ -423,9 +423,14 @@ benchmarks above augur takes 1–4 s per run against 55–152 s for the real one
   | async | −1.1 / −0.8 / −1.0% | +2.4 / −0.2 / +2.0% | −0.1 / −0.8 / −0.2% |
   | sync | −0.6 / −1.0 / −0.5% | −0.9 / −1.2 / −0.7% | −0.8 / −0.2 / −0.7% |
 
-  Decisions: the async run replays exactly (24,373 / 24,373 steps); the sync
-  run 24,191 / 24,195: two requests whose CPU loads the real engine reported
-  done in step 2341 were scheduled a step apart in replay (open). Four host
+  Decisions: both replay exactly (24,373 / 24,373 async, 24,195 / 24,195
+  sync). The sync run first differed in 4 steps: vLLM's worker submits a
+  step's async loads after the forward and polls only once its CPU has
+  launched the copies, so a large load (127 blocks, 233 MB) was reported in
+  the step that issued it, which took 71.5 ms against ~31. Replay now reports
+  such a job in its issuing step too. That CPU time is not priced in normal
+  runs: steps reporting loads ran 0.7 s (sync) and 0.3 s (async) longer than
+  priced over runs of 990 and 940 s. Four host
   processes streaming memory barely slow one GPU's copies (H2D −2%, D2H 0%;
   the losses of 11-56% need both GPUs copying), so a loaded-host run on one
   GPU was not made. Before 2026-11-23 `--hardware RTX4060Ti` had no GPU
