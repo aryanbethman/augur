@@ -1,0 +1,197 @@
+diff -ruN a/blis-vllm/vllmengine/extpricer.go b/blis-vllm/vllmengine/extpricer.go
+--- a/blis-vllm/vllmengine/extpricer.go	1970-01-01 05:30:00.000000000 +0530
++++ b/blis-vllm/vllmengine/extpricer.go	2026-11-23 22:04:45.983247789 +0530
+@@ -0,0 +1,158 @@
++// Same-step-time test (augur scripts/baselines): an external step price, and a step log.
++//
++// With BLIS_PRICER_CMD set, every step is priced by that command, which reads one JSON line per
++// batch on stdin ({"reqs": [[tokens, computed, is_decode], ...], "spec_k": K}) and answers one
++// line on stdout ({"gpu_ns": N, "cpu_ns": M}); the step takes gpu_ns, plus cpu_ns unless
++// BLIS_PRICER_NO_CPU is set (async scheduling hides the CPU term behind the previous batch),
++// rounded to the engine's microsecond. BLIS_STEP_LOG names a file that gets one JSON line per
++// priced batch ({"k", "tok", "computed", "pre"}). BLIS_NUM_GPU_BLOCKS overrides the pool's KV
++// block count (vllmengine.go). BLIS_OFFLOAD_GBPS and BLIS_OFFLOAD_BLOCK_BYTES make a KV offload
++// transfer take blocks x block bytes / bandwidth (no latency), as augur's offload link does, instead
++// of the kernel's price.
++
++package vllmengine
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"strconv"
++	"strings"
++	"sync"
++
++	"github.com/inference-sim/blis-substrate/contracts/engine"
++)
++
++// extPricer prices a step with the external command and delegates everything else (offload
++// transfers, verified drafts) to the kernel's pricer.
++type extPricer struct {
++	kernelPricer
++	once  sync.Once
++	in    *bufio.Writer
++	out   *bufio.Scanner
++	log   *bufio.Writer
++	step  int
++	memo  map[engine.BatchID]engine.Duration // the engine may price one batch more than once
++	specK int
++	noCPU bool
++}
++
++func newExtPricer(k kernelPricer) *extPricer {
++	e := &extPricer{kernelPricer: k, noCPU: os.Getenv("BLIS_PRICER_NO_CPU") != "", memo: map[engine.BatchID]engine.Duration{}}
++	e.specK, _ = strconv.Atoi(os.Getenv("BLIS_SPEC_K"))
++	return e
++}
++
++func (e *extPricer) start() {
++	args := strings.Fields(os.Getenv("BLIS_PRICER_CMD"))
++	cmd := exec.Command(args[0], args[1:]...)
++	cmd.Stderr = os.Stderr
++	w, err := cmd.StdinPipe()
++	if err != nil {
++		panic(err)
++	}
++	r, err := cmd.StdoutPipe()
++	if err != nil {
++		panic(err)
++	}
++	if err := cmd.Start(); err != nil {
++		panic(fmt.Errorf("BLIS_PRICER_CMD: %w", err))
++	}
++	e.in = bufio.NewWriter(w)
++	e.out = bufio.NewScanner(r)
++	e.out.Buffer(make([]byte, 1<<20), 1<<20)
++	if !e.out.Scan() { // {"ready": 1}
++		panic("BLIS_PRICER_CMD: no ready line")
++	}
++	if p := os.Getenv("BLIS_STEP_LOG"); p != "" {
++		f, err := os.Create(p)
++		if err != nil {
++			panic(err)
++		}
++		e.log = bufio.NewWriter(f)
++	}
++}
++
++// StepTime implements core/vllm.Pricer.
++func (e *extPricer) StepTime(b engine.Batch) engine.Duration {
++	e.once.Do(e.start)
++	if len(b.Reqs) == 0 {
++		return 1
++	}
++	if d, ok := e.memo[b.ID]; ok {
++		return d
++	}
++	reqs := make([][3]int, len(b.Reqs))
++	for i, r := range b.Reqs {
++		dec := 0
++		if r.Tokens == 1 || (r.Drafts > 0 && r.Tokens == 1+r.Drafts) {
++			dec = 1
++		}
++		reqs[i] = [3]int{r.Tokens, r.Computed, dec}
++	}
++	line, _ := json.Marshal(map[string]any{"reqs": reqs, "spec_k": e.specK})
++	e.in.Write(line)
++	e.in.WriteByte('\n')
++	e.in.Flush()
++	if !e.out.Scan() {
++		panic("BLIS_PRICER_CMD: closed")
++	}
++	var ans struct {
++		Gpu int64 `json:"gpu_ns"`
++		Cpu int64 `json:"cpu_ns"`
++	}
++	if err := json.Unmarshal(e.out.Bytes(), &ans); err != nil {
++		panic(err)
++	}
++	ns := ans.Gpu
++	if !e.noCPU {
++		ns += ans.Cpu
++	}
++	if e.log != nil {
++		tok := make(map[string]int, len(b.Reqs))
++		comp := make(map[string]int, len(b.Reqs))
++		for _, r := range b.Reqs {
++			tok[r.ID] = r.Tokens
++			comp[r.ID] = r.Computed
++		}
++		e.step++
++		rec, _ := json.Marshal(map[string]any{"k": e.step, "id": b.ID, "tok": tok, "computed": comp, "pre": b.Preempted, "ns": ns})
++		e.log.Write(rec)
++		e.log.WriteByte('\n')
++		e.log.Flush()
++	}
++	d := max((ns+500)/1000, 1)
++	if len(e.memo) > 256 {
++		clear(e.memo)
++	}
++	e.memo[b.ID] = d
++	return d
++}
++
++// xfer is a transfer's time under BLIS_OFFLOAD_GBPS and BLIS_OFFLOAD_BLOCK_BYTES, or false when unset.
++func xfer(blocks int) (engine.Duration, bool) {
++	gbps, _ := strconv.ParseFloat(os.Getenv("BLIS_OFFLOAD_GBPS"), 64)
++	per, _ := strconv.ParseInt(os.Getenv("BLIS_OFFLOAD_BLOCK_BYTES"), 10, 64)
++	if gbps <= 0 || per <= 0 {
++		return 0, false
++	}
++	return max(engine.Duration(float64(int64(blocks)*per)/(gbps*1e3)+0.5), 1), true
++}
++
++// TransferTime implements core/vllm.TransferPricer.
++func (e *extPricer) TransferTime(t engine.Transfer) engine.Duration {
++	if d, ok := xfer(t.Blocks); ok {
++		return d
++	}
++	return e.kernelPricer.TransferTime(t)
++}
++
++// GroupTransferTime implements core/vllm.GroupTransferPricer.
++func (e *extPricer) GroupTransferTime(t engine.Transfer, groupBlocks []int) engine.Duration {
++	if d, ok := xfer(t.Blocks); ok {
++		return d
++	}
++	return e.kernelPricer.GroupTransferTime(t, groupBlocks)
++}
+diff -ruN a/blis-vllm/vllmengine/vllmengine.go b/blis-vllm/vllmengine/vllmengine.go
+--- a/blis-vllm/vllmengine/vllmengine.go	2026-11-23 21:24:17.582703417 +0530
++++ b/blis-vllm/vllmengine/vllmengine.go	2026-11-23 21:24:38.839058446 +0530
+@@ -44,6 +44,7 @@
+ 	"os"
+ 	"path/filepath"
+ 	"reflect"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -221,6 +222,13 @@
+ 	if err != nil {
+ 		return pool{}, fmt.Errorf("vllmengine: %s: %w", filepath.Base(path), err)
+ 	}
++	if v := os.Getenv("BLIS_NUM_GPU_BLOCKS"); v != "" { // same-step-time test: the real run's block count
++		n, perr := strconv.ParseInt(v, 10, 64)
++		if perr != nil || n <= 0 {
++			return pool{}, fmt.Errorf("vllmengine: BLIS_NUM_GPU_BLOCKS=%q: want a positive integer", v)
++		}
++		blocks = n
++	}
+ 	// The pool's own offload and connector, else the deployment's (Shape.PoolOffloads): a prefill pool
+ 	// can run NIXL beside a CPU tier while the decode pool runs NIXL alone.
+ 	poolOffload, poolConnector := shape.Offload, shape.PDConnector
+@@ -770,6 +778,9 @@
+ 	if g, err := offloadGroupBytes(p.model); err == nil {
+ 		k.groupBytes = g
+ 	}
++	if os.Getenv("BLIS_PRICER_CMD") != "" {
++		return newExtPricer(k)
++	}
+ 	return k
+ }
+ 
