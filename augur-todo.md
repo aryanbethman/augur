@@ -58,9 +58,15 @@ Additions
 5. [x] Error breakdown (206a5a4): `python -m augur.verify.breakdown`, results in docs/accuracy.md section 3. Outside
    the step loop, step time and decisions each within ~2% of the mean on the non-speculative runs; ngram decisions
    dominate their tails (median TTFT −24%): acceptance is a rate, not token content
-6. [ ] Custom-scheduler example through --scheduler-cls (e.g. shortest job first)
-7. [ ] KV cache spec from vLLM's own model definition (meta device) for sliding-window, MLA and hybrid models;
-   decisions checked on a small sliding-window model on the 4060 Ti
+6. [x] Custom-scheduler example (3d4960f): examples/shortest_prompt_first.py, a waiting queue ordered by prompt
+   length; on ShareGPT 300 (4060 Ti tables, async) mean TTFT 53.8 → 45.4 s, p99 125.6 → 136.8 s
+7. [x] KV cache spec from vLLM's own model definition (cbcfdac, 0b7002e): augur/sim/kvspec.py builds the model on the
+   meta device and asks its layers, as GPUModelRunner does; cached per process (~1 s once, for vLLM's kernel
+   imports). Sliding window (Mistral-7B), MLA (DeepSeek-V2-Lite), hybrid Mamba (granite-4.0-h-micro) and mixed
+   sliding/full (Olmo-3-7B) build vLLM's specs and replay their own logs exactly (--cost fixed). Open: pricing for
+   them (sliding-window attention priced at full context, no MLA or Mamba kernels in the tables, weight and reserve
+   estimates ignore MLA and hybrid layers, hybrid offload bytes per block overstated); a real decision check on a
+   small sliding-window model needs its weights (a download)
 8. [ ] Pipeline parallelism; EAGLE with DP; MoE MTP pricing. Next-features 2 and 4
 9. [ ] Packaging: Dockerfile, fork and ASTRA-Sim setup script, CI for the tests that need no fork, LICENSE.
    Next-features 6
@@ -72,8 +78,11 @@ Real runs on the test host
     copied schedulers do not?
 12. [ ] Held-out accuracy: 2-3 workloads not used for any fit (another chat set, long context to 32k, bursty
     arrivals)
-13. [ ] More single-GPU decision coverage: priority scheduling, heavy preemption, prefix caching off, other chunk
-    sizes, SWE-bench at a higher session rate
+13. [x] More single-GPU decision coverage (2026-11-24, five real runs, all replayed exactly; docs/accuracy.md
+    section 1): KV cut to 520 blocks sync and async (~32k steps, 225-228 preemptions), SWE-bench with 1,550 blocks
+    (39k steps), priority scheduling, prefix caching off with a 512-token budget. Preemptions stay in the hundreds:
+    each frees a whole request, and 520 blocks is the floor for 8k-token requests. Open: SWE-bench at a higher
+    session rate; the baselines on these runs (agent running)
 14. [ ] LMCache connector unmodified, replayed against a real LMCache run. Next-features 3
 15. [ ] vLLM upgrade study: move to the next vLLM release, count the lines changed, rerun the six real replays
 

@@ -39,6 +39,11 @@ augur with the real run's arrival times and step durations
 | ShareGPT 300, TP2 (GPU 0 + 1), sync | 2,262 / 2,262 |
 | ShareGPT 300, TP2, async | 2,265 / 2,265 |
 | ShareGPT 300, small MoE (8 layers, 16 experts, dummy weights), DP2 + EP, sync | 1,919 / 1,919 and 2,151 / 2,151 |
+| ShareGPT 300, KV cut to 520 blocks (228 preemptions), sync | 31,931 / 31,931 |
+| ShareGPT 300, KV cut to 520 blocks (225 preemptions), async | 31,985 / 31,985 |
+| SWE-bench 50 sessions, KV cut to 1,550 blocks, sync | 39,044 / 39,044 |
+| ShareGPT 300, priority scheduling (seeded priorities 0-3), sync | 3,164 / 3,164 |
+| ShareGPT 300, prefix caching off, 512-token budget, sync | 3,635 / 3,635 |
 
 The two-GPU runs use GPU 1, whose clock is locked at 510 MHz: that slows its steps, not its decisions. In vLLM 0.33
 only MoE models run DP ranks in lockstep (dense DP ranks are independent engines), so the lockstep rounds, with 241
@@ -288,7 +293,10 @@ is the price of the verification steps. Decisions
 dominate their tails (median TTFT −24 / −22%, p99 TPOT −16 / −14%) because
 augur draws accepted drafts from a rate, not from the tokens. In the offload
 runs, transfer stalls are not re-timed, so they count under decisions.
-The re-timed schedule had to wait for a request the real engine already had
+On the five runs at the end of the section 1 table (KV cut down, priority, prefix caching off), decisions stay
+within ±1.3% of every mean and step time carries the error: mean latency +5.1 / +1.2% with 520 KV blocks (sync /
+async), +3.4% on SWE-bench with 1,550 blocks, +2.0% with priority, 0.0% with prefix caching off and a 512-token
+budget. The re-timed schedule had to wait for a request the real engine already had
 in one step of three runs (14-447 ms), and in no other run. p50/p90/p99 rows
 are in the tool's CSV.
 

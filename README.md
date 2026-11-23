@@ -50,7 +50,12 @@ priced as bf16).
 
 `--scheduler-cls DOTTED.PATH` runs your own vLLM scheduler class (a `Scheduler`
 subclass, or `AsyncScheduler` with `--async-scheduling`) in place of vLLM's;
-`--step-log-vllm` still logs it. `--scheduling-policy priority` orders requests
+`--step-log-vllm` still logs it. `examples/shortest_prompt_first.py` is one.
+
+Each layer's KV-cache spec comes from vLLM's own model definition, built on the
+meta device without weights: sliding-window, MLA, Mamba-hybrid and mixed models
+get vLLM's KV-cache manager behaviour (their step prices need profiles augur
+does not ship yet; `--cost fixed` runs them). `--scheduling-policy priority` orders requests
 by the workload's per-request `priority` field (lower first, default 0).
 
 Multi-GPU engines (`--tp`; link and memory settings from `--tp-link-bw`,
@@ -118,6 +123,7 @@ augur/
     offload.py         KV offload to CPU: the GPU-worker half of vLLM's OffloadingConnector
     tiers.py           simulated secondary KV tiers (CXL, memory pools) for vLLM's offload tiering
     models.py          model configs without weights
+    kvspec.py          each layer's KV-cache spec, from vLLM's model built on the meta device
   cost/                step pricing (interface in __init__.py)
     tables.py          from profiles shipped with augur: dense models on one node, no fork needed
     convert.py         builds such a profile from an LLMServingSim profile
@@ -130,8 +136,10 @@ augur/
   verify/              checking against real vLLM (table above)
 tests/                 pytest; replay self-tests and LLMServingSim comparison need the fork
   data/llmservingsim/  LLMServingSim reference outputs for the comparison
-scripts/               rebuild test data from the fork
-docs/accuracy.md       current accuracy against real vLLM and LLMServingSim
+scripts/               real-run, profiling and test-data scripts
+  baselines/           the same-step-time test against BLIS, Frontier and Vidur (docs/accuracy.md section 5)
+examples/              research uses, e.g. a custom scheduler
+docs/accuracy.md       current accuracy against real vLLM and other simulators
 augur-todo.md          open work, in priority order
 ```
 
