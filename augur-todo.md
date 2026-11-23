@@ -6,7 +6,7 @@ inference experiments. Every item is judged by that.
 
 Order: top to bottom. Status: [ ] open, [~] in progress, [x] done.
 
-## Current state (2026-11-21)
+## Current state (2026-11-23)
 Merged on 2026-11-21: kv-aware router; KV offload with PD and DP (vLLM's MultiConnector); one step log per engine and
 exact replay of multi-engine runs (round-robin, PD, DP, with and without offload, sync and async); MoE
 (Qwen3-30B-A3B) priced from shipped tables at TP1/TP2; DP + async pays the CPU term; `cxl` tier preset; warning
@@ -34,8 +34,16 @@ pushed); MoE TP4 and DP2 + EP2 on the tables; contention checked against two rea
    study; a short pilot on the RTX 4060 Ti first to shake out the memory probe
 
 ## Next features (proposed order, no runs needed)
-Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 on
-the tables; the sync replay difference fixed; DP2 + EP2 on the tables.
+First: push fork commit e8625e0 (the shipped 4060 Ti profile's provenance points at it).
+1. Automatic KV size from the memory accounting augur.profile records (now a manual --kv-reserve-gib; section 6)
+2. Pipeline parallelism (section 4; the fork has PP cluster configs to compare against)
+3. KV offload through the LMCache connector (section 4)
+4. Speculation: EAGLE with DP, MoE MTP pricing (section 4)
+5. Storage tiers (files, object stores) as more than a slow memory tier (section 4)
+6. Packaging: fork and ASTRA-Sim setup scripted, so the fork path installs like the tables path (section 3)
+
+Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
+DP2 + EP2 on the tables, the sync offload replay difference fixed.
 
 ## 0. Prove augur runs vLLM properly (top priority)
 - [x] Logging scheduler (augur.vllm_hooks), plugged in via `scheduler_cls`
