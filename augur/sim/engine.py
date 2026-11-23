@@ -41,7 +41,9 @@ class EngineSpec:
     tensor_parallel_size: int = 1
     dtype: str = "bfloat16"
     enforce_eager: bool = False  # vLLM's default: CUDA graphs on, so steps are padded
-    scheduler_cls: str | None = None  # e.g. augur.verify.hooks.LoggingScheduler
+    scheduler_cls: str | type | None = None  # e.g. augur.verify.hooks.LoggingScheduler
+    scheduling_policy: str = "fcfs"  # vLLM's SchedulerConfig.policy: fcfs | priority
+    kv_cache_dtype: str = "auto"  # vLLM's cache dtype: auto (the model's) | fp8 | fp8_e4m3 | fp8_e5m2
     num_gpu_blocks: int | None = None  # vLLM's num_gpu_blocks_override (match a real run's KV cache)
     kv_role: str | None = None  # "kv_producer" (prefill) / "kv_consumer" (decode) for PD
     data_parallel_size: int = 1  # >1: this engine is one rank of a DP group (lockstep rounds)
@@ -106,6 +108,8 @@ class SimEngine:
             enable_chunked_prefill=spec.enable_chunked_prefill,
             async_scheduling=spec.async_scheduling,
             scheduler_cls=spec.scheduler_cls,
+            scheduling_policy=spec.scheduling_policy,
+            kv_cache_dtype=spec.kv_cache_dtype,
             num_gpu_blocks_override=spec.num_gpu_blocks,
             speculative_config=spec.speculative,
             distributed_executor_backend=make_sim_executor(self.ctx),
@@ -251,7 +255,7 @@ class SimEngine:
         req = EngineCoreRequest(
             request_id=rid, prompt_token_ids=call.prompt_ids, mm_features=None,
             sampling_params=sp, pooling_params=None, arrival_time=now_ns / 1e9,
-            lora_request=None, cache_salt=None, data_parallel_rank=None,
+            lora_request=None, cache_salt=None, data_parallel_rank=None, priority=call.priority,
         )
         self.ctx.output_ids[rid] = call.output_ids
         r, wave = self.core.preprocess_add_request(req)

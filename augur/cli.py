@@ -28,10 +28,32 @@ def pin_hash_seed(module: str) -> None:
     os.execv(sys.executable, [sys.executable, "-m", module, *sys.argv[1:]])
 
 
-def _scheduler_cls(a) -> str | None:
+def _scheduler_cls(a) -> str | type | None:
+    """The scheduler class of the run: --scheduler-cls (checked to be a vLLM scheduler of the run's sync / async
+    kind), with the step log added when --step-log-vllm is set; else the logging scheduler alone, or None for
+    vLLM's own. Raises ValueError. Called by: main."""
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    from vllm.v1.core.sched.scheduler import Scheduler
+    cls = None
+    if a.scheduler_cls:
+        try:
+            cls = resolve_obj_by_qualname(a.scheduler_cls)
+        except (ImportError, AttributeError, ValueError) as e:
+            raise ValueError(f"--scheduler-cls {a.scheduler_cls}: cannot import it ({e})") from None
+        if not (isinstance(cls, type) and issubclass(cls, Scheduler)):
+            raise ValueError(f"--scheduler-cls {a.scheduler_cls} is not a subclass of vLLM's Scheduler")
+        is_async = issubclass(cls, AsyncScheduler)
+        if is_async != a.async_scheduling:
+            fix = "pass --no-async-scheduling" if is_async else "pass --async-scheduling or subclass AsyncScheduler"
+            raise ValueError(f"--scheduler-cls {a.scheduler_cls} is {'an async' if is_async else 'a synchronous'} "
+                             f"scheduler but the run is {'async' if a.async_scheduling else 'synchronous'}: {fix}")
     if not a.step_log_vllm:
-        return None
+        return cls
     os.environ["AUGUR_STEP_LOG"] = a.step_log_vllm
+    if cls is not None:
+        from augur.verify.hooks import with_step_log
+        return with_step_log(cls)
     return ("augur.verify.hooks.LoggingAsyncScheduler" if a.async_scheduling
             else "augur.verify.hooks.LoggingScheduler")
 
@@ -202,6 +224,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help="default: what `vllm serve` picks for the simulated GPU (--hbm-gb, --hardware)")
     p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--scheduler-cls", default=None, metavar="DOTTED.PATH",
+                   help="a vLLM scheduler class (a Scheduler subclass, or AsyncScheduler with --async-scheduling) to "
+                        "decide every step; --step-log-vllm still logs (the class is wrapped)")
+    p.add_argument("--scheduling-policy", choices=("fcfs", "priority"), default="fcfs",
+                   help="vLLM's scheduling policy; priority orders requests by the workload's per-request "
+                        "\"priority\" (lower first, default 0)")
+    p.add_argument("--kv-cache-dtype", choices=("auto", "fp8", "fp8_e4m3", "fp8_e5m2"), default="auto",
+                   help="vLLM's KV cache dtype: fp8 halves a block's bytes, so the same memory holds twice the blocks "
+                        "(step prices stay bf16)")
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--no-chunked-prefill", action="store_true")
     p.add_argument("--frontend-latency-ms", type=float, default=3.4,
@@ -512,6 +543,14 @@ def main(argv: list[str] | None = None) -> int:
                   "give --hbm-gb", file=sys.stderr)
             return 2
         a.hbm_gb = GPU_FACTS[a.hardware].mem_gib
+    try:
+        scheduler_cls = _scheduler_cls(a)
+    except ValueError as e:
+        print(f"augur: {e}", file=sys.stderr)
+        return 2
+    if a.kv_cache_dtype != "auto":
+        print(f"augur: --kv-cache-dtype {a.kv_cache_dtype}: the KV cache takes fp8 bytes, but attention is priced as "
+              "bf16 (the profiles were measured with a bf16 cache)", file=sys.stderr)
     if a.kv_cache_gb is not None:
         kv_bytes = int(a.kv_cache_gb * 2**30)
     else:
@@ -585,7 +624,8 @@ def main(argv: list[str] | None = None) -> int:
                       async_scheduling=a.async_scheduling,
                       speculative=speculative,
                       spec_accept_rate=a.spec_accept_rate,
-                      scheduler_cls=_scheduler_cls(a), num_gpu_blocks=a.num_gpu_blocks,
+                      scheduler_cls=scheduler_cls, scheduling_policy=a.scheduling_policy,
+                      kv_cache_dtype=a.kv_cache_dtype, num_gpu_blocks=a.num_gpu_blocks,
                       kv_offload_gib=a.kv_offload_gib,
                       kv_offload_link=_offload_link(a, *cpu_flags) if a.kv_offload_gib else None,
                       kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware,

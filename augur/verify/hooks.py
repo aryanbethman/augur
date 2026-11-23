@@ -148,3 +148,11 @@ class LoggingScheduler(_LoggingMixin, Scheduler):
 
 class LoggingAsyncScheduler(_LoggingMixin, AsyncScheduler):
     pass
+
+
+def with_step_log(base: type) -> type:
+    """``base`` (a vLLM scheduler class, e.g. a user's ``--scheduler-cls``) with the step log added: it decides as
+    ``base`` does and logs as LoggingScheduler does."""
+    if issubclass(base, _LoggingMixin):
+        return base
+    return type(f"Logging{base.__name__}", (_LoggingMixin, base), {"__module__": base.__module__})
