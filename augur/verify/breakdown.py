@@ -342,7 +342,14 @@ def main(argv=None) -> int:
     ap.add_argument("--name", default=None, help="label of the run (default: its folder)")
     ap.add_argument("--csv", default=None, help="write every value and part (ms and %% of the real value) here")
     ap.add_argument("--work", default=None, help="keep the augur runs' outputs here (default: discard)")
+    ap.add_argument("--cost", default="auto", choices=["auto", "roofline"],
+                    help="auto: augur's own choice for the runs and the profile for the retimed prices; roofline: "
+                         "--cost roofline for all of them")
+    ap.add_argument("--roofline-params", default=None,
+                    help="--cost roofline: parameters JSON (augur.cost.roofline_fit)")
     a, rest = ap.parse_known_args(argv)
+    if a.cost == "roofline":
+        rest = ["--cost", "roofline", *(["--roofline-params", a.roofline_params] if a.roofline_params else []), *rest]
 
     from augur.cli import _parser
     from augur.verify.stepcheck import make_pricer, price_steps
@@ -370,7 +377,8 @@ def main(argv=None) -> int:
         replay = client_view(from_csv(f"{work}/replay.csv", calls, order), calls, t)
         arrivals = from_csv(f"{work}/arrivals.csv", calls)
         sim = from_csv(f"{work}/sim.csv", calls)
-    cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len)
+    cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len,
+                             a.cost == "roofline", a.roofline_params)
     priced = price_steps(events, cost, disp)
     retimed, late = retime(events, priced, calls, t)
 

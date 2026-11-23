@@ -242,18 +242,41 @@ class _Attention:
 class GpuFacts(NamedTuple):
     mem_gib: float  # device memory as torch / vLLM report it (GiB): what --gpu-memory-utilization is a share of
     mem_bw_gbps: float | None = None  # GPU memory bandwidth (GB/s); None: the profiles carry it or it is not needed
+    bf16_tflops: float | None = None  # peak dense BF16 tensor-core TFLOP/s (what --cost roofline prices from)
+    datasheet_bw_gbps: float | None = None  # datasheet bandwidth for --cost roofline where mem_bw_gbps is left unset
 
 
 # What augur knows about each --hardware name.  mem_bw_gbps is for hardware whose profiles carry none because the
-# fork's hardware_defaults has no entry for it.
-# H100: SXM5 HBM3, 3.35 TB/s, the value the fork's H100 cluster configs set (an H100 PCIe has 2.0 TB/s: pass
-#   npu_mem_bw for it); 80 GB card, 79.19 GiB seen by torch (the total in PyTorch OOM messages for H100 80GB; not
-#   measured on this host).
+# fork's hardware_defaults has no entry for it; bf16_tflops (dense, fp32 accumulate) is for --cost roofline.
+# Sources (NVIDIA product pages and datasheets read 2026-11-24; NVIDIA prints the sparse figure, dense is half of it):
+# H100: SXM5 HBM3, 3.35 TB/s (nvidia.com/en-us/data-center/h100: 80 GB, 3.35 TB/s), BF16 1,979 sparse = 989.5 dense;
+#   the value the fork's H100 cluster configs set (an H100 PCIe has 2.0 TB/s: pass npu_mem_bw for it); 79.19 GiB seen by
+#   torch (the total in PyTorch OOM messages for H100 80GB; not measured on this host).
+# H200: SXM, 141 GB HBM3e, 4.8 TB/s, same compute as H100 (nvidia.com/en-us/data-center/h200).
+# B200: per GPU of an 8-GPU HGX/DGX B200 baseboard: BF16 18 PFLOPS dense / 8 (nvidia.com/en-us/data-center/hgx: 36
+#   PFLOPS sparse), 64 TB/s / 8 = 8 TB/s HBM3e (nvidia.com/en-us/data-center/dgx-b200), 1,440 GB / 8 = 180 GB.
+# A100: 80 GB SXM: 312 dense BF16 TFLOPS, 2,039 GB/s; A100_40GB (SXM): 312, 1,555 GB/s (NVIDIA A100 datasheet,
+#   Jun 2021).
+# L40S: 362.05 dense BF16 TFLOPS, 48 GB GDDR6, 864 GB/s (nvidia.com/en-us/data-center/l40s).
+# A10: 125 dense BF16 TFLOPS, 24 GB GDDR6, 600 GB/s (nvidia.com/en-us/data-center/products/a10-gpu).
+# mem_gib of the GPUs above except H100 and the RTX cards is the datasheet capacity x 0.99, the ratio torch reports
+# for the H100 (79.19 of 80 GB): an estimate, not a torch reading; give --hbm-gb for the exact figure.
 # RTX 4060 Ti: 128-bit GDDR6 at 18 Gb/s = 288 GB/s (also what --hbm-interference was fitted against); 16 GB card,
-#   15.58 GiB seen by vLLM 0.33 ("Free memory on device (15.4/15.58 GiB)" in all 11 out/real/*/server.log).
-# RTX PRO 6000 Blackwell: 96 GB GDDR7 (NVIDIA datasheet), 94.97 GiB seen by torch (the total in public PyTorch and
-#   vLLM logs for this card; not measured on this host).
-GPU_FACTS = {"H100": GpuFacts(79.19, 3350.0), "RTX4060Ti": GpuFacts(15.58, 288.0), "RTXPRO6000": GpuFacts(94.97)}
+#   15.58 GiB seen by vLLM 0.33 ("Free memory on device (15.4/15.58 GiB)" in all 11 out/real/*/server.log).  BF16 44.1
+#   TFLOP/s dense with fp32 accumulate: 136 tensor cores x 2.535 GHz boost x 128 FLOP/clock (the GeForce rate; core
+#   count and clock from the public spec sheets; NVIDIA lists 353 AI TOPS = FP8 sparse, 353 / 8 = 44.1; flopper.io
+#   lists 44).
+# RTX PRO 6000 Blackwell Server Edition: 96 GB GDDR7 and 1,597 GB/s (NVIDIA datasheet, doc 3850600; 1,792 GB/s is the
+#   Workstation Edition), 94.97 GiB seen by torch (the total in public PyTorch and vLLM logs for this card; not measured
+#   on this host).  BF16 500 TFLOP/s dense = 1,000 sparse / 2 (the sparse figure is from flopper.io; the datasheet
+#   gives only FP4).  Its mem_bw_gbps stays unset (the default pricer's behaviour is unchanged); roofline reads the
+#   datasheet value from datasheet_bw_gbps.
+GPU_FACTS = {
+    "H100": GpuFacts(79.19, 3350.0, 989.5), "H200": GpuFacts(139.59, 4800.0, 989.5),
+    "B200": GpuFacts(178.2, 8000.0, 2250.0), "A100": GpuFacts(79.2, 2039.0, 312.0),
+    "A100_40GB": GpuFacts(39.6, 1555.0, 312.0), "L40S": GpuFacts(47.52, 864.0, 362.05),
+    "A10": GpuFacts(23.76, 600.0, 125.0), "RTX4060Ti": GpuFacts(15.58, 288.0, 44.1),
+    "RTXPRO6000": GpuFacts(94.97, None, 500.0, 1597.0)}
 
 
 def gpu_mem_bw_gbps(hardware) -> float | None:
@@ -279,7 +302,58 @@ class OutsideRegime(ValueError):
     """A TP>1 step whose communication time the closed form does not reproduce exactly."""
 
 
-class TableCost:
+class RingTP:
+    """ASTRA-Sim's TP>1 collectives in closed form (the module docstring's ``comm_ns``), shared by ``TableCost`` and
+    ``augur.cost.roofline.RooflineCost``.  Needs ``tp``, ``link_bw``, ``link_latency_ns``, ``npu_mem_bw``,
+    ``cpu_mem_bw``, ``cpu_mem_latency_ns``, ``_coll`` (all_reduce_count, all_reduce_bytes_per_token,
+    all_gather_bytes_per_seq, moe_layers) and ``_in_bytes_per_token`` / ``_out_bytes_per_seq``."""
+
+    def _ring_ns(self, tokens: int, rows: int) -> tuple[int, int, int, int]:
+        """ASTRA-Sim's ring at TP>1: (one hop and the whole of an all-reduce of ``tokens`` tokens, one hop and
+        the whole of the logits all-gather of ``rows`` sequences; 0 for the whole without rows)."""
+        n, lat, c = self.tp, self.link_latency_ns, self._coll
+        bw = self.link_bw * (1 << 30) / 1000000000          # NetworkFunction.cpp: bw * (1<<30) / 1e9 bytes/ns
+        local = int(self.npu_mem_bw) * 1000000000           # Sys.cc: local-mem-bw (json, int) * 1e9
+        msg = (c["all_reduce_bytes_per_token"] * tokens) // n   # Ring.cc: chunk = data_size / N
+        hop = int(lat + msg / bw)                           # BasicTopology.cpp: one FullyConnected hop
+        # Ring.cc: 2(N-1) steps; reduce half is processed by the memory bus, 3 x size/local_bw (PacketBundle.cc);
+        # MemBus + endpoint delay (10 ns, system.json) once per step and once for the first packet
+        ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
+        ag_hop = int(lat + c["all_gather_bytes_per_seq"] * rows / bw) if rows else hop
+        ag = (n - 1) * ag_hop + 10 * n if rows else 0      # N-1 steps (Ring.cc)
+        return hop, ar, ag_hop, ag
+
+    def _comm_ns(self, tokens: int, rows: int) -> int:
+        n, lat, c = self.tp, self.link_latency_ns, self._coll
+        cpu_bw = int(self.cpu_mem_bw)                       # AnalyticalMemory: uint64 mem_bw
+        a = self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / cpu_bw)  # token ids in (CPU memory)
+        b = self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / cpu_bw)     # sampled ids out
+        hop, ar, ag_hop, ag = self._ring_ns(tokens, rows)
+        if 2 * a > hop or 2 * b > ag_hop:
+            raise OutsideRegime(
+                f"TP={n} step (T={tokens}, R={rows}): a CPU-memory access (A={a} ns for the token ids, B={b} ns "
+                f"for the sampled ids; cpu latency {self.cpu_mem_latency_ns} ns, bandwidth {self.cpu_mem_bw} GB/s) "
+                f"is more than half a ring step (all-reduce {hop} ns, last collective {ag_hop} ns; link latency "
+                f"{lat} ns, bandwidth {self.link_bw} GB/s); the closed form is not exact there. "
+                f"Use --cost llmservingsim")
+        total = n * max(a, b) + min(a, b) + c["all_reduce_count"] * ar   # CPU memory: one FIFO queue per node
+        m = c.get("moe_layers", 0) if tokens > 0 else 0  # an empty step has no MoE block
+        if m:  # see the MoE note in the module docstring
+            total -= self._moe_comm_saving(m, a, b)
+        return total + ag  # and the all-gather of the per-rank logits chunk
+
+    def _moe_comm_saving(self, m: int, a: int, b: int) -> int:
+        """How much less than the dense form ASTRA-Sim charges a MoE step at TP2 or TP4 (see the module docstring);
+        ``m`` MoE layers, ``a`` and ``b`` the CPU-memory times of the token ids and the sampled ids."""
+        if self.tp == 2:
+            return max(0, min(m, a, max(m, a) - b))
+        if b > a:  # never with 4-byte token ids and sampled ids (R <= T); the form was fitted for a >= b only
+            raise OutsideRegime(f"MoE TP4 step with sampled-id time {b} ns above the token-id time {a} ns")
+        h = m - m // 2
+        return min(m, max(h + a - b, min(m - b, h + a, max(m - 2 * b, 2 * a + h - 2 * b))))
+
+
+class TableCost(RingTP):
     """``step_ns(shape)`` for a dense or MoE model at TP=N, priced from a profile file.
 
     ``cpu_mem_bw`` (GB/s = bytes/ns) and ``cpu_mem_latency_ns`` price the two
@@ -422,52 +496,6 @@ class TableCost:
                             "prices there are a linear extrapolation, not a measurement (augur counts such "
                             "steps as steps_beyond_profile in its summary)", axis, value, top)
         return tuple(found)
-
-    # --- TP>1 communication ----------------------------------------------
-
-    def _ring_ns(self, tokens: int, rows: int) -> tuple[int, int, int, int]:
-        """ASTRA-Sim's ring at TP>1: (one hop and the whole of an all-reduce of ``tokens`` tokens, one hop and
-        the whole of the logits all-gather of ``rows`` sequences; 0 for the whole without rows)."""
-        n, lat, c = self.tp, self.link_latency_ns, self._coll
-        bw = self.link_bw * (1 << 30) / 1000000000          # NetworkFunction.cpp: bw * (1<<30) / 1e9 bytes/ns
-        local = int(self.npu_mem_bw) * 1000000000           # Sys.cc: local-mem-bw (json, int) * 1e9
-        msg = (c["all_reduce_bytes_per_token"] * tokens) // n   # Ring.cc: chunk = data_size / N
-        hop = int(lat + msg / bw)                           # BasicTopology.cpp: one FullyConnected hop
-        # Ring.cc: 2(N-1) steps; reduce half is processed by the memory bus, 3 x size/local_bw (PacketBundle.cc);
-        # MemBus + endpoint delay (10 ns, system.json) once per step and once for the first packet
-        ar = 2 * (n - 1) * hop + (n - 1) * 3 * int(msg / local * 1e9) + 10 * (2 * (n - 1) + 1)
-        ag_hop = int(lat + c["all_gather_bytes_per_seq"] * rows / bw) if rows else hop
-        ag = (n - 1) * ag_hop + 10 * n if rows else 0      # N-1 steps (Ring.cc)
-        return hop, ar, ag_hop, ag
-
-    def _comm_ns(self, tokens: int, rows: int) -> int:
-        n, lat, c = self.tp, self.link_latency_ns, self._coll
-        cpu_bw = int(self.cpu_mem_bw)                       # AnalyticalMemory: uint64 mem_bw
-        a = self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / cpu_bw)  # token ids in (CPU memory)
-        b = self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / cpu_bw)     # sampled ids out
-        hop, ar, ag_hop, ag = self._ring_ns(tokens, rows)
-        if 2 * a > hop or 2 * b > ag_hop:
-            raise OutsideRegime(
-                f"TP={n} step (T={tokens}, R={rows}): a CPU-memory access (A={a} ns for the token ids, B={b} ns "
-                f"for the sampled ids; cpu latency {self.cpu_mem_latency_ns} ns, bandwidth {self.cpu_mem_bw} GB/s) "
-                f"is more than half a ring step (all-reduce {hop} ns, last collective {ag_hop} ns; link latency "
-                f"{lat} ns, bandwidth {self.link_bw} GB/s); the closed form is not exact there. "
-                f"Use --cost llmservingsim")
-        total = n * max(a, b) + min(a, b) + c["all_reduce_count"] * ar   # CPU memory: one FIFO queue per node
-        m = c.get("moe_layers", 0) if tokens > 0 else 0  # an empty step has no MoE block
-        if m:  # see the MoE note in the module docstring
-            total -= self._moe_comm_saving(m, a, b)
-        return total + ag  # and the all-gather of the per-rank logits chunk
-
-    def _moe_comm_saving(self, m: int, a: int, b: int) -> int:
-        """How much less than the dense form ASTRA-Sim charges a MoE step at TP2 or TP4 (see the module docstring);
-        ``m`` MoE layers, ``a`` and ``b`` the CPU-memory times of the token ids and the sampled ids."""
-        if self.tp == 2:
-            return max(0, min(m, a, max(m, a) - b))
-        if b > a:  # never with 4-byte token ids and sampled ids (R <= T); the form was fitted for a >= b only
-            raise OutsideRegime(f"MoE TP4 step with sampled-id time {b} ns above the token-id time {a} ns")
-        h = m - m // 2
-        return min(m, max(h + a - b, min(m - b, h + a, max(m - 2 * b, 2 * a + h - 2 * b))))
 
     # --- MoE block, TP>1 legacy path ---------------------------------------
 
