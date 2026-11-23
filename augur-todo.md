@@ -82,21 +82,16 @@ Contention-aware co-simulation (design doc) is merged (2026-11-21), off by defau
       as a one-token decode (1.4-1.9x), plus 160-210 us per request per step; the ngram proposer is 0.1-0.25 ms.
       --spec-us-per-request (default 100); stepcheck now prices spec steps as decodes. With a q=1,4 profile the real
       runs come to −1.3% (async) and +0.6% (sync) mean latency
-- [ ] Ship q=2,4 attention for RTX4060Ti Qwen3-1.7B (2026-11-22). Problem: the shipped profile times attention only
-      at 1 query per request, so ngram verification (1+k queries, 1.4-1.9x dearer) is priced as a plain decode and
-      real ngram runs come out too fast (mean latency −17.8% async, −21.6% sync; ShareGPT 300, GPU 0).
-      Re-profiled with --decode-q-lens 1,2,4 (anjuna3 out/profile_qlens, fork perf/RTX4060Ti_qlens). The full new
-      profile fixes ngram (+5.6% / −0.2%) but its other tables moved up to 5% from last week's (prefill 2048
-      −4.9%), and stepcheck predicted/measured got worse: ShareGPT 0.965→0.961, SWE 0.973→0.955, bench
-      0.990→0.982. So build a hybrid: the shipped profile plus only the q=2,4 attention and skew tables (local
-      branch profile-qlens on anjuna3, 2762287). Non-spec pricing is unchanged, six replays exact, ngram runs
-      +8.9/−1.0/+4.7% async, +2.2/−5.4/−0.9% sync (mean TTFT/TPOT/latency).
-      Blocker: test_regression_exact and test_live_against_fork need augur and the fork to price identically, and
-      the fork's RTX4060Ti data has no q=2,4 tables. Plan: add the q=2,4 rows to the fork's attention.csv,
-      skew.csv, skew_fit.csv and merge meta.yaml (attention_grid.decode_q_lens, sampling targets, skew
-      case_families and fits; keep q=1 entries); commit and push the fork; regenerate augur's profile from it with
-      convert; rebuild tests/data/table_cost/qwen3-1.7b-rtx4060ti with build_table_regression.py; full suite +
-      replays; update docs/accuracy.md section 3. Also: refit --spec-us-per-request on a quiet host and another GPU
+- [x] Ship q=2,4 attention for RTX4060Ti Qwen3-1.7B (2026-11-23). The shipped profile timed attention only at 1
+      query per request, so ngram verification (1+k queries, 1.4-1.9x dearer) was priced as a plain decode: real
+      ngram runs came out −17.8% (async) and −21.6% (sync) mean latency. A whole new profile (2026-11-21,
+      --decode-q-lens 1,2,4) drifted up to 5% elsewhere and made stepcheck worse, so the fork's RTX4060Ti bundle got
+      only its q=2,4 attention and skew rows (fork e8625e0, local on anjuna3, not pushed: q=1 rows and skew cells
+      unchanged, skew refit with refit-skew); augur's profile is converted from it (exact against the fork), the
+      regression data rebuilt (workload shapes now include an ngram run). Non-spec prices identical; ngram runs
+      +8.9/−1.0/+4.7% async, +2.2/−5.4/−0.9% sync (mean TTFT/TPOT/latency). 276 tests pass
+- [ ] Push the fork commit e8625e0 (feature/vllm-sim-20261114) from a machine with access; refit
+      --spec-us-per-request on a quiet host and another GPU
 - [x] Offload: GPU-to-CPU copies lose 15% when a load overlaps; decode is 7% slower during a copy: modeled by the
       fabric (--d2h-duplex-penalty, --hbm-interference)
 - [x] Contention-aware co-simulation (2026-11-21, feature/contention-20261121): augur/sim/fabric.py, `--contention

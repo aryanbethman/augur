@@ -188,7 +188,24 @@ measured, and the runs to +1.9 / −5.8 / −1.3% (async) and −3.7 / −9.6 / 
 (sync). A further 160-210 us per request per step remains (rejection sampling,
 bookkeeping); `--spec-us-per-request` (default 100) adds it: +10.4 / +0.7 /
 +6.3% async, +3.6 / −3.8 / +0.6% sync. Decisions replay exactly (1,760 / 1,760
-and 1,653 / 1,653 steps). The shipped profile does not yet have the q=4 table.
+and 1,653 / 1,653 steps).
+
+The shipped profile now has attention at query lengths 1, 2 and 4 (since
+2026-11-23; fork e8625e0): the shipped q=1 tables and skew fit unchanged,
+plus the q=2 and q=4 attention and skew tables of the 2026-11-21 re-profile
+(query lengths in between use the nearer, ties going down). Prices of steps
+without speculation are identical to before. On the same two runs, with the
+defaults (`--spec-us-per-request` 100), mean TTFT / TPOT / latency:
+
+| Run | Shipped profile before (q=1) | Now (q=1,2,4) |
+| --- | --- | --- |
+| ngram k=3, async | −16.3 / −20.4 / −17.8% | +8.9 / −1.0 / +4.7% |
+| ngram k=3, sync | −21.0 / −23.3 / −21.6% | +2.2 / −5.4 / −0.9% |
+
+A wholly new profile from that run is no better: its other tables moved up
+to 5% from the shipped ones (run-to-run drift of the GPU) and step checks on
+the non-speculative runs got worse (predicted / measured 0.965 → 0.961
+ShareGPT, 0.973 → 0.955 SWE-bench), so only the q=2,4 tables were taken.
 
 **Knee TTFT** is the hardest metric. With the real engine arrivals held fixed
 (`--replay-arrivals`), median TTFT is 1,111 ms with the real step times and
@@ -226,14 +243,15 @@ measured, is reliable.
 | SWE-bench sessions, sync | session duration, median per-session error | 3.7% | 0.9% |
 | SWE-bench sessions, async | mean TTFT / TPOT / latency | −0.4 / −0.6 / −0.4% | −0.8 / +0.1 / −0.6% |
 | SWE-bench sessions, async | median per-call TTFT / TPOT / latency (absolute) | 8.7 / 8.2 / 6.1% | 9.1 / 7.0 / 6.1% |
-| ShareGPT 300, ngram k=3, async (shipped profile) | mean TPOT | −25.5% | −26.3% |
+| ShareGPT 300, ngram k=3, async (q=1 profile) | mean TPOT | −25.5% | −26.3% |
 | random 2 req/s | mean TTFT / TPOT | −11.9 / −1.9% | −1.2 / −1.9% |
 | random 6 req/s | mean / median TTFT, TPOT | −1.1 / −20.8%, +1.2% | −11.2 / −28.1%, −1.4% |
 | random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.4%, −2.1%, +2.0% |
 
 At 0.2 sessions/s the async SWE-bench engine is rarely saturated and the two
-schedulers agree. With speculation both price verification steps as
-one-token decodes (section 3).
+schedulers agree. With speculation and a q=1 profile both price verification
+steps as one-token decodes (section 3); the fork reads the shipped q=2,4
+tables as augur does.
 On sync runs and at light load augur is closer: LLMServingSim has no term for
 vLLM's CPU time, the API server or the client. On loaded async runs the two
 are equally close. LLMServingSim's async runs come out
