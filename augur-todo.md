@@ -81,8 +81,10 @@ Real runs on the test host
 13. [x] More single-GPU decision coverage (2026-11-24, five real runs, all replayed exactly; docs/accuracy.md
     section 1): KV cut to 520 blocks sync and async (~32k steps, 225-228 preemptions), SWE-bench with 1,550 blocks
     (39k steps), priority scheduling, prefix caching off with a 512-token budget. Preemptions stay in the hundreds:
-    each frees a whole request, and 520 blocks is the floor for 8k-token requests. Open: SWE-bench at a higher
-    session rate; the baselines on these runs (agent running)
+    each frees a whole request, and 520 blocks is the floor for 8k-token requests. Baselines on them (339aa06;
+    docs/accuracy.md section 5): BLIS replays the sync, priority and prefix-off runs step for step (with a priority
+    patch to its host); its only differences are its inputs (prefix groups, session format) and async host time.
+    Open: SWE-bench at a higher session rate
 14. [ ] LMCache connector unmodified, replayed against a real LMCache run. Next-features 3
 15. [ ] vLLM upgrade study: move to the next vLLM release, count the lines changed, rerun the six real replays
 
@@ -109,8 +111,9 @@ against ports, decided after the heavy-preemption runs (plan item 13).
 19. [ ] Third-party and unreleased code on day one: LMCache unmodified (plan item 14) and a vLLM release candidate or
     open pull request run without changes to augur
 20. [ ] Workloads where a port's inputs lose information: prompts that overlap in part (shared system prompts,
-    few-shot, RAG), which BLIS encodes as prefix groups; plus the heavy-preemption runs of plan item 13. Measure
-    BLIS's error against augur's on each
+    few-shot, RAG), which BLIS encodes as prefix groups. The stress runs (plan item 13) showed that BLIS's scheduler
+    is exact and every difference left comes from its inputs (prefix groups, session prompts) or host timing, so
+    this is where the gap is. Measure BLIS's error against augur's on each
 21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
     effect; contrast with a port, which reproduces 57% of the steps of the same run
 22. [ ] Where BLIS is ahead: a pluggable timing model for GPUs nobody has profiled (a roofline pricer, or an adapter

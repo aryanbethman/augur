@@ -390,10 +390,11 @@ against the real engine (TTFT in brackets), first step that differs from the rea
 | bench 1,024/128 at 6 req/s | 0.0, none, 100% | +0.9 [+8], 12, 45% | n/a | n/a |
 | ngram k=3, sync | 0.0, none, 100% | +8.3 [+13], 70, 5% | n/a | n/a |
 
-BLIS's first difference on ShareGPT is a real one: after a preemption it recomputes 1,486 tokens where vLLM
-recomputes 830 (a 656-token hit on the request's own freed blocks). On SWE-bench, step 134 is a round its session
-format cannot express (a prompt shorter than the previous prompt plus output; 64 of 715 later calls). Frontier
-preempts early (two requests at step 100 that vLLM keeps running).
+BLIS's first difference on ShareGPT comes from its input, not its scheduler. A request first scheduled at step 836
+shares 1,072 prompt tokens with an earlier one, so vLLM schedules 830 tokens. BLIS takes prefix sharing as groups
+with one shared length each; this request's group gets the group minimum of 416 tokens, so BLIS schedules 1,486. On
+SWE-bench, step 134 is a round its session format cannot express (a prompt shorter than the previous prompt plus
+output; 64 of 715 later calls). Frontier preempts early (two requests at step 100 that vLLM keeps running).
 
 **Each simulator's own run** (normal arrivals, augur's price), E2E mean against the real client, % (TTFT in
 brackets); preemptions counted from the step logs:
@@ -414,8 +415,29 @@ Frontier and Vidur ran bench 1,024/128 (an async real run) with sync semantics. 
 own transfer queueing model (the link rate is the same 12.7 GB/s). Of the real run's preempted requests, BLIS
 preempts 84% on ShareGPT sync (augur 97%) and 6% on SWE-bench sync. So on these runs, which have mild memory
 pressure (14-191 preemptions), a faithful port such as BLIS lands within about 1% end to end on plain runs, while
-Frontier and Vidur miss by 4-205%. `scripts/baselines/run.sh RUN` reruns a row; the simulators' checkouts live
-outside the repo (`~/baselines`).
+Frontier and Vidur miss by 4-205%. `scripts/baselines/run.sh RUN` reruns a row (`AUGUR_RUN_DIR` and
+`AUGUR_WORKLOAD` take any other real run); the simulators' checkouts live outside the repo (`~/baselines`).
+
+**Under memory pressure, priority and prefix caching off** (the last five runs of the section 1 table). Replay with
+the real step durations: E2E mean against the real engine (TTFT in brackets), first differing step, steps
+identical; then preemptions real / BLIS / Frontier / Vidur in the simulators' own runs:
+
+| Run | BLIS | Frontier | Vidur | Preemptions |
+| --- | --- | --- | --- | --- |
+| ShareGPT, 520 KV blocks, sync (31,931 steps) | 0.0 [0.0], none, 100% | −0.7 [−0.8], 98, 18% | +7.7 [+8.0], 98, 6% | 228 / 218 / 319 / 696 |
+| ShareGPT, 520 KV blocks, async | 0.0 [0.0], 9, 92% | n/a | n/a | 225 / 221 / – / – |
+| SWE-bench 50, 1,550 KV blocks, sync | +5.1 [+4.7], 134, 31% | −9.9 [−12.0], 325, 16% | +1,011 [+1,104], 134, 3% | 25 / 29 / 580 / 128 |
+| ShareGPT, priority, sync | 0.0 [0.0], none, 100% | 0.0 [−2.3], 93, 11% | n/a | 169 / 172 / 220 / – |
+| ShareGPT, prefix caching off, 512-token budget | 0.0 [0.0], none, 100% | −0.1 [+0.3], 179, 19% | +4.3 [+1.7], 203, 11% | 158 / 162 / 520 / 240 |
+
+BLIS reproduces every step of the sync, priority and prefix-off runs, all 228, 169 and 158 preemptions included:
+it is a faithful copy of vLLM 0.33's scheduler. Priority needed a patch to its host (`blis_priority.patch`; as
+checked out it sends every request at priority 0 and refuses a priority policy). With the cache this small,
+prefix sharing nearly vanishes (0.7% hits), and with it the input that BLIS's prefix groups cannot express. Its
+remaining differences are all outside the scheduler: what its inputs cannot say (prefix sharing beyond one length
+per group, session prompts that are not the previous prompt plus output) and timing (async step 9: a request that
+arrived 10 us before vLLM's next schedule, in the 69 us of host time between steps that BLIS does not model).
+Frontier preempts 1.3-23x as often as vLLM and Vidur 1.5-5x, and neither follows vLLM's steps past 98-325.
 
 ## 6. Speed
 
