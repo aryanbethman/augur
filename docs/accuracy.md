@@ -34,6 +34,19 @@ augur with the real run's arrival times and step durations
 | SWE-bench 50 sessions, KV offload to a 16 GiB CPU tier, async | 11,136 / 11,136 |
 | ShareGPT 300, ngram k=3, sync, rerun on GPU 0 | 1,653 / 1,653 |
 | ShareGPT 300, ngram k=3, async, rerun on GPU 0 | 1,760 / 1,760 |
+| ShareGPT 300, DP2 (two engines, GPU 0 + 1), sync | 1,872 / 1,872 and 2,145 / 2,145 |
+| ShareGPT 300, DP2, async | 1,961 / 1,961 and 2,107 / 2,107 |
+| ShareGPT 300, TP2 (GPU 0 + 1), sync | 2,262 / 2,262 |
+| ShareGPT 300, TP2, async | 2,265 / 2,265 |
+| ShareGPT 300, small MoE (8 layers, 16 experts, dummy weights), DP2 + EP, sync | 1,919 / 1,919 and 2,151 / 2,151 |
+
+The two-GPU runs use GPU 1, whose clock is locked at 510 MHz: that slows its steps, not its decisions. In vLLM 0.33
+only MoE models run DP ranks in lockstep (dense DP ranks are independent engines), so the lockstep rounds, with 241
+and 9 dummy forwards on the two ranks, come from a small MoE with random weights; Qwen3-30B-A3B does not fit two
+16 GB GPUs. The logging scheduler records those rounds (vLLM runs a dummy forward outside the scheduler), and replay
+places each call in the round the log says. Multi-GPU replays take the real run's output tokens
+(`--replay-tokens`): identical prompts decoded greedily generate identical tokens, whose blocks then share prefix-cache
+hits after a preemption. Not exact yet: a real async DP MoE run (differs from the first step).
 
 Replay takes the KV block count from the server log (it varies run to run)
 and uses `--no-recorded-outputs`; runs from `augur.verify.client` add
@@ -347,7 +360,56 @@ Where they differ, LLMServingSim departs from vLLM:
   scheduling. Neither extrapolation has been measured; augur now warns and
   reports `steps_beyond_profile` when a run leaves the profile's range.
 
-## 5. Speed
+## 5. Against BLIS, Frontier and Vidur, with the same step times
+
+`scripts/baselines/` gives each simulator augur's step price (the same function, checked equal to
+`augur.verify.stepcheck` on all 3,402 and 11,030 steps of two runs), the same KV block count, batch limits and CPU
+term, and zeroes their own CPU, front-end and host-overhead terms, so what differs is how each decides. Simulators:
+BLIS (inference-sim fe42284, a Go port of vLLM 0.33's scheduler with a per-step oracle against vLLM's classes;
+patched to take the price and block count from outside), Frontier (db5a85b, a discrete-event simulator mirroring
+vLLM v1's scheduler) and Vidur (abae7f6, its sarathi scheduler; its vllm scheduler cannot run prompts longer than
+the token budget). Frontier and Vidur have no async scheduling, speculative decoding or KV offload. BLIS refuses ngram
+speculation with async scheduling, takes a mean acceptance length, and takes prefix sharing as prefix groups.
+
+**With the real arrivals and the real step durations**, only the scheduler and memory manager differ. E2E mean
+against the real engine (TTFT in brackets), first step that differs from the real log, steps identical:
+
+| Run | augur | BLIS | Frontier | Vidur |
+| --- | --- | --- | --- | --- |
+| ShareGPT 300, sync | 0.0, none, 100% | +0.3 [+1], 836, 57% | 0.0 [+4], 100, 14% | +3.8 [+26], 51, 8% |
+| ShareGPT 300, async | 0.0, none, 100% | +0.5 [+3], 10, 43% | n/a | n/a |
+| SWE-bench 50, sync | 0.0, none, 100% | +6.3 [+9], 134, 33% | −7.5 [−15], 312, 31% | +180 [+284], 134, 14% |
+| bench 1,024/128 at 6 req/s | 0.0, none, 100% | +0.9 [+8], 12, 45% | n/a | n/a |
+| ngram k=3, sync | 0.0, none, 100% | +8.3 [+13], 70, 5% | n/a | n/a |
+
+BLIS's first difference on ShareGPT is a real one: after a preemption it recomputes 1,486 tokens where vLLM
+recomputes 830 (a 656-token hit on the request's own freed blocks). On SWE-bench, step 134 is a round its session
+format cannot express (a prompt shorter than the previous prompt plus output; 64 of 715 later calls). Frontier
+preempts early (two requests at step 100 that vLLM keeps running).
+
+**Each simulator's own run** (normal arrivals, augur's price), E2E mean against the real client, % (TTFT in
+brackets); preemptions counted from the step logs:
+
+| Run | augur | BLIS | Frontier | Vidur | Preemptions real / augur / BLIS / Frontier / Vidur |
+| --- | --- | --- | --- | --- | --- |
+| ShareGPT 300, sync | +0.1 [0] | +0.1 [0] | +3.9 [+5] | +4.1 [+7] | 177 / 178 / 177 / 247 / 202 |
+| ShareGPT 300, async | +1.5 [+2] | +1.2 [+2] | n/a | n/a | 191 / 184 / 171 / – / – |
+| SWE-bench 50, sync | −0.2 [0] | +0.8 [+2] | +3.7 [+5] | +205 [+319] | 18 / 12 / 14 / 403 / 48 |
+| SWE-bench 50, async | −0.6 [−1] | +0.3 [+1] | n/a | n/a | 18 / 23 / 16 / – / – |
+| bench 1,024/128 at 6 req/s | −2.6 [−10] | −2.1 [−9] | +5.1 [+16] | +9.0 [+31] | 17 / 18 / 21 / 14 / 17 |
+| ngram k=3, sync (GPU 0) | −1.0 [+2] | −0.6 [+2] | n/a | n/a | 159 / 148 / 157 / – / – |
+| ngram k=3, async (GPU 0) | +4.4 [+9] | refused | n/a | n/a | 159 / 150 / – / – / – |
+| SWE-bench 50, offload 16 GiB, sync | −3.3 [−4] | +10.3 [+13] | n/a | n/a | 19 / 20 / 16 / – / – |
+| SWE-bench 50, offload 16 GiB, async | −3.2 [−4] | +12.2 [+15] | n/a | n/a | 14 / 16 / 16 / – / – |
+
+Frontier and Vidur ran bench 1,024/128 (an async real run) with sync semantics. BLIS's offload rows differ by its
+own transfer queueing model (the link rate is the same 12.7 GB/s). Of the real run's preempted requests, BLIS
+preempts 84% on ShareGPT sync (augur 97%) and 6% on SWE-bench sync. So on these runs, which have mild memory
+pressure (14-191 preemptions), a faithful port such as BLIS lands within about 1% end to end on plain runs, while
+Frontier and Vidur miss by 4-205%. `scripts/baselines/run.sh RUN` reruns a row; the simulators' checkouts live
+outside the repo (`~/baselines`).
+
+## 6. Speed
 
 Wall time simulating Llama-3.1-70B TP4 on H100s (ShareGPT 750
 requests at 10 req/s, 89 s simulated):

@@ -88,6 +88,10 @@ class ReplayCost:
     k: int = 0
     # DP (augur's own logs): this rank's duration in each round it took part in, dummy forwards too.
     rounds: list[int] = field(default_factory=list)
+    round_dummy: list[bool] = field(default_factory=list)
+    # call id -> how many rounds this rank had run when the call reached it (it joins the next round). A real rank's
+    # iterations drift against its peers' clocks, so only this count, not the time, says which round a call joins.
+    add_round: dict[str, int] = field(default_factory=dict)
     round_k: int = 0
     # call id -> the request id the logged engine used (augur.sim.coordinator.Coordinator.request_ids)
     rids: dict[str, str] = field(default_factory=dict)
@@ -111,7 +115,9 @@ class ReplayCost:
         """One cost per engine log. Several engines share one time zero: the
         earliest event of any log."""
         t0 = min(e["t"] for p in paths if p for e in read_log(p))
-        return [cls.from_log(p, t0) if p else cls([]) for p in paths]
+        costs = [cls.from_log(p, t0) if p else cls([]) for p in paths]
+        _drop_idle_rounds(costs)
+        return costs
 
     @classmethod
     def from_log(cls, path: str, t0: int | None = None) -> "ReplayCost":
@@ -124,7 +130,13 @@ class ReplayCost:
         kv_done = {jid: sched_t[e["k"]] - t0 for e in ev if e["ev"] == "upd" for jid in e.get("jobs", ())}
         kv_done_step = {jid: i for i, (_, u) in enumerate(st) for jid in u.get("jobs", ())}
         sched_times = sorted(t - t0 for t in sched_t.values())
-        rounds = [e["dur"] for e in ev if e["ev"] == "round"]
+        rec = [e for e in ev if e["ev"] == "round"]
+        rounds, round_dummy = [e["dur"] for e in rec], [e["dummy"] for e in rec]
+        add_round, n = {}, 0
+        for e in ev:
+            n += e["ev"] == "round"
+            if e["ev"] == "add" and rec and not e["rid"].endswith("@d"):
+                add_round.setdefault(call_id(e["rid"]), n)
         rids = {call_id(e["rid"]): e["rid"] for e in ev if e["ev"] == "add"}
         if is_async(ev):
             # The GPU runs batches back to back: batch k starts when it was
@@ -139,16 +151,16 @@ class ReplayCost:
             # like the last one.
             for _ in range(_unlogged_tail(ev) if d else 0):
                 d.append(d[-1])
-            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds, rids=rids,
-                   kv_done_step=kv_done_step)
+            return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds,
+                       round_dummy=round_dummy, add_round=add_round, rids=rids, kv_done_step=kv_done_step)
         d = []
         for i, (s, u) in enumerate(st):
             if u["left"] > 0 and i + 1 < len(st):
                 d.append(st[i + 1][0]["t"] - s["t"])
             else:
                 d.append(u["t"] - s["t"])
-        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds, rids=rids,
-                   kv_done_step=kv_done_step)
+        return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds,
+                   round_dummy=round_dummy, add_round=add_round, rids=rids, kv_done_step=kv_done_step)
 
     def reported_this_step(self, job_id: int) -> bool:
         """The logged worker reported offload job ``job_id`` in the step being replayed now (the last one priced).
@@ -161,6 +173,26 @@ class ReplayCost:
         d = self.durations[self.k]
         self.k += 1
         return d
+
+
+def _drop_idle_rounds(costs: list[ReplayCost]) -> None:
+    """A real DP group goes on running dummy forwards on every rank until its next finish-sync after the last
+    request is done (vLLM's dp_sync_interval); augur's group sleeps then, so those rounds have no counterpart.
+    Rank logs hold the same rounds in the same order (a forward is a collective): drop those where every rank was
+    idle."""
+    logged = [c for c in costs if c.rounds]
+    if len({len(c.rounds) for c in logged}) > 1:
+        raise ValueError(f"DP ranks logged different numbers of rounds: {[len(c.rounds) for c in logged]}")
+    if not logged:
+        return
+    keep = [not all(c.round_dummy[i] for c in logged) for i in range(len(logged[0].rounds))]
+    kept_before = [0]
+    for k in keep:
+        kept_before.append(kept_before[-1] + k)
+    for c in logged:
+        c.rounds = [d for d, k in zip(c.rounds, keep) if k]
+        c.round_dummy = [d for d, k in zip(c.round_dummy, keep) if k]
+        c.add_round = {cid: kept_before[n] for cid, n in c.add_round.items()}
 
 
 @dataclass

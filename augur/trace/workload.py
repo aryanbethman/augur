@@ -90,10 +90,17 @@ class Workload:
     # Set to (at most) the model's regular vocabulary to keep filler ids valid
     # for a real server, e.g. 150000 for Qwen3 (its special tokens start at 151643).
     filler_vocab: int | None = None
+    # Output ids a real run generated (augur.verify.client --tokens-out), by call id: they replace the trace's
+    # (or the unique ids) so that calls whose generations coincide share prefix-cache blocks, as they did there.
+    output_tokens: str | None = None
     _filler: _Filler = field(default_factory=_Filler)
+    _generated: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self._filler = _Filler(self.filler_vocab)
+        if self.output_tokens:
+            with open(self.output_tokens) as f:
+                self._generated = {r["call_id"]: r["output_tok_ids"] for r in map(json.loads, f)}
 
     def entries(self) -> Iterator[Call | Session]:
         with open(self.path) as f:
@@ -123,6 +130,7 @@ class Workload:
         if len(rec_in) < n_in:
             rec_in += self._filler.ids(n_in - len(rec_in), call_id + "/in")
         rec_out = list(d.get("output_tok_ids") or ())[:n_out] if self.recorded_outputs else []
+        rec_out = self._generated.get(call_id, rec_out)[:n_out]
         if len(rec_out) < n_out:
             rec_out += self._filler.ids(n_out - len(rec_out), call_id + "/out")
         return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,

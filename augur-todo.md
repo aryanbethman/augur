@@ -47,12 +47,14 @@ Fixes
 2. [x] Flags (2a0dc58): --scheduler-cls (wrapped so --step-log-vllm still logs), --scheduling-policy priority with a
    per-request "priority" in workloads (the client sends it when non-zero; untested against a real server),
    --kv-cache-dtype fp8 (block count doubles; prices stay bf16, warned)
-3. [ ] Real DP runs replayable: log DP dummy rounds, which run outside the scheduler (section 4)
+3. [x] Real DP runs replayable (44ded75): the logging scheduler records DP rounds and dummy forwards; replay holds a
+   call until its logged round (sync); --replay-tokens takes a real run's output tokens. Open: real async DP MoE
+   replay differs from the first step (the async DP path still places arrivals by time)
 
 Additions
-4. [ ] Same-step-time test: Vidur, BLIS (inference-sim), Frontier and LLMServingSim priced with augur's step times
-   on the real runs; what error is left comes from their copies of vLLM's scheduler. Decides whether decision
-   fidelity leads the paper
+4. [x] Same-step-time test (scripts/baselines/, 9c9ab90 + 78250e4; docs/accuracy.md section 5): BLIS lands within
+   ~1% end to end on plain runs and reproduces the first 835 real steps of ShareGPT 300; Frontier +4-5% with far more
+   preemptions; Vidur +4% to +205% (no prefix cache). Open: rerun on the heavy-preemption runs (item 13)
 5. [x] Error breakdown (206a5a4): `python -m augur.verify.breakdown`, results in docs/accuracy.md section 3. Outside
    the step loop, step time and decisions each within ~2% of the mean on the non-speculative runs; ngram decisions
    dominate their tails (median TTFT −24%): acceptance is a rate, not token content
@@ -64,7 +66,8 @@ Additions
    Next-features 6
 
 Real runs on the test host
-10. [ ] Multi-GPU decision replay on GPU 0 + GPU 1: TP2, DP2 (after 3), one prefill + one decode engine (needs NIXL)
+10. [~] Multi-GPU decision replay on GPU 0 + GPU 1: TP2 and DP2 exact, sync and async (docs/accuracy.md section 1);
+    left: one prefill + one decode engine (needs NIXL installed)
 11. [ ] Winner-changes pilot: sweep one setting with real runs; does augur pick the real best setting while the
     copied schedulers do not?
 12. [ ] Held-out accuracy: 2-3 workloads not used for any fit (another chat set, long context to 32k, bursty
@@ -76,6 +79,34 @@ Real runs on the test host
 
 Needs the repo owner: push fork commit e8625e0 (the shipped 4060 Ti profile's provenance points at it); pick a
 license; ask Revati's authors for code; decide whether to report the tiering livelock (section 4) upstream.
+
+## Next: what only running vLLM's own code can do (added 2026-11-23; after the plan above)
+Why: BLIS (inference-sim) ports vLLM 0.33's scheduler to Go and checks it step by step against vLLM's classes. With
+real step durations it reproduced the first 835 of 3,402 steps of ShareGPT 300 and came within 0.3% end to end, so
+accuracy alone will not set augur apart from it on ordinary workloads. These items rest on what a port cannot do.
+The paper's lead claim is still open: lead with these (accuracy against ports as support), or lead with accuracy
+against ports, decided after the heavy-preemption runs (plan item 13).
+
+16. [ ] Token-faithful simulation: with recorded outputs, the simulated model emits the real tokens; vLLM's own ngram
+    proposer is verified against them (exact acceptance per request and step for greedy decoding, instead of
+    --spec-accept-rate), and prefix hits on generated text are the real ones (identical generations share blocks).
+    Check on the existing ngram runs, whose decision error is −24% median TTFT today (plan item 5). No GPU
+17. [ ] Plugin case study: a KV eviction or offload policy (or a scheduler) written as a vLLM plugin, ranked against
+    alternatives at hundreds of GPUs in augur, then the same code run on the 4060 Ti to confirm the ranking; BLIS
+    would need it rewritten in Go first
+18. [ ] vLLM version study (plan item 15, moved up): the lines changed to move augur to the next release, a decision
+    change between the two versions that only the new code produces, and what each of BLIS's ports took (lines,
+    days after the vLLM release) from its history
+19. [ ] Third-party and unreleased code on day one: LMCache unmodified (plan item 14) and a vLLM release candidate or
+    open pull request run without changes to augur
+20. [ ] Workloads where a port's inputs lose information: prompts that overlap in part (shared system prompts,
+    few-shot, RAG), which BLIS encodes as prefix groups; plus the heavy-preemption runs of plan item 13. Measure
+    BLIS's error against augur's on each
+21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
+    effect; contrast with a port, which reproduces 57% of the steps of the same run
+22. [ ] Where BLIS is ahead: a pluggable timing model for GPUs nobody has profiled (a roofline pricer, or an adapter
+    to BLIS's timing, giving "vLLM's real decisions under any timing model"); measure augur's speed against BLIS's
+    at 256-1,024 GPUs and report it honestly
 
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
 DP2 + EP2 on the tables, the sync offload replay difference fixed.
@@ -178,8 +209,8 @@ DP2 + EP2 on the tables, the sync offload replay difference fixed.
 - [x] Multi-engine step logs and replay (2026-11-21, 21b01a2): one log per engine (<prefix>.e<id>.<pid>.jsonl),
       --replay-durations with a run prefix, DP rounds logged by augur and replayed, `replay compare` on run prefixes.
       Own-log replay exact for round-robin, PD, PD+offload, DP, DP+offload, sync and async
-- [ ] Real-GPU multi-engine replay: real vLLM logs carry no DP dummy rounds, so a real DP run cannot be replayed
-      round by round; PD and multi-engine real logs not tried (needs GPU 1)
+- [~] Real-GPU multi-engine replay: DP2 (dense and a small MoE with its dummy rounds) and TP2 exact (2026-11-23,
+      plan items 3 and 10); real PD logs not tried (needs NIXL)
 - [ ] KV offload: LMCache connector
 - [ ] vLLM's tiering livelocks when one request's prefix needs more chunks than the CPU tier holds (promote,
       evict, promote ...); augur now stops such a run after 60 s simulated without a token (STALL_NS).
@@ -267,7 +298,8 @@ DP2 + EP2 on the tables, the sync offload replay difference fixed.
       activation alone 0.50-0.82), so one model/GPU cannot fit a formula. Better done in the profiling pipeline:
       record weights / non-torch / peak activation / CUDA-graph memory when a GPU is profiled. augur.profile now
       records them (2026-11-21); using them to size the KV cache is next
-- [ ] Multi-GPU against real hardware (TP>1, PD): blocked on GPU 1's clock lock
+- [~] Multi-GPU against real hardware: decisions of TP2 and DP2 replay exactly (GPU 1's clock lock only slows its
+      steps); timing and PD still blocked on the clock lock
 
 ## Also open
 - [x] Repo restructured by role (sim/ cost/ trace/ verify/), pytest tests, docs/accuracy.md (960750c);
