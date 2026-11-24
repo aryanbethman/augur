@@ -288,6 +288,23 @@ far each metric moves. On this benchmark:
 A large spread marks an operating point where no single number, simulated or
 measured, is reliable.
 
+**Held-out workloads.** Four real runs on workloads none of augur's terms were fitted on (generators in
+`scripts/baselines/overlap_workloads.py`, seeded), each replayed step for step (12,952, 6,316, 10,068 and 4,354
+steps), with augur's normal run against the real client, mean TTFT / TPOT / latency, and stepcheck's
+predicted / measured:
+
+| Workload | augur error | Steps priced |
+| --- | --- | --- |
+| ShareGPT with bursty arrivals (gamma, CV 4, ~1 req/s), async | +1.5 / +3.1 / +3.0% | 1.019 |
+| 100 prompts of 12k-24k tokens, sync | +4.1 / +0.2 / +2.1% | 0.984 |
+| SWE-bench 50 sessions arriving 5x faster, sync | +1.1 / +0.4 / +0.9% | 0.989 |
+| Short per-user prompts (60 users, partly shared prefixes, 5 req/s), sync | +23.0 / +7.9 / +8.1% | 0.959 |
+
+On the per-user run the GPU price is close but the fixed 2 ms CPU term overprices its short (~19 ms) decode steps;
+the same workload at 10 req/s, where the engine never idles, is +6.4 / +1.9 / +2.0%. Making the bursty run replay
+exactly needed a fix: after a launch that stalled the real engine's loop, replay now waits for the next logged
+schedule.
+
 **What if one setting changed?** Pairs of real runs of the same workload that differ in one setting test this held
 out: augur is calibrated on run A (`python -m augur.verify.calibrate`: one GPU-time scale per step class, so each
 class's total matches A; `--step-class-scales` applies it) and predicts run B. Mean absolute error over ten metrics
