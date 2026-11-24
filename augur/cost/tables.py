@@ -368,11 +368,13 @@ class TableCost(RingTP):
     tensors that live in CPU memory, as in ``LLMServingSimCost``.  At TP>1 the
     collectives are priced from ``link_bw`` (GB/s), ``link_latency_ns`` and
     ``npu_mem_bw`` (GB/s; default: the profile's ``hardware`` entry, else
-    ``GPU_FACTS`` for its hardware).
+    ``GPU_FACTS`` for its hardware).  ``shared_kv=False`` ignores the profile's
+    shared-KV model (decode attention priced as if no two requests shared a block).
     """
 
     def __init__(self, profile_path, cpu_mem_bw: float = 256.0, cpu_mem_latency_ns: int = 0,
-                 link_bw: float = 16.0, link_latency_ns: int = 20_000, npu_mem_bw: float | None = None):
+                 link_bw: float = 16.0, link_latency_ns: int = 20_000, npu_mem_bw: float | None = None,
+                 shared_kv: bool = True):
         with gzip.open(profile_path, "rt", encoding="utf-8") as f:
             p = json.load(f)
         if p.get("format_version") != FORMAT_VERSION:
@@ -409,7 +411,7 @@ class TableCost(RingTP):
         self._attn = {layer: {int(q): _Attention(spec) for q, spec in by_q.items()}
                       for layer, by_q in p["attention"].items()}
         self._skew = p["skew"]
-        self._shared = p.get("shared_kv")
+        self._shared = p.get("shared_kv") if shared_kv else None
         self._moe_exact = (moe or {}).get("exact", {})
         self._moe_balanced = (moe or {}).get("balanced", {})
         self._moe_dp = (moe or {}).get("dp", {})

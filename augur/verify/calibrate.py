@@ -12,11 +12,13 @@ none for async scheduling where it hides behind the previous batch) and prices t
 
 so that the class's total time matches the real run. A class with fewer than --min-steps steps (a ShareGPT run has two
 pure-prefill steps) takes the scale of all steps pooled. Steps that waited on KV offload transfers are left out.
+A profile that prices KV blocks shared by several decodes (a ``shared_kv`` entry) needs --workload, the file the run
+was driven by: augur's engine prices those steps lower, so the fit must too (augur.verify.prefix_share).
 The cpu term is not fitted: it is a property of the host, and a fit of it (and of a per-request term) on one run
 extrapolated worse to other batch sizes than leaving it.
 
     python -m augur.verify.calibrate out/real/run/steps.<pid>.jsonl --model Qwen/Qwen3-1.7B --hardware RTX4060Ti \\
-        --max-num-seqs 128 --max-num-batched-tokens 2048 --max-model-len 8192 --output scales.json
+        --max-num-seqs 128 --max-num-batched-tokens 2048 --max-model-len 8192 --workload trace.jsonl --output scales.json
     python -m augur.cli ... --step-class-scales scales.json          (also: augur.verify.breakdown ...)
 
 It prints the scales, and the error of the total step time per class before and after, and for a check the same with
@@ -77,18 +79,24 @@ def main(argv=None) -> int:
                          "run, 0 for an async one)")
     ap.add_argument("--min-steps", type=int, default=MIN_STEPS,
                     help="a class with fewer steps takes the scale of all steps")
+    ap.add_argument("--workload", default=None,
+                    help="the workload file the run was driven by (required when the profile prices shared KV blocks)")
     ap.add_argument("--output", default=None, help="write the scales here as JSON (augur --step-class-scales takes it)")
     a = ap.parse_args(argv)
 
     from augur.verify.stepcheck import classify, make_pricer, price_steps
-    events = read_log(a.log)
     try:
         cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len)
     except FileNotFoundError as e:
         print(f"augur.verify.calibrate: {e}", file=sys.stderr)
         return 2
+    if getattr(cost, "prices_sharing", False) and not a.workload:
+        print("augur.verify.calibrate: this profile prices KV blocks that decodes share, as augur's engine does: give "
+              "--workload (the run's workload file) so the logged steps are priced the same way", file=sys.stderr)
+        return 2
+    events = read_log(a.log)
     cpu_ns = (a.step_cpu_us if a.step_cpu_us is not None else (0.0 if is_async(events) else 1300.0)) * 1e3
-    priced = [p for p in price_steps(events, cost, disp) if not p.xfer]
+    priced = [p for p in price_steps(events, cost, disp, a.workload) if not p.xfer]
     cl = [classify(p.shape) for p in priced]
     m = [p.measured_ns for p in priced]
     pr = [p.predicted_ns for p in priced]

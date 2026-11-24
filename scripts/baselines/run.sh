@@ -72,7 +72,7 @@ augur() {
   rm -f $O/augur_steps.*.jsonl
   $PY -m augur.cli --model Qwen/Qwen3-1.7B --hardware RTX4060Ti --cost tables --num-gpu-blocks $(get num_gpu_blocks) \
     --max-num-seqs $(get max_num_seqs) --max-num-batched-tokens $(get max_num_batched_tokens) \
-    --max-model-len $(get max_model_len) $extra --step-cpu-us 2000 --no-recorded-outputs --filler-vocab 150000 --quiet \
+    --max-model-len $(get max_model_len) $extra --step-cpu-us 2000 --no-shared-kv --no-recorded-outputs --filler-vocab 150000 --quiet \
     --workload $wl --num-entries $(get num_entries) --step-log-vllm $O/augur_steps --output $O/augur.csv > $O/augur.log 2>&1
 }
 

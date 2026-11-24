@@ -69,6 +69,7 @@ import re
 import sys
 
 from augur.trace.workload import Session, Workload, call_id
+from augur.verify.prefix_share import block_chain
 from augur.verify.replay import ReplayWorkload, is_async, read_log, steps
 
 BLOCK = 16
@@ -76,12 +77,8 @@ MASK = (1 << 62) - 1
 
 
 def _block_hashes(ids: list[int]) -> list[int]:
-    """vLLM-style chained hashes of the prompt's full blocks."""
-    out, parent = [], 0
-    for i in range(0, len(ids) - len(ids) % BLOCK, BLOCK):
-        parent = hash((parent, tuple(ids[i:i + BLOCK]))) & MASK
-        out.append(parent)
-    return out
+    """vLLM-style chained hashes of the prompt's full blocks (augur.verify.prefix_share's), as non-negative ints."""
+    return [h & MASK for h in block_chain(ids, BLOCK)]
 
 
 def _server_meta(run_dir: str) -> dict:

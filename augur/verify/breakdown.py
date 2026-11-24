@@ -73,7 +73,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from augur.cost import parse_class_scales
+from augur.cost import adjust_gpu_ns, parse_class_scales
 from augur.cost.profiles import default_fork
 from augur.trace.workload import Workload, call_id
 from augur.verify.replay import ReplayWorkload, compare, is_async, read_log, steps
@@ -274,8 +274,7 @@ def retime(events: list[dict], priced: list, calls: dict[str, CallInfo], t: Timi
                 late.requests += len(wait)
                 late.delay_ns += start - after
         seqs = p.shape.seqs
-        gpu = round(p.predicted_ns * t.step_time_scale * t.class_scales.get(p.shape.step_class, 1.0)) + t.spec_ns_per_request * sum(
-            1 for x in seqs if x.is_decode and x.num_new > 1)
+        gpu = adjust_gpu_ns(p.predicted_ns, p.shape, t.step_time_scale, t.class_scales, t.spec_ns_per_request)
         launch = max(start + t.cpu_ns + t.cpu_per_request_ns * len(seqs), gpu_free)
         gpu_free = launch + gpu
         ends.append(gpu_free)

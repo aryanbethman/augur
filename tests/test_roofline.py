@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -151,3 +152,16 @@ def test_cli_prices_a_run(tmp_path, workload):
 
 
 REGRESSION = {"qwen_decode": 32562790, "qwen_prefill": 112842250, "moe_mixed": 49811965}
+
+
+def test_pricing_distinct_steps_holds_no_memory_per_step(configs):
+    # Regression (2026-11-24): step_ns cached each price under every sequence's KV length, which grows each decode
+    # step, so the cache never hit and kept ~14 KB per 128-decode step (14 GB over a million steps).
+    cost = RooflineCost(configs["qwen"], "RTX4060Ti")
+    cost.step_ns(decode(128, 1000))
+    tracemalloc.start()
+    for k in range(2000):
+        cost.step_ns(StepShape(tuple(SeqWork(1, 1000 + k + i, True) for i in range(128))))
+    held, _ = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert held < 1 << 20

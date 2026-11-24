@@ -246,6 +246,10 @@ def _parser() -> argparse.ArgumentParser:
                    help="vLLM's KV cache dtype: fp8 halves a block's bytes, so the same memory holds twice the blocks "
                         "(step prices stay bf16)")
     p.add_argument("--no-prefix-caching", action="store_true")
+    p.add_argument("--no-shared-kv", action="store_true",
+                   help="--cost tables: price decode attention as if no two requests shared a KV block, ignoring the "
+                        "profile's shared-KV model (what a simulator without vLLM's block ids prices; "
+                        "scripts/baselines/run.sh uses it for augur's control run)")
     p.add_argument("--no-chunked-prefill", action="store_true")
     p.add_argument("--frontend-latency-ms", type=float, default=3.4,
                    help="API-server time before the engine sees a request (HTTP, hand-off), independent of prompt "
@@ -627,7 +631,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             kw = _tp_params(a, *cpu_flags) if a.tp > 1 or a.dp > 1 else dict(cpu_mem_bw=a.cpu_mem_bw,
                                                                                cpu_mem_latency_ns=a.cpu_mem_latency_ns)
-            cost = TableCost(profile, **kw)
+            cost = TableCost(profile, **kw, shared_kv=not a.no_shared_kv)
             if cost.tp != a.tp:
                 raise ValueError(f"profile {profile} is tp={cost.tp}, --tp is {a.tp}")
         except (NotImplementedError, ValueError) as e:

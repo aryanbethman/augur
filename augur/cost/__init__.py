@@ -80,6 +80,18 @@ def parse_class_scales(spec: str | None) -> dict[str, float]:
     return {k: float(v) for k, v in out.items()}
 
 
+def adjust_gpu_ns(ns: int, shape: StepShape, scale: float = 1.0, class_scales: dict | None = None,
+                  spec_ns_per_request: int = 0) -> int:
+    """A cost model's GPU time for ``shape`` after augur's own terms: --step-time-scale and --step-class-scales (a
+    dummy forward has no class and takes the first only), then --spec-us-per-request for each decode verified with
+    drafts. Called by: SimWorker.execute_model, Coordinator._scaled, augur.verify.breakdown.retime,
+    scripts/baselines/pricer.py."""
+    f = scale if shape.dummy else scale * (class_scales or {}).get(shape.step_class, 1.0)
+    if f != 1.0:
+        ns = round(ns * f)
+    return ns + spec_ns_per_request * sum(1 for s in shape.seqs if s.is_decode and s.num_new > 1)
+
+
 class CostModel(Protocol):
     def step_ns(self, shape: StepShape) -> int: ...
 
