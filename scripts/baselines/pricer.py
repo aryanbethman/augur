@@ -48,7 +48,7 @@ class Pricer:
     def __init__(self, hardware: str = "RTX4060Ti", model: str = "Qwen/Qwen3-1.7B", max_num_seqs: int = 128,
                  max_num_batched_tokens: int = 2048, max_model_len: int = 8192, step_cpu_us: float = 2000.0,
                  step_cpu_per_request_us: float = 0.0, spec_us_per_request: float = 100.0,
-                 fork: str | None = None) -> None:
+                 fork: str | None = None, class_scales: dict | None = None) -> None:
         from vllm.config import CUDAGraphMode  # noqa: F401  (fail early without vLLM)
 
         from augur.cost.profiles import default_fork
@@ -67,6 +67,7 @@ class Pricer:
         self.cpu_fixed_ns = int(step_cpu_us * 1e3)  # as augur.cli: --step-cpu-us
         self.cpu_per_request_ns = int(step_cpu_per_request_us * 1e3)
         self.spec_ns = int(spec_us_per_request * 1e3)  # as augur: per request verified with drafts
+        self.class_scales = class_scales or {}  # as augur --step-class-scales: GPU time of a decode, prefill or mixed step
 
     def gpu_ns(self, reqs, spec_k: int = 0) -> int:
         """Price of one step. ``spec_k``: speculative tokens per decode (the executor's uniform-decode query length)."""
@@ -78,7 +79,10 @@ class Pricer:
         total = sum(s.num_new for s in seqs)
         uniform = all(s.num_new == 1 + spec_k for s in seqs)
         _, desc = self.cudagraph.dispatch(num_tokens=total, uniform_decode=uniform)
-        gpu = self.cost.step_ns(StepShape(seqs=seqs, padded_tokens=desc.num_tokens))
+        shape = StepShape(seqs=seqs, padded_tokens=desc.num_tokens)
+        gpu = self.cost.step_ns(shape)
+        if self.class_scales:
+            gpu = round(gpu * self.class_scales.get(shape.step_class, 1.0))
         return gpu + self.spec_ns * sum(1 for s in seqs if s.is_decode and s.num_new > 1)
 
     def cpu_ns(self, n_reqs: int) -> int:
@@ -122,11 +126,13 @@ def _add_args(p) -> None:
     p.add_argument("--step-cpu-us", type=float, default=2000.0)
     p.add_argument("--step-cpu-per-request-us", type=float, default=0.0)
     p.add_argument("--spec-us-per-request", type=float, default=100.0)
+    p.add_argument("--step-class-scales", default=None, help="augur --step-class-scales: a calibrate.py JSON or decode=1.01,...")
 
 
 def _make(a) -> Pricer:
+    from augur.cost import parse_class_scales
     return Pricer(a.hardware, a.model, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len, a.step_cpu_us,
-                  a.step_cpu_per_request_us, a.spec_us_per_request)
+                  a.step_cpu_per_request_us, a.spec_us_per_request, class_scales=parse_class_scales(a.step_class_scales))
 
 
 def serve(a) -> int:

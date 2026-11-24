@@ -464,6 +464,9 @@ class Coordinator:
     def _scaled(g, per_rank, shapes):
         f = g[0].ctx.step_time_scale
         per_rank = per_rank if f == 1.0 else [round(ns * f) for ns in per_rank]
+        cs = g[0].ctx.class_scales
+        if cs:
+            per_rank = [round(ns * cs.get(sh.step_class, 1.0) if not sh.dummy else ns) for ns, sh in zip(per_rank, shapes)]
         if any(e.ctx.net is not None for e in g):  # a rank's PCIe traffic slows its own forward
             per_rank = [round(ns * e.ctx.interference_factor(sh)) for e, ns, sh in zip(g, per_rank, shapes)]
         return per_rank

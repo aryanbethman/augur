@@ -8,6 +8,7 @@ import json
 import os
 import sys
 
+from augur.cost import parse_class_scales
 from augur.cost.profiles import default_fork
 from augur.cost.tables import GPU_FACTS, gpu_mem_bw_gbps, measured_reserve_gib, profile_vllm_memory
 from augur.sim.router import ROUTERS, make_router
@@ -266,6 +267,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--step-time-scale", type=float, default=1.0,
                    help="multiply every GPU step time from the cost model by this (sensitivity runs: 0.99, 1.01); "
                         "not the CPU term, KV transfers or front-end latency. Ignored with --replay-durations")
+    p.add_argument("--step-class-scales", default=None, metavar="JSON|CLASS=X,...",
+                   help="multiply the GPU step time of each step class (decode, prefill, mixed) by its own factor, on top of "
+                        "--step-time-scale: a JSON file from `python -m augur.verify.calibrate` or text like "
+                        "decode=0.99,mixed=1.03. Ignored with --replay-durations")
     p.add_argument("--step-cpu-per-request-us", type=float, default=0.0,
                    help="vLLM's per-step CPU time per scheduled request")
     p.add_argument("--filler-vocab", type=int, default=None,
@@ -469,6 +474,7 @@ def _build_engines(a, spec, cost, replay_costs, topology) -> list:
             e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
             e.ctx.spec_ns_per_request = int(a.spec_us_per_request * 1e3)
             e.ctx.step_time_scale = a.step_time_scale
+            e.ctx.class_scales = parse_class_scales(a.step_class_scales)
     if a.step_log:
         for e in engines:
             e.step_log = []
