@@ -137,6 +137,7 @@ class _ReqState:
     num_output: int = 0
     context: Context | None = None  # ngram, token-faithful: prompt + emitted ids
     drafts: list[int] = field(default_factory=list)  # ngram, token-faithful: proposed after the last step
+    blocks: list[int] = field(default_factory=list)  # KV block ids of the first cache group (a cost model that prices sharing)
 
 
 class SimWorker:
@@ -250,6 +251,19 @@ class SimWorker:
         return out
 
     # ---- steps -----------------------------------------------------------
+    def _shared_kv(self, decodes) -> dict[str, int]:
+        """For the decodes of a step, ``(request id, tokens of computed KV)``: per request, the tokens of its KV that
+        sit in blocks an earlier decode of the step also holds (the total does not depend on the order)."""
+        size = self.vllm_config.cache_config.block_size
+        seen: set[int] = set()
+        out: dict[str, int] = {}
+        for rid, before in decodes:
+            blocks = set(self.reqs[rid].blocks[:before // size])  # only full blocks are ever shared
+            if blocks:
+                out[rid] = len(blocks & seen) * size
+                seen |= blocks
+        return out
+
     def execute_model(self, so) -> ModelRunnerOutput:
         for rid in so.finished_req_ids:
             self.reqs.pop(rid, None)
@@ -281,6 +295,7 @@ class SimWorker:
             self.ctx.deliver_sending.clear()
 
         work: list[tuple[str, int, int]] = []  # (req_id, computed_before, num_new)
+        track = getattr(self.ctx.cost, "prices_sharing", False)  # the cost model prices KV blocks several requests read
         # A new request's computed tokens at its first schedule are its prefix-cache hit.
         self.ctx.last_new_req_ids = {nr.req_id: nr.num_computed_tokens for nr in so.scheduled_new_reqs}
         self.ctx.last_preempted_req_ids = list(so.preempted_req_ids or ())
@@ -293,6 +308,8 @@ class SimWorker:
             n_known = len(nr.prefill_token_ids) if nr.prefill_token_ids else n_prompt
             self.reqs[nr.req_id] = st = _ReqState(num_prompt=n_prompt, num_output=n_known - n_prompt)
             self._track(nr.req_id, st, nr.prefill_token_ids or nr.prompt_token_ids)
+            if track and nr.block_ids:
+                st.blocks = list(nr.block_ids[0])
             work.append((nr.req_id, nr.num_computed_tokens, so.num_scheduled_tokens[nr.req_id]))
         cr = so.scheduled_cached_reqs
         for i, rid in enumerate(cr.req_ids):
@@ -305,6 +322,8 @@ class SimWorker:
                 st = self.reqs[rid] = _ReqState(num_prompt=n_prompt, num_output=n_out)
                 if all_ids is not None:
                     self._track(rid, st, all_ids)
+            if track and cr.new_block_ids and cr.new_block_ids[i]:  # a resumed request's list is its whole table
+                st.blocks.extend(cr.new_block_ids[i][0])
             work.append((rid, cr.num_computed_tokens[i], so.num_scheduled_tokens[rid]))
 
         req_ids: list[str] = []
@@ -314,6 +333,8 @@ class SimWorker:
         proposing: list[tuple[str, _ReqState]] = []  # token-faithful ngram: requests that emit this step
         spec = so.scheduled_spec_decode_tokens or {}
         self._step += 1
+        shared = self._shared_kv([(rid, before) for rid, before, n in work
+                                  if n == 1 or (spec.get(rid) and n == 1 + len(spec[rid]))]) if track else {}
         for rid, before, num_new in work:
             st = self.reqs[rid]
             known = st.num_prompt + st.num_output
@@ -323,7 +344,8 @@ class SimWorker:
             # chunk runs as one), and so is 1 + k under speculative decoding,
             # where k draft tokens are verified alongside the real one.
             is_decode = num_new == 1 or (n_draft > 0 and num_new == 1 + n_draft)
-            seqs.append(SeqWork(num_new=num_new, num_computed_before=before, is_decode=is_decode))
+            seqs.append(SeqWork(num_new=num_new, num_computed_before=before, is_decode=is_decode,
+                                shared_kv=shared.get(rid, 0)))
             req_ids.append(rid)
             if before + num_new >= known + n_draft:
                 rec = self.ctx.output_ids.get(rid)
