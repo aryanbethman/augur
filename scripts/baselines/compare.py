@@ -138,6 +138,14 @@ def _pre_events_csv(d, rows, pattern, col):
     return out
 
 
+def _blis_idx(rows):
+    """Row of each call by id, and of each BLIS session round (--blis-encoding best: a round that does not continue
+    its session is the first round of a new BLIS session, named by blis_sid)."""
+    idx = {r["call_id"]: i for i, r in enumerate(rows)}
+    idx.update({r["blis_sid"] + "#" + str(r["blis_round"]): i for i, r in enumerate(rows) if r.get("blis_sid")})
+    return idx
+
+
 def _preempt(events, real_events):
     if events is None:
         return None
@@ -172,7 +180,7 @@ def _load_blis(d, rows, v=""):
         return None
     j = json.load(open(p))
     ttft, e2e, out = [None] * len(rows), [None] * len(rows), [0] * len(rows)
-    idx = {r["call_id"]: i for i, r in enumerate(rows)}
+    idx = _blis_idx(rows)
     for r in j["request_rows"]:
         i = _row_of(r["id"], idx)
         if r["fate"] == "completed":
@@ -312,7 +320,7 @@ def compare(d):
     if af:
         pre_ev["augur"] = _pre_events_log(af[-1], rows)
     for v in ("", "_replay"):
-        e = _pre_events_steps(os.path.join(d, f"blis_steps{v}.jsonl"), {r["call_id"]: i for i, r in enumerate(rows)})
+        e = _pre_events_steps(os.path.join(d, f"blis_steps{v}.jsonl"), _blis_idx(rows))
         if e is not None:
             pre_ev["blis" + v] = e
         for name, pat, col in (("frontier", f"frontier_out{v}/*/*/r/request_metrics.csv", "request_total_preemption_count"),

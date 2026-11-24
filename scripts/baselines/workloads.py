@@ -204,7 +204,7 @@ def prepare(a) -> int:
         r["real"] = None if rr is None else {
             "add_s": (rr["add"] - t0) / 1e9, "first_s": None if rr["first"] is None else (rr["first"] - t0) / 1e9,
             "fin_s": None if rr["fin"] is None else (rr["fin"] - t0) / 1e9, "out": rr["out"], "pre": rr["pre"]}
-    _map_prefixes(rows, meta)
+    _map_prefixes(rows, meta, a.blis_encoding)
     # top-level entries of the trace the real run sent (a flat request, or a whole session), for augur's --num-entries
     meta["num_entries"] = len({r["call_id"].rsplit("#", 1)[0] if "#" in r["call_id"] else r["call_id"] for r in rows})
     if meta["spec_k"]:
@@ -233,8 +233,10 @@ def _lcp(a: list[int], b: list[int]) -> int:
     return n
 
 
-def _map_prefixes(rows: list[dict], meta: dict) -> None:
-    """BLIS's prefix_group / prefix_len per request (see the module docstring) and the sharing it gives."""
+def _map_prefixes(rows: list[dict], meta: dict, encoding: str = "greedy") -> None:
+    """BLIS's prefix_group / prefix_len per request (see the module docstring) and the sharing it gives.
+    ``encoding`` "best" then replaces the greedy mapping with ``_encode_best`` (the greedy one's numbers stay in
+    ``meta["prefix"]`` as ``greedy_*``)."""
     by_first: dict[int, list[int]] = {}  # first block hash -> earlier requests starting with it
     group: list[int] = []
     plen: list[int] = [0] * len(rows)  # blocks
@@ -287,6 +289,177 @@ def _map_prefixes(rows: list[dict], meta: dict) -> None:
     meta["prefix"] = {"prompt_tokens": total, "token_id_sharing_tokens": ideal, "blis_mapping_tokens": mapped,
                       "token_id_sharing_rate": ideal / total if total else 0.0,
                       "blis_mapping_rate": mapped / total if total else 0.0}
+    if encoding == "best":
+        greedy = meta["prefix"]
+        _encode_best(rows, meta)
+        meta["prefix"].update(greedy_mapping_tokens=greedy["blis_mapping_tokens"],
+                              greedy_mapping_rate=greedy["blis_mapping_rate"])
+
+
+def _encode_best(rows: list[dict], meta: dict) -> None:
+    """The best a user of BLIS's trace format can do with the prompts' token ids (``--blis-encoding best``).
+
+    BLIS states sharing as one ``prefix_group`` per request with one ``prefix_length`` per group (the group's first
+    record's), and a session as each round's previous prompt and output plus a delta, or a reset to a fresh prompt.
+    Here:
+
+    * A session round whose prompt starts with the whole previous prompt (and is at least as long as that prompt and
+      output) continues the session. Any other round (a context trimmed or summarised: it shares only a head with the
+      previous prompt, and the greedy encoding's reset shares nothing) starts a new BLIS session at its own engine
+      arrival, so that it can carry a prefix group.
+    * Every request and every such start is a unit, and the units are partitioned into groups with a length each so
+      as to minimise the sum over units of |tokens the group states - tokens the prompt really reuses from an earlier
+      prompt| (the first unit of a group states 0). Start from the greedy partition (join the group of the earlier unit
+      sharing the most), pick each group's length best, then move one unit at a time to the group that lowers the
+      sum, until none does. A unit's sharing with units of other groups, and a tree of prefixes
+      (a preamble for everyone, then a section for some), is what this cannot state."""
+    n = len(rows)
+    last: dict[str, int] = {}
+    cont = [False] * n
+    sid_of = [r["call_id"].rsplit("#", 1)[0] if "#" in r["call_id"] else None for r in rows]
+    for i, r in enumerate(rows):
+        s = sid_of[i]
+        if s is None:
+            continue
+        p = last.get(s)
+        if p is not None:
+            q = rows[p]
+            cont[i] = r["input"] >= q["input"] + q["output"] and _lcp(r["blocks"], q["blocks"]) >= len(q["blocks"])
+        last[s] = i
+    cap = [(r["input"] - 1) // BLOCK for r in rows]
+    by_first: dict[int, list[int]] = {}
+    true = [0] * n  # blocks the prompt really reuses from an earlier prompt
+    lcp: dict[tuple[int, int], int] = {}  # between units, both orders, capped by neither
+    units = [i for i in range(n) if not cont[i]]
+    for i, r in enumerate(rows):
+        b = r["blocks"]
+        for j in by_first.get(b[0], []) if b else []:
+            n_ij = _lcp(b, rows[j]["blocks"])
+            true[i] = max(true[i], min(n_ij, cap[i]))
+            lcp[i, j] = lcp[j, i] = n_ij
+        if b:
+            by_first.setdefault(b[0], []).append(i)
+
+    def best_len(members: list[int]) -> tuple[int, int]:
+        """(cost, length in blocks) of a group of units (indices into rows, ascending): the first states nothing,
+        so the length that minimises the others' |length - true| is their median, within every member's cap."""
+        first, rest = members[0], members[1:]
+        if not rest:
+            return true[first], 0
+        top = min(cap[m] for m in members)
+        ts = sorted(true[m] for m in rest)
+        length = min(ts[len(ts) // 2], top)
+        return true[first] + sum(abs(length - t) for t in ts), length
+
+    group_of: dict[int, int] = {}
+    members: dict[int, list[int]] = {}
+    for u in units:  # the greedy partition: join the group of the earlier unit sharing the most
+        best, bj = 0, -1
+        for j in units:
+            if j >= u:
+                break
+            if lcp.get((u, j), 0) > best:
+                best, bj = lcp[u, j], j
+        g = group_of[bj] if bj >= 0 else u
+        group_of[u] = g
+        members.setdefault(g, []).append(u)
+    cost = {g: best_len(m)[0] for g, m in members.items()}
+    fresh = n  # labels for the groups a move creates
+
+    def move(us: list[int], src: int, dst: int) -> None:
+        nonlocal fresh
+        if dst == -1:
+            dst, fresh = fresh, fresh + 1
+            members[dst] = []
+        keep = [m for m in members[src] if m not in us]
+        if keep:
+            members[src], cost[src] = keep, best_len(keep)[0]
+        else:
+            del members[src], cost[src]
+        members[dst] = sorted(members[dst] + us)
+        cost[dst] = best_len(members[dst])[0]
+        for m in us:
+            group_of[m] = dst
+
+    for _ in range(12):
+        moved = False
+        seen: set[tuple] = set()  # (subset, destination) already tried against the current groups
+        for u in units:
+            g0 = group_of[u]
+            mem = members[g0]
+            near = {v: lcp.get((u, v), 0) for v in mem if v != u}
+            others = {group_of[v] for v in units if v != u and lcp.get((u, v), 0) > 0} - {g0}
+            depths = sorted({x for x in near.values() if x > 0})
+            depths = depths if len(depths) <= 24 else depths[::len(depths) // 24 + 1]
+            tries = []
+            # (a) take with u the members of its group sharing at least d blocks with it (d = None: u alone), and
+            # make them a group of their own or add them to another group u shares a prefix with; (b) merge u's
+            # group into another one
+            for d in [None, *depths]:
+                us = tuple([u] if d is None else sorted([u] + [v for v, x in near.items() if x >= d]))
+                if (us, g0) in seen:
+                    continue
+                seen.add((us, g0))
+                keep = [m for m in mem if m not in us]
+                c_keep = best_len(keep)[0] if keep else 0
+                if keep:
+                    tries.append((c_keep + best_len(list(us))[0] - cost[g0], us, -1))
+                for g in others:
+                    tries.append((c_keep + best_len(sorted(members[g] + list(us)))[0] - cost[g0] - cost[g], us, g))
+            for g in others:
+                tries.append((best_len(sorted(members[g] + mem))[0] - cost[g] - cost[g0], tuple(mem), g))
+            if tries:
+                d, us, dst = min(tries, key=lambda t: t[0])
+                if d < 0:
+                    move(list(us), g0, dst)
+                    moved = True
+                    seen.clear()
+        if not moved:
+            break
+    plen = {}
+    for g, m in members.items():
+        length = best_len(m)[1] if len(m) > 1 else 0
+        for u in m:
+            plen[u] = length
+    seg: dict[str, int] = {}  # session -> its current BLIS session (a start of a new one counts up)
+    rnd: dict[str, int] = {}
+    last_row: dict[str, int] = {}
+    ideal = mapped = error = total = 0
+    first_of = {g: m[0] for g, m in members.items()}
+    for i, r in enumerate(rows):
+        s = sid_of[i]
+        total += r["input"]
+        if cont[i]:
+            p = last_row[s]
+            e = min((rows[p]["input"] + rows[p]["output"]) // BLOCK, cap[i])
+            rnd[s] += 1
+            r.update(prefix_group="", prefix_len=0, blis_sid=f"{s}~{seg[s]}" if seg[s] else s, blis_round=rnd[s], blis_cont=True)
+        else:
+            g = group_of[i]
+            e = plen[i] if first_of[g] != i else 0
+            if s is not None:
+                seg[s] = seg.get(s, -1) + 1
+                rnd[s] = 0
+            r.update(prefix_group=f"g{g}" if plen[i] else "", prefix_len=plen[i] * BLOCK,
+                     blis_sid="" if s is None else (f"{s}~{seg[s]}" if seg[s] else s), blis_round=0, blis_cont=False)
+        if s is not None:
+            last_row[s] = i
+        ideal += true[i] * BLOCK
+        mapped += e * BLOCK
+        error += abs(e - true[i]) * BLOCK
+    meta["prefix"] = {"prompt_tokens": total, "token_id_sharing_tokens": ideal, "blis_mapping_tokens": mapped,
+                      "token_id_sharing_rate": ideal / total if total else 0.0,
+                      "blis_mapping_rate": mapped / total if total else 0.0, "blis_error_tokens": error,
+                      "groups": sum(1 for m in members.values() if len(m) > 1 and plen[m[0]])}
+
+
+def blis_groups(call_ids: list[str], prompts: list[list[int]], outputs: list[int]) -> dict:
+    """The sharing both encodings state for calls in arrival order (``meta["prefix"]``), from their prompt ids."""
+    rows = [{"call_id": c, "blocks": _block_hashes(p), "input": len(p), "output": o}
+            for c, p, o in zip(call_ids, prompts, outputs)]
+    meta: dict = {}
+    _map_prefixes(rows, meta, "best")
+    return meta["prefix"]
 
 
 def _load(out: str) -> tuple[list[dict], dict]:
@@ -360,7 +533,19 @@ def blis(a) -> int:
             f.write(cols)
             for i, r in enumerate(rows):
                 sid, rnd, tail, tt = "", 0, "", ""
-                if "#" in r["call_id"]:
+                if "blis_sid" in r:  # --blis-encoding best: a continuing round is a delta, any other a session's start
+                    sid, rnd = r["blis_sid"], r["blis_round"]
+                    if r["blis_cont"]:
+                        prev = last[sid]
+                        n_in = r["input"] - prev["input"] - prev["output"]
+                        if think:
+                            tt = str(round((prev["tool_wait_s"] + r["delivery_s"] + r["frontend_s"]) * 1e6))
+                    else:
+                        n_in = r["input"] - (r["prefix_len"] if cache else 0)
+                    tail = (f",{tt}," if think else ",") if sessions else ""
+                    if sid:
+                        last[sid] = r
+                elif "#" in r["call_id"]:
                     sid, idx = r["call_id"].rsplit("#", 1)
                     rnd = int(idx)
                     prev = last.get(sid)
@@ -454,6 +639,8 @@ def main(argv=None) -> int:
     pr.add_argument("--prefix-caching", choices=("on", "off"), default=None)
     pr.add_argument("--scheduling-policy", choices=("fcfs", "priority"), default=None)
     pr.add_argument("--async-scheduling", choices=("sync", "async"), default=None)
+    # how BLIS's prefix groups and sessions are stated (see _encode_best): greedy is the encoding of the earlier runs
+    pr.add_argument("--blis-encoding", choices=("greedy", "best"), default="greedy")
     # augur's front-end and delivery defaults (augur.cli), which its normal run applies to every call
     pr.add_argument("--frontend-latency-ms", type=float, default=3.4)
     pr.add_argument("--frontend-us-per-token", type=float, default=3.0)
