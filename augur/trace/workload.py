@@ -13,7 +13,8 @@ Every line is either a flat request or an agentic session (it has
   ``input_tok_ids`` drive prefix caching only: the prompt's ids are the
   recorded ones, and any tokens past them are filled with ids unique to the
   request, so that tail never hits the cache (the fork leaves it unhashed).
-  ``output_tok_ids`` are what the simulated model emits; past them, unique ids.
+  ``output_tok_ids`` are what the simulated model emits; past them, unique ids.  A call whose outputs
+  are all recorded is ``recorded``: ngram speculation then verifies its drafts against them.
 
 The file is streamed: sessions are read in arrival order, and a session's
 calls are kept only until the session ends.
@@ -46,6 +47,7 @@ class Call:
     tool_wait_ns: int  # wait after this call before the session's next one
     after_step_start: bool = False  # replay only: reached the engine just after a step began
     priority: int = 0  # vLLM request priority (only --scheduling-policy priority looks at it)
+    recorded: bool = False  # output_ids are all recorded ids (none is filler): speculation can verify against them
 
 
 @dataclass
@@ -167,10 +169,11 @@ class Workload:
         if shift:
             rec_out = [(t + shift) % REPLICA_VOCAB for t in rec_out]
         rec_out = self._generated.get(call_id, rec_out)[:n_out]
+        recorded = n_out > 0 and len(rec_out) == n_out
         if len(rec_out) < n_out:
             rec_out += self._filler.ids(n_out - len(rec_out), call_id + "/out")
         return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,
-                    prompt_ids=rec_in, output_toks=n_out, output_ids=rec_out,
+                    prompt_ids=rec_in, output_toks=n_out, output_ids=rec_out, recorded=recorded,
                     tool_wait_ns=int(d.get("tool_duration_ns", 0) or 0), priority=int(d.get("priority", 0) or 0))
 
     def next_call(self, s: Session, arrival_ns: int) -> Call:

@@ -39,6 +39,11 @@ augur with the real run's arrival times and step durations
 | ShareGPT 300, TP2 (GPU 0 + 1), sync | 2,262 / 2,262 |
 | ShareGPT 300, TP2, async | 2,265 / 2,265 |
 | ShareGPT 300, small MoE (8 layers, 16 experts, dummy weights), DP2 + EP, sync | 1,919 / 1,919 and 2,151 / 2,151 |
+| ShareGPT 300, KV cut to 520 blocks (228 preemptions), sync | 31,931 / 31,931 |
+| ShareGPT 300, KV cut to 520 blocks (225 preemptions), async | 31,985 / 31,985 |
+| SWE-bench 50 sessions, KV cut to 1,550 blocks, sync | 39,044 / 39,044 |
+| ShareGPT 300, priority scheduling (seeded priorities 0-3), sync | 3,164 / 3,164 |
+| ShareGPT 300, prefix caching off, 512-token budget, sync | 3,635 / 3,635 |
 
 The two-GPU runs use GPU 1, whose clock is locked at 510 MHz: that slows its steps, not its decisions. In vLLM 0.33
 only MoE models run DP ranks in lockstep (dense DP ranks are independent engines), so the lockstep rounds, with 241
@@ -106,6 +111,18 @@ process outputs): 1–3 ms longer than the profile's price at every batch size.
 workloads below; measured with vLLM 0.33 on an i7-12700, and it will differ on
 other host CPUs). Under async scheduling vLLM hides this work behind the
 previous batch, and results do not move with it.
+
+**GPUs with no profile: `--cost roofline`.** Each operation takes max(FLOPs / (peak × efficiency), bytes /
+(bandwidth × efficiency)) plus a per-kernel overhead, from the model's config and the GPU's datasheet peaks
+(`GPU_FACTS`); ten parameters shared by all GPUs, fitted to the shipped profiles (`python -m
+augur.cost.roofline_fit fit`). It is a coarse fallback. With every profile of one GPU held out of the fit, median
+step error (GPU work only) is 3-13% for decode on the RTX PRO 6000 and H100 (GEMMs only: the H100 profile's
+attention and elementwise tables are not usable) but 13 / 47 / 26% for decode / prefill / mixed on the RTX 4060
+Ti, whose GEMMs reach 97% of datasheet peak against 77-80% elsewhere, which no shared efficiency captures. End to
+end on the real 4060 Ti runs with it held out: mean TTFT / TPOT / latency +27 / +22 / +25% (ShareGPT sync), +42 /
++29 / +37% (SWE-bench), and +268% mean TTFT at the 6 req/s knee, where slow steps grow the queue. The breakdown
+puts that error in step time (decisions within 2.3%), so comparisons that turn on scheduling hold under it. One
+measured GEMM rate and decode step for a new GPU (`--roofline-params FILE`) should cut the error most; untested.
 
 ## 3. End to end
 
@@ -284,11 +301,29 @@ calls follow augur's own loop. Mean TTFT / TPOT / latency, % of the real value:
 
 Without speculation, step time and decisions each stay within about 2% of the
 mean. The ngram runs are the exception. Their step-time error (−4 to −7.5%)
-is the price of the verification steps. Decisions
-dominate their tails (median TTFT −24 / −22%, p99 TPOT −16 / −14%) because
-augur draws accepted drafts from a rate, not from the tokens. In the offload
+is the price of the verification steps. With acceptance drawn from a rate
+(the table above), decisions dominate their tails (median TTFT −24 / −22%, p99
+TPOT −16 / −14%).
+
+**Token-faithful speculation.** When a call's output tokens are known (recorded
+in the trace, or `--replay-tokens` from a real run), the simulated model emits
+them, and the drafts are those vLLM 0.33's V2 runner makes (a numpy mirror of
+its two Triton n-gram kernels, checked against the kernels run in Triton's CPU
+interpreter), verified greedily against the real next tokens. Over every logged
+decode step of the two real ngram runs, it reproduces each request's accepted
+count exactly: 88,640 / 88,640 request-steps (sync) and 88,562 / 88,562 (async);
+vLLM's CPU NgramProposer, which takes the earliest of equal matches where the
+kernel takes the latest, matches 89%. With it, the decisions part of the two
+runs falls to +0.1 / +0.2 / +0.1% (sync) and +0.6 / +0.3 / +0.4% (async) of
+mean TTFT / TPOT / latency (from +9.2 / +2.3 / +6.4% and +12.9 / +3.4 / +8.8%
+with the rate), every p50/p90/p99 within ±1.5%, and the error left is step
+time: mean latency −7.6% (sync) and −3.7% (async). The rate-based totals were
+closer only because the two errors cancelled. In the offload
 runs, transfer stalls are not re-timed, so they count under decisions.
-The re-timed schedule had to wait for a request the real engine already had
+On the five runs at the end of the section 1 table (KV cut down, priority, prefix caching off), decisions stay
+within ±1.3% of every mean and step time carries the error: mean latency +5.1 / +1.2% with 520 KV blocks (sync /
+async), +3.4% on SWE-bench with 1,550 blocks, +2.0% with priority, 0.0% with prefix caching off and a 512-token
+budget. The re-timed schedule had to wait for a request the real engine already had
 in one step of three runs (14-447 ms), and in no other run. p50/p90/p99 rows
 are in the tool's CSV.
 
@@ -382,10 +417,11 @@ against the real engine (TTFT in brackets), first step that differs from the rea
 | bench 1,024/128 at 6 req/s | 0.0, none, 100% | +0.9 [+8], 12, 45% | n/a | n/a |
 | ngram k=3, sync | 0.0, none, 100% | +8.3 [+13], 70, 5% | n/a | n/a |
 
-BLIS's first difference on ShareGPT is a real one: after a preemption it recomputes 1,486 tokens where vLLM
-recomputes 830 (a 656-token hit on the request's own freed blocks). On SWE-bench, step 134 is a round its session
-format cannot express (a prompt shorter than the previous prompt plus output; 64 of 715 later calls). Frontier
-preempts early (two requests at step 100 that vLLM keeps running).
+BLIS's first difference on ShareGPT comes from its input, not its scheduler. A request first scheduled at step 836
+shares 1,072 prompt tokens with an earlier one, so vLLM schedules 830 tokens. BLIS takes prefix sharing as groups
+with one shared length each; this request's group gets the group minimum of 416 tokens, so BLIS schedules 1,486. On
+SWE-bench, step 134 is a round its session format cannot express (a prompt shorter than the previous prompt plus
+output; 64 of 715 later calls). Frontier preempts early (two requests at step 100 that vLLM keeps running).
 
 **Each simulator's own run** (normal arrivals, augur's price), E2E mean against the real client, % (TTFT in
 brackets); preemptions counted from the step logs:
@@ -406,8 +442,29 @@ Frontier and Vidur ran bench 1,024/128 (an async real run) with sync semantics. 
 own transfer queueing model (the link rate is the same 12.7 GB/s). Of the real run's preempted requests, BLIS
 preempts 84% on ShareGPT sync (augur 97%) and 6% on SWE-bench sync. So on these runs, which have mild memory
 pressure (14-191 preemptions), a faithful port such as BLIS lands within about 1% end to end on plain runs, while
-Frontier and Vidur miss by 4-205%. `scripts/baselines/run.sh RUN` reruns a row; the simulators' checkouts live
-outside the repo (`~/baselines`).
+Frontier and Vidur miss by 4-205%. `scripts/baselines/run.sh RUN` reruns a row (`AUGUR_RUN_DIR` and
+`AUGUR_WORKLOAD` take any other real run); the simulators' checkouts live outside the repo (`~/baselines`).
+
+**Under memory pressure, priority and prefix caching off** (the last five runs of the section 1 table). Replay with
+the real step durations: E2E mean against the real engine (TTFT in brackets), first differing step, steps
+identical; then preemptions real / BLIS / Frontier / Vidur in the simulators' own runs:
+
+| Run | BLIS | Frontier | Vidur | Preemptions |
+| --- | --- | --- | --- | --- |
+| ShareGPT, 520 KV blocks, sync (31,931 steps) | 0.0 [0.0], none, 100% | −0.7 [−0.8], 98, 18% | +7.7 [+8.0], 98, 6% | 228 / 218 / 319 / 696 |
+| ShareGPT, 520 KV blocks, async | 0.0 [0.0], 9, 92% | n/a | n/a | 225 / 221 / – / – |
+| SWE-bench 50, 1,550 KV blocks, sync | +5.1 [+4.7], 134, 31% | −9.9 [−12.0], 325, 16% | +1,011 [+1,104], 134, 3% | 25 / 29 / 580 / 128 |
+| ShareGPT, priority, sync | 0.0 [0.0], none, 100% | 0.0 [−2.3], 93, 11% | n/a | 169 / 172 / 220 / – |
+| ShareGPT, prefix caching off, 512-token budget | 0.0 [0.0], none, 100% | −0.1 [+0.3], 179, 19% | +4.3 [+1.7], 203, 11% | 158 / 162 / 520 / 240 |
+
+BLIS reproduces every step of the sync, priority and prefix-off runs, all 228, 169 and 158 preemptions included:
+it is a faithful copy of vLLM 0.33's scheduler. Priority needed a patch to its host (`blis_priority.patch`; as
+checked out it sends every request at priority 0 and refuses a priority policy). With the cache this small,
+prefix sharing nearly vanishes (0.7% hits), and with it the input that BLIS's prefix groups cannot express. Its
+remaining differences are all outside the scheduler: what its inputs cannot say (prefix sharing beyond one length
+per group, session prompts that are not the previous prompt plus output) and timing (async step 9: a request that
+arrived 10 us before vLLM's next schedule, in the 69 us of host time between steps that BLIS does not model).
+Frontier preempts 1.3-23x as often as vLLM and Vidur 1.5-5x, and neither follows vLLM's steps past 98-325.
 
 ## 6. Speed
 

@@ -1,0 +1,20 @@
+{
+ "architectures": [
+  "MistralForCausalLM"
+ ],
+ "model_type": "mistral",
+ "vocab_size": 1000,
+ "hidden_size": 256,
+ "intermediate_size": 512,
+ "num_hidden_layers": 4,
+ "num_attention_heads": 4,
+ "num_key_value_heads": 2,
+ "head_dim": 64,
+ "sliding_window": 64,
+ "max_position_embeddings": 8192,
+ "rms_norm_eps": 1e-05,
+ "rope_theta": 10000.0,
+ "tie_word_embeddings": false,
+ "torch_dtype": "bfloat16",
+ "hidden_act": "silu"
+}

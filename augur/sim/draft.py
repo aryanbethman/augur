@@ -156,12 +156,23 @@ def draft_layer_count(vllm_config) -> int:
     return int(sc.draft_model_config.get_num_layers(vllm_config.parallel_config))
 
 
-def draft_kv_spec(vllm_config, target_spec):
-    """(KV spec, layer count) of the draft model's attention layers, or None: they take cache next to the target's."""
+def draft_kv_spec(vllm_config, target_specs):
+    """(KV spec, layer count) of the draft model's attention layers, or None: they take cache next to the target's.
+
+    The drafter's layers are built like the target's attention layer: MLA targets (DeepSeek MTP) give MLA layers, a
+    dense full-attention target gives full-attention layers of the draft model's own head layout. Other kinds
+    (sliding window, hybrid) raise: no drafter for them is modelled."""
     n = draft_layer_count(vllm_config)
     if not n:
         return None
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, MLAAttentionSpec
+    target = next((spec for spec in target_specs.values() if isinstance(spec, AttentionSpec)), None)
+    if isinstance(target, MLAAttentionSpec):
+        return target, n
+    if type(target) is not FullAttentionSpec:
+        kind = "no attention layer" if target is None else type(target).__name__
+        raise ValueError(f"{vllm_config.speculative_config.method} drafting is modelled for full-attention and MLA "
+                         f"targets only; this model's first attention layer is {kind}")
     dm, pc = vllm_config.speculative_config.draft_model_config, vllm_config.parallel_config
-    return FullAttentionSpec(block_size=target_spec.block_size, num_kv_heads=dm.get_num_kv_heads(pc),
-                             head_size=dm.get_head_size(), dtype=target_spec.dtype), n
+    return FullAttentionSpec(block_size=target.block_size, num_kv_heads=dm.get_num_kv_heads(pc),
+                             head_size=dm.get_head_size(), dtype=target.dtype), n

@@ -75,8 +75,11 @@ class PricedStep:
     xfer: dict  # offload transfers reported in the step: {"load": [bytes, s, n], "store": [...]}
 
 
-def make_pricer(model, hardware, fork, max_num_seqs, max_num_batched_tokens, max_model_len):
-    """(cost model, CUDA-graph dispatcher) of a run's engine settings. Raises FileNotFoundError without a profile."""
+def make_pricer(model, hardware, fork, max_num_seqs, max_num_batched_tokens, max_model_len, roofline=False,
+                roofline_params=None):
+    """(cost model, CUDA-graph dispatcher) of a run's engine settings. Raises FileNotFoundError without a profile.
+    ``roofline``: price with ``--cost roofline`` (parameters from the JSON file ``roofline_params``, else the fitted
+    defaults) instead of the profile."""
     from augur.sim.engine import EngineSpec, SimEngine
     from augur.cost.llmservingsim import LLMServingSimCost
     from augur.cost.tables import TableCost, bundled_profile
@@ -86,9 +89,17 @@ def make_pricer(model, hardware, fork, max_num_seqs, max_num_batched_tokens, max
         profile = bundled_profile(hardware, model)
     except FileNotFoundError:
         profile = None
-    mdir = model_dir(fork, model, os.path.expanduser("~/.cache/augur/models"), None, profile)
-    cost = TableCost(profile) if profile else LLMServingSimCost(
-        fork_root=fork, hardware=hardware, model=model, max_num_batched_tokens=max_num_batched_tokens)
+    mdir = model_dir(fork, model, os.path.expanduser("~/.cache/augur/models"), None, None if roofline else profile)
+    if roofline:
+        from augur.cost.roofline import DEFAULT_PARAMS, RooflineCost, RooflineParams
+        params = DEFAULT_PARAMS
+        if roofline_params:
+            with open(roofline_params, encoding="utf-8") as f:
+                params = RooflineParams.from_json(json.load(f))
+        cost = RooflineCost(os.path.join(mdir, "config.json"), hardware, params=params)
+    else:
+        cost = TableCost(profile) if profile else LLMServingSimCost(
+            fork_root=fork, hardware=hardware, model=model, max_num_batched_tokens=max_num_batched_tokens)
     # Only for vLLM's CUDA-graph dispatcher under the same engine settings.
     eng = SimEngine(0, EngineSpec(model_dir=mdir, model_name=model, kv_cache_bytes=8 << 30, max_model_len=max_model_len,
                                   max_num_batched_tokens=max_num_batched_tokens, max_num_seqs=max_num_seqs), cost)
@@ -120,10 +131,15 @@ def main(argv=None) -> int:
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--csv", default=None, help="per-step rows: class, tokens, seqs, padded, measured, predicted, and the "
                                                "offload bytes loaded and stored by transfers reported in the step")
+    p.add_argument("--cost", default="auto", choices=["auto", "roofline"],
+                   help="auto: the profile; roofline: --cost roofline")
+    p.add_argument("--roofline-params", default=None,
+                   help="--cost roofline: parameters JSON (python -m augur.cost.roofline_fit)")
     a = p.parse_args(argv)
 
     try:
-        cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len)
+        cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len,
+                                 a.cost == "roofline", a.roofline_params)
     except FileNotFoundError as e:
         print(f"augur.verify.stepcheck: {e}", file=sys.stderr)
         return 2

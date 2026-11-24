@@ -50,7 +50,12 @@ priced as bf16).
 
 `--scheduler-cls DOTTED.PATH` runs your own vLLM scheduler class (a `Scheduler`
 subclass, or `AsyncScheduler` with `--async-scheduling`) in place of vLLM's;
-`--step-log-vllm` still logs it. `--scheduling-policy priority` orders requests
+`--step-log-vllm` still logs it. `examples/shortest_prompt_first.py` is one.
+
+Each layer's KV-cache spec comes from vLLM's own model definition, built on the
+meta device without weights: sliding-window, MLA, Mamba-hybrid and mixed models
+get vLLM's KV-cache manager behaviour (their step prices need profiles augur
+does not ship yet; `--cost fixed` runs them). `--scheduling-policy priority` orders requests
 by the workload's per-request `priority` field (lower first, default 0).
 
 Multi-GPU engines (`--tp`; link and memory settings from `--tp-link-bw`,
@@ -64,7 +69,9 @@ tier), prefill/decode
 `--enable-expert-parallel`), async scheduling (default, as in vLLM 0.33), speculative decoding
 (`--speculative-method ngram|eagle|eagle3|mtp --num-speculative-tokens k
 --spec-accept-rate p`, not with `--dp`; EAGLE and MTP run vLLM's drafter path without weights,
-the drafter priced from the target's per-layer profile), KV
+the drafter priced from the target's per-layer profile; ngram is token-faithful when a call's output
+tokens are known, from the trace or `--replay-tokens`: vLLM's own drafts, verified against the real
+next tokens, and the rate only for calls without them), KV
 offload to CPU memory (`--kv-offload-gib`, vLLM's `--kv-offloading-size`;
 transfer cost from `--kv-offload-gbps` / `--kv-offload-latency-ns`, by default
 the CPU memory's, as LLMServingSim prices KV loads), and secondary tiers behind
@@ -118,6 +125,7 @@ augur/
     offload.py         KV offload to CPU: the GPU-worker half of vLLM's OffloadingConnector
     tiers.py           simulated secondary KV tiers (CXL, memory pools) for vLLM's offload tiering
     models.py          model configs without weights
+    kvspec.py          each layer's KV-cache spec, from vLLM's model built on the meta device
   cost/                step pricing (interface in __init__.py)
     tables.py          from profiles shipped with augur: dense models on one node, no fork needed
     convert.py         builds such a profile from an LLMServingSim profile
@@ -130,8 +138,10 @@ augur/
   verify/              checking against real vLLM (table above)
 tests/                 pytest; replay self-tests and LLMServingSim comparison need the fork
   data/llmservingsim/  LLMServingSim reference outputs for the comparison
-scripts/               rebuild test data from the fork
-docs/accuracy.md       current accuracy against real vLLM and LLMServingSim
+scripts/               real-run, profiling and test-data scripts
+  baselines/           the same-step-time test against BLIS, Frontier and Vidur (docs/accuracy.md section 5)
+examples/              research uses, e.g. a custom scheduler
+docs/accuracy.md       current accuracy against real vLLM and other simulators
 augur-todo.md          open work, in priority order
 ```
 
@@ -168,7 +178,10 @@ through a checkout of the fork
 `llmservingsim` extra): its profiles, model configs and ASTRA-Sim.
 `python -m augur.cost.convert` turns one of its dense profiles into a shipped
 one. `--model-config` takes any Hugging Face `config.json`, and
-`--cost fixed` runs any model with a constant step time.
+`--cost fixed` runs any model with a constant step time. `--cost roofline`
+prices any model on any GPU in `GPU_FACTS` (A100, L40S, H100, H200, B200 and
+others) from FLOPs, bytes and datasheet peaks, with no profile: a coarse
+fallback, 25-40% off end to end on a held-out GPU (docs/accuracy.md section 2).
 
 To add a GPU or model, run `python -m augur.profile --model M --hardware NAME
 --tp N` on that GPU: it profiles with the LLMServingSim fork's profiler (KV up

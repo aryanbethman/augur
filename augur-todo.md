@@ -58,9 +58,15 @@ Additions
 5. [x] Error breakdown (206a5a4): `python -m augur.verify.breakdown`, results in docs/accuracy.md section 3. Outside
    the step loop, step time and decisions each within ~2% of the mean on the non-speculative runs; ngram decisions
    dominate their tails (median TTFT −24%): acceptance is a rate, not token content
-6. [ ] Custom-scheduler example through --scheduler-cls (e.g. shortest job first)
-7. [ ] KV cache spec from vLLM's own model definition (meta device) for sliding-window, MLA and hybrid models;
-   decisions checked on a small sliding-window model on the 4060 Ti
+6. [x] Custom-scheduler example (3d4960f): examples/shortest_prompt_first.py, a waiting queue ordered by prompt
+   length; on ShareGPT 300 (4060 Ti tables, async) mean TTFT 53.8 → 45.4 s, p99 125.6 → 136.8 s
+7. [x] KV cache spec from vLLM's own model definition (cbcfdac, 0b7002e): augur/sim/kvspec.py builds the model on the
+   meta device and asks its layers, as GPUModelRunner does; cached per process (~1 s once, for vLLM's kernel
+   imports). Sliding window (Mistral-7B), MLA (DeepSeek-V2-Lite), hybrid Mamba (granite-4.0-h-micro) and mixed
+   sliding/full (Olmo-3-7B) build vLLM's specs and replay their own logs exactly (--cost fixed). Open: pricing for
+   them (sliding-window attention priced at full context, no MLA or Mamba kernels in the tables, weight and reserve
+   estimates ignore MLA and hybrid layers, hybrid offload bytes per block overstated); a real decision check on a
+   small sliding-window model needs its weights (a download)
 8. [ ] Pipeline parallelism; EAGLE with DP; MoE MTP pricing. Next-features 2 and 4
 9. [ ] Packaging: Dockerfile, fork and ASTRA-Sim setup script, CI for the tests that need no fork, LICENSE.
    Next-features 6
@@ -72,8 +78,13 @@ Real runs on the test host
     copied schedulers do not?
 12. [ ] Held-out accuracy: 2-3 workloads not used for any fit (another chat set, long context to 32k, bursty
     arrivals)
-13. [ ] More single-GPU decision coverage: priority scheduling, heavy preemption, prefix caching off, other chunk
-    sizes, SWE-bench at a higher session rate
+13. [x] More single-GPU decision coverage (2026-11-24, five real runs, all replayed exactly; docs/accuracy.md
+    section 1): KV cut to 520 blocks sync and async (~32k steps, 225-228 preemptions), SWE-bench with 1,550 blocks
+    (39k steps), priority scheduling, prefix caching off with a 512-token budget. Preemptions stay in the hundreds:
+    each frees a whole request, and 520 blocks is the floor for 8k-token requests. Baselines on them (339aa06;
+    docs/accuracy.md section 5): BLIS replays the sync, priority and prefix-off runs step for step (with a priority
+    patch to its host); its only differences are its inputs (prefix groups, session format) and async host time.
+    Open: SWE-bench at a higher session rate
 14. [ ] LMCache connector unmodified, replayed against a real LMCache run. Next-features 3
 15. [ ] vLLM upgrade study: move to the next vLLM release, count the lines changed, rerun the six real replays
 
@@ -87,10 +98,12 @@ accuracy alone will not set augur apart from it on ordinary workloads. These ite
 The paper's lead claim is still open: lead with these (accuracy against ports as support), or lead with accuracy
 against ports, decided after the heavy-preemption runs (plan item 13).
 
-16. [ ] Token-faithful simulation: with recorded outputs, the simulated model emits the real tokens; vLLM's own ngram
-    proposer is verified against them (exact acceptance per request and step for greedy decoding, instead of
-    --spec-accept-rate), and prefix hits on generated text are the real ones (identical generations share blocks).
-    Check on the existing ngram runs, whose decision error is −24% median TTFT today (plan item 5). No GPU
+16. [x] Token-faithful simulation (a640abe; docs/accuracy.md section 3): with known output tokens the model emits
+    them; drafts are the V2 runner's (numpy mirror of its Triton n-gram kernels, tested against the kernels in
+    Triton's CPU interpreter), verified greedily. Accepted counts match the real logs on every request-step (88,640
+    sync, 88,562 async; the CPU NgramProposer 89%); the decisions part of the ngram runs fell from +6-9% to +0.1-0.6%
+    of mean latency. Left: the verification steps' price (step time −7.6% sync, −3.7% async); only ngram k=3 on
+    ShareGPT checked against real logs
 17. [ ] Plugin case study: a KV eviction or offload policy (or a scheduler) written as a vLLM plugin, ranked against
     alternatives at hundreds of GPUs in augur, then the same code run on the 4060 Ti to confirm the ranking; BLIS
     would need it rewritten in Go first
@@ -100,13 +113,15 @@ against ports, decided after the heavy-preemption runs (plan item 13).
 19. [ ] Third-party and unreleased code on day one: LMCache unmodified (plan item 14) and a vLLM release candidate or
     open pull request run without changes to augur
 20. [ ] Workloads where a port's inputs lose information: prompts that overlap in part (shared system prompts,
-    few-shot, RAG), which BLIS encodes as prefix groups; plus the heavy-preemption runs of plan item 13. Measure
-    BLIS's error against augur's on each
+    few-shot, RAG), which BLIS encodes as prefix groups. The stress runs (plan item 13) showed that BLIS's scheduler
+    is exact and every difference left comes from its inputs (prefix groups, session prompts) or host timing, so
+    this is where the gap is. Measure BLIS's error against augur's on each
 21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
     effect; contrast with a port, which reproduces 57% of the steps of the same run
-22. [ ] Where BLIS is ahead: a pluggable timing model for GPUs nobody has profiled (a roofline pricer, or an adapter
-    to BLIS's timing, giving "vLLM's real decisions under any timing model"); measure augur's speed against BLIS's
-    at 256-1,024 GPUs and report it honestly
+22. [~] Where BLIS is ahead. Done: `--cost roofline` (7ebce16; docs/accuracy.md section 2), a coarse fallback for
+    unprofiled GPUs (held-out 4060 Ti: +22-42% end to end; 3-13% median decode step error on the PRO 6000 and H100).
+    Left: a one-point calibration for a new GPU; measure augur's speed against BLIS's at 256-1,024 GPUs on a quiet
+    host and report it honestly
 
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
 DP2 + EP2 on the tables, the sync offload replay difference fixed.

@@ -1,0 +1,37 @@
+diff -ruN a/cmd/engine_driver_build.go b/cmd/engine_driver_build.go
+--- a/cmd/engine_driver_build.go	2026-11-20 03:22:50.000000000 +0530
++++ b/cmd/engine_driver_build.go	2026-11-24 03:06:16.512025864 +0530
+@@ -50,9 +50,8 @@
+ 			"carry request priority across it yet (every request reaches the engine at priority 0), so %s",
+ 			kernelScenario, version, setting)
+ 	}
+-	if scenarioScheduler == "priority-fcfs" {
+-		refusePriority("engine.scheduling_policy priority would run as FCFS")
+-	}
++	// (Same-step-time test: scripts/baselines/blis_priority.patch lets a priority policy run: sim.EngineDriver
++	// sends a numeric SLO class as the request's priority.)
+ 	if len(sloPriorityOverrides) > 0 {
+ 		refusePriority("the --policy-config priority.slo_priorities override would be ignored")
+ 	}
+diff -ruN a/sim/engine_driver.go b/sim/engine_driver.go
+--- a/sim/engine_driver.go	2026-11-20 03:22:50.000000000 +0530
++++ b/sim/engine_driver.go	2026-11-24 03:06:09.535905413 +0530
+@@ -11,6 +11,7 @@
+ 	"fmt"
+ 	"maps"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 
+ 	"github.com/sirupsen/logrus"
+@@ -548,6 +549,10 @@
+ 	if req.SLOClass != "" {
+ 		// The request's SLO class, an opaque fact for an engine whose priority policy reads it.
+ 		er.Tags = map[string]string{"slo_class": req.SLOClass}
++		// Same-step-time test (augur scripts/baselines): a numeric SLO class is the request's vLLM priority.
++		if n, err := strconv.Atoi(req.SLOClass); err == nil {
++			er.Priority = n
++		}
+ 	}
+ 	if req.KVTransferParams != "" {
+ 		// The request's kv_transfer_params, as the P/D gateway sets them for a p2p handoff.

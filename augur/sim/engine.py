@@ -52,6 +52,7 @@ class EngineSpec:
     async_scheduling: bool = False  # vLLM 0.33's default is True
     speculative: dict | None = None  # vLLM speculative_config, e.g. {"method": "ngram", "num_speculative_tokens": 3}
     spec_accept_rate: float = 0.0
+    spec_rate_only: bool = False
     kv_offload_gib: float | None = None  # vLLM --kv-offloading-size: CPU tier for the KV cache (native connector)
     kv_offload_link: OffloadLink | None = None  # GPU <-> CPU transfer cost (required with kv_offload_gib)
     kv_offload_extra: dict | None = None  # merged into the OffloadingConnector's kv_connector_extra_config (e.g. eviction_policy)
@@ -130,6 +131,7 @@ class SimEngine:
         if spec.speculative:
             self.ctx.spec_k = int(spec.speculative["num_speculative_tokens"])
             self.ctx.spec_accept_rate = spec.spec_accept_rate
+            self.ctx.spec_rate_only = spec.spec_rate_only
         usage_context = None
         if spec.hbm_gb is not None:
             args.get_batch_defaults = _simulated_gpu_batch_defaults(spec.hardware, spec.hbm_gb)
@@ -264,6 +266,8 @@ class SimEngine:
             lora_request=None, cache_salt=None, data_parallel_rank=None, priority=call.priority,
         )
         self.ctx.output_ids[rid] = call.output_ids
+        if call.recorded:
+            self.ctx.recorded.add(rid)
         r, wave = self.core.preprocess_add_request(req)
         self.core.add_request(r, wave)
 
