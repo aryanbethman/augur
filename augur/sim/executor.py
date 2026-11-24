@@ -34,11 +34,12 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 
-from augur.cost import CostModel, SeqWork, StepShape
+from augur.cost import CostModel, SeqWork, StepShape, adjust_gpu_ns
 from augur.sim.draft import draft_kv_spec
 from augur.sim.kvspec import layer_kv_specs
 from augur.sim.ngram import Context, NgramDrafter
 from augur.trace.workload import call_id
+from augur.verify.prefix_share import shared_tokens
 
 SYNTHETIC_TOKEN = 0  # emitted when the workload recorded no output IDs
 
@@ -251,19 +252,6 @@ class SimWorker:
         return out
 
     # ---- steps -----------------------------------------------------------
-    def _shared_kv(self, decodes) -> dict[str, int]:
-        """For the decodes of a step, ``(request id, tokens of computed KV)``: per request, the tokens of its KV that
-        sit in blocks an earlier decode of the step also holds (the total does not depend on the order)."""
-        size = self.vllm_config.cache_config.block_size
-        seen: set[int] = set()
-        out: dict[str, int] = {}
-        for rid, before in decodes:
-            blocks = set(self.reqs[rid].blocks[:before // size])  # only full blocks are ever shared
-            if blocks:
-                out[rid] = len(blocks & seen) * size
-                seen |= blocks
-        return out
-
     def execute_model(self, so) -> ModelRunnerOutput:
         for rid in so.finished_req_ids:
             self.reqs.pop(rid, None)
@@ -333,8 +321,9 @@ class SimWorker:
         proposing: list[tuple[str, _ReqState]] = []  # token-faithful ngram: requests that emit this step
         spec = so.scheduled_spec_decode_tokens or {}
         self._step += 1
-        shared = self._shared_kv([(rid, before) for rid, before, n in work
-                                  if n == 1 or (spec.get(rid) and n == 1 + len(spec[rid]))]) if track else {}
+        shared = shared_tokens([(rid, self.reqs[rid].blocks, before) for rid, before, n in work
+                                if n == 1 or (spec.get(rid) and n == 1 + len(spec[rid]))],
+                               self.vllm_config.cache_config.block_size) if track else {}
         for rid, before, num_new in work:
             st = self.reqs[rid]
             known = st.num_prompt + st.num_output
@@ -427,16 +416,13 @@ class SimWorker:
             gpu = self.ctx.cost.step_ns(shape) if seqs else 0
             if seqs and self.ctx.drafter is not None:
                 gpu += self.ctx.drafter.step_ns(shape, len(drafts_next))
-            if self.ctx.step_time_scale != 1.0:
-                gpu = round(gpu * self.ctx.step_time_scale)
-            if self.ctx.class_scales:
-                gpu = round(gpu * self.ctx.class_scales.get(shape.step_class, 1.0))
-            if self.ctx.spec_ns_per_request and not hasattr(self.ctx.cost, "durations"):
-                gpu += self.ctx.spec_ns_per_request * sum(1 for x in seqs if x.is_decode and x.num_new > 1)
-            if self.ctx.net is not None and not hasattr(self.ctx.cost, "durations"):
+            replayed = hasattr(self.ctx.cost, "durations")
+            gpu = adjust_gpu_ns(gpu, shape, self.ctx.step_time_scale, self.ctx.class_scales,
+                                0 if replayed else self.ctx.spec_ns_per_request)
+            if self.ctx.net is not None and not replayed:
                 gpu = round(gpu * self.ctx.interference_factor(shape))
             cpu = (self.ctx.cpu_fixed_ns + self.ctx.cpu_per_request_ns * len(seqs)) if seqs else 0
-            if not hasattr(self.ctx.cost, "durations"):  # a replayed duration already holds its stalls
+            if not replayed:  # a replayed duration already holds its stalls
                 cpu += forward_ready - self.ctx.now_ns  # offload waits (flushed stores, sync loads) hold the step
             self.ctx.last_cpu_ns = cpu
             self.ctx.last_step_ns = gpu + cpu if not self.ctx.async_cpu else gpu

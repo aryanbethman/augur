@@ -216,7 +216,6 @@ class RooflineCost(RingTP):
             if int(self._bw) < 1 or int(cpu_mem_bw) < 1 or link_bw <= 0 or link_latency_ns < 0:
                 raise ValueError("TP>1 needs npu_mem_bw >= 1, cpu_mem_bw >= 1, link_bw > 0, link_latency_ns >= 0")
             self.link_bw, self.link_latency_ns, self.npu_mem_bw = link_bw, link_latency_ns, self._bw
-        self._cache: dict[tuple, int] = {}
         self.steps = 0
 
     def ops_ns(self, shape: StepShape) -> dict[str, float]:
@@ -227,11 +226,8 @@ class RooflineCost(RingTP):
         return {name: float(per[name]) * n for name, n in self._counts.items()}
 
     def step_ns(self, shape: StepShape) -> int:
-        key = (tuple((s.num_new, s.num_computed_before) for s in shape.seqs), shape.forward_tokens, shape.dummy)
+        # No cache: decode KV lengths grow every step, so a step's shape practically never repeats.
         self.steps += 1
-        hit = self._cache.get(key)
-        if hit is not None:
-            return hit
         tokens, rows = shape.forward_tokens, 0 if shape.dummy else len(shape.seqs)
         ns = int(sum(self.ops_ns(shape).values()))
         if self.tp > 1:
@@ -239,5 +235,4 @@ class RooflineCost(RingTP):
         else:  # token ids in, sampled ids out: both in CPU memory, as TableCost
             ns += self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / self.cpu_mem_bw)
             ns += self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / self.cpu_mem_bw)
-        self._cache[key] = ns
         return ns

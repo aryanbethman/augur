@@ -335,6 +335,11 @@ batch sizes the base run never had. With the same price BLIS predicts the same e
 on these runs (section 5). The ShareGPT base was recorded with the client's old 100-connection cap; simulating it
 as recorded or unthrottled differs by under 1%.
 
+Calibration needs `--workload` when the profile prices shared KV blocks (the RTX 4060 Ti one does). Until
+2026-11-24 it fitted the scales without that discount while augur's runs applied it, so the discount counted twice:
+on the overlapping-prompt tenants run the decode scale came out 0.62 instead of 0.96 and step time 29% short. On the
+ShareGPT and SWE-bench runs above sharing moves prices by at most 0.2%, so the table stands.
+
 **Where the error comes from** (`python -m augur.verify.breakdown`). For each
 real run, augur's error (its normal run minus the real one) splits exactly into
 three parts, from three more runs of the same requests: the real log replayed

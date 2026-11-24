@@ -13,7 +13,6 @@ from augur.cost import SeqWork, StepShape
 from augur.cost.convert import random_shapes
 from augur.cost.tables import TableCost, bundled_profile
 from augur.profile_shared import ND_AXIS, apply, fit, relative_times, unique_fraction
-from augur.sim.executor import SimWorker, _ReqState
 from augur.verify import prefix_share
 from augur.verify.stepcheck import real_steps
 
@@ -107,17 +106,6 @@ def test_a_prefill_chunk_keeps_its_own_price_when_decodes_share(cost):
     assert chunk < shared < private  # the decode part shrinks, the chunk's own attention stays
 
 
-def test_executor_counts_shared_blocks_of_a_step():
-    worker = SimpleNamespace(vllm_config=SimpleNamespace(cache_config=SimpleNamespace(block_size=16)),
-                             reqs={"a": _ReqState(100, blocks=[1, 2, 3, 4, 5, 6, 7]),
-                                   "b": _ReqState(100, blocks=[1, 2, 3, 9, 10, 11, 12]),
-                                   "c": _ReqState(100, blocks=[1, 2, 20]),
-                                   "d": _ReqState(100, blocks=[30, 31])})
-    work = [("a", 100), ("b", 70), ("c", 40), ("d", 0)]
-    # a holds 6 full blocks (100 // 16); b 4 (70 // 16): its first 3 are a's; c 2: both a's; d none yet
-    assert SimWorker._shared_kv(worker, work) == {"a": 0, "b": 48, "c": 32}
-
-
 def test_the_engine_fills_shared_kv_from_block_ids(workload, monkeypatch):
     import augur.cli as cli
     seen = []
@@ -148,6 +136,24 @@ def test_the_engine_does_not_look_at_blocks_without_a_model_for_them(workload, m
     monkeypatch.setenv("VLLM_LOGGING_LEVEL", "WARNING")
     assert cli.main(argv) == 0
     assert seen and not any(s.shared_kv for shape in seen for s in shape.seqs)
+
+
+def test_no_shared_kv_prices_as_a_profile_without_the_model(workload, monkeypatch, tmp_path):
+    # The baselines' control run (scripts/baselines/run.sh) must take the price pricer.py gives the other simulators,
+    # which know no block ids.
+    import augur.cli as cli
+    p = load_profile()
+    del p["shared_kv"]
+    plain = save_profile(p, tmp_path / "plain.json.gz")
+    argv = ["--model", "Qwen/Qwen3-1.7B", "--hardware", "RTX4060Ti", "--num-gpu-blocks", "600", "--max-num-seqs", "16",
+            "--max-model-len", "8192", "--max-num-batched-tokens", "512", "--no-recorded-outputs",
+            "--no-async-scheduling", "--quiet", "--workload", workload]
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "WARNING")
+    assert cli.main(argv + ["--profile", str(plain), "--output", str(tmp_path / "plain.csv")]) == 0
+    assert cli.main(argv + ["--no-shared-kv", "--output", str(tmp_path / "off.csv")]) == 0
+    assert cli.main(argv + ["--output", str(tmp_path / "on.csv")]) == 0
+    off = (tmp_path / "off.csv").read_bytes()
+    assert off == (tmp_path / "plain.csv").read_bytes() and off != (tmp_path / "on.csv").read_bytes()
 
 
 # --- augur.profile_shared -------------------------------------------------------
@@ -226,10 +232,11 @@ def test_prompt_chains_identify_blocks_by_everything_before_them(tmp_path):
 
 
 def test_shared_tokens_counts_blocks_an_earlier_decode_holds():
-    chains = {"x": [1, 2, 3, 4], "y": [1, 2, 3, 9], "z": [1, 7, 8]}
-    rid = lambda c: f"cmpl-augur.{c}.-0"
-    got = prefix_share.shared_tokens(chains, [(rid("x"), 64), (rid("y"), 64), (rid("z"), 20), (rid("nothere"), 50)])
-    assert got == {rid("x"): 0, rid("y"): 48, rid("z"): 16}
+    # (request id, its block ids, tokens of computed KV): only the full blocks of the computed KV count
+    decodes = [("a", [1, 2, 3, 4, 5, 6, 7], 100), ("b", [1, 2, 3, 9, 10, 11, 12], 70), ("c", [1, 2, 20], 40),
+               ("d", [30, 31], 0), ("e", [], 50)]
+    # a holds 6 full blocks (100 // 16); b 4: its first 3 are a's; c 2: both a's; d none yet; e has no blocks
+    assert prefix_share.shared_tokens(decodes, 16) == {"a": 0, "b": 48, "c": 32}
 
 
 def test_real_steps_carry_the_shared_tokens():

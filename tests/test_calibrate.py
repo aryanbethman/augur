@@ -1,6 +1,7 @@
-"""augur.verify.calibrate's fit, --step-class-scales and StepShape.step_class (no GPU)."""
+"""augur.verify.calibrate's fit, --step-class-scales, adjust_gpu_ns and StepShape.step_class (no GPU)."""
 
 import csv
+import glob
 import json
 import os
 import subprocess
@@ -8,7 +9,8 @@ import sys
 
 import pytest
 
-from augur.cost import SeqWork, StepShape, parse_class_scales
+from augur.cost import STEP_CLASSES, SeqWork, StepShape, adjust_gpu_ns, parse_class_scales
+from augur.verify import calibrate
 from augur.verify.calibrate import fit_scales, total_error
 
 BASE = ["--model", "Qwen/Qwen3-1.7B", "--cost", "fixed",
@@ -68,3 +70,47 @@ def test_class_scales_of_one_is_bit_identical(tmp_path, workload):
     augur(tmp_path, workload, "plain")
     augur(tmp_path, workload, "one", "--step-class-scales", "decode=1.0,prefill=1.0,mixed=1.0")
     assert (tmp_path / "plain.csv").read_bytes() == (tmp_path / "one.csv").read_bytes()
+
+
+def test_gpu_time_scales_only_its_own_class_and_adds_the_spec_term_after_scaling():
+    mixed = StepShape(seqs=(SeqWork(4, 10, True), SeqWork(1, 10, True), SeqWork(64, 0, False)))
+    assert adjust_gpu_ns(1000, mixed, class_scales={"decode": 3.0}) == 1000
+    assert adjust_gpu_ns(1000, mixed, scale=2.0, class_scales={"mixed": 1.5}, spec_ns_per_request=7) == 3007
+
+
+def test_a_dummy_forward_takes_the_step_scale_but_no_class_scale():
+    dummy = StepShape(seqs=(), dummy=True)
+    assert adjust_gpu_ns(1000, dummy, scale=2.0, class_scales={"decode": 3.0}) == 2000
+
+
+TABLES = ["--model", "Qwen/Qwen3-1.7B", "--hardware", "RTX4060Ti", "--num-gpu-blocks", "600", "--max-num-seqs", "16",
+          "--max-model-len", "8192", "--max-num-batched-tokens", "512", "--no-recorded-outputs", "--no-async-scheduling",
+          "--quiet"]
+CALIBRATE = ["--model", "Qwen/Qwen3-1.7B", "--hardware", "RTX4060Ti", "--max-num-seqs", "16",
+             "--max-num-batched-tokens", "512", "--max-model-len", "8192"]
+
+
+@pytest.fixture(scope="module")
+def own_log(tmp_path_factory, workload):
+    """augur's own step log of the synthetic workload on the RTX 4060 Ti tables, whose profile prices shared KV
+    blocks (a third of the prompts share 256 tokens)."""
+    d = tmp_path_factory.mktemp("own")
+    subprocess.run([sys.executable, "-m", "augur.cli", *TABLES, "--workload", workload, "--output", os.devnull,
+                    "--step-log-vllm", str(d / "steps")], check=True, env=dict(os.environ, VLLM_LOGGING_LEVEL="WARNING"),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (log,) = glob.glob(str(d / "steps.*.jsonl"))
+    return log
+
+
+def test_calibrating_augurs_own_run_gives_scales_of_one(own_log, workload, tmp_path):
+    # Regression (2026-11-24): calibrate priced the logged steps without the shared-KV discount augur's engine applies,
+    # so on shared prompts it fitted scales below 1 (0.998 here, 0.62 on a real multi-tenant run) and the run that used
+    # them counted the discount twice.
+    out = tmp_path / "scales.json"
+    assert calibrate.main([own_log, *CALIBRATE, "--workload", workload, "--output", str(out)]) == 0
+    assert json.loads(out.read_text())["scales"] == pytest.approx({c: 1.0 for c in STEP_CLASSES}, abs=1e-4)
+
+
+def test_calibrate_needs_the_workload_when_the_profile_prices_shared_blocks(own_log, capsys):
+    assert calibrate.main([own_log, *CALIBRATE]) == 2
+    assert "--workload" in capsys.readouterr().err

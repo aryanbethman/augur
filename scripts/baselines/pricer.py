@@ -49,21 +49,13 @@ class Pricer:
                  max_num_batched_tokens: int = 2048, max_model_len: int = 8192, step_cpu_us: float = 2000.0,
                  step_cpu_per_request_us: float = 0.0, spec_us_per_request: float = 100.0,
                  fork: str | None = None, class_scales: dict | None = None) -> None:
-        from vllm.config import CUDAGraphMode  # noqa: F401  (fail early without vLLM)
-
         from augur.cost.profiles import default_fork
-        from augur.cost.tables import TableCost, bundled_profile
-        from augur.sim.engine import EngineSpec, SimEngine
-        from augur.sim.models import model_dir
+        from augur.cost.tables import bundled_profile
+        from augur.verify.stepcheck import make_pricer
 
-        profile = bundled_profile(hardware, model)
-        self.cost = TableCost(profile)
-        mdir = model_dir(fork or default_fork(), model, os.path.expanduser("~/.cache/augur/models"), None, profile)
-        # Only for vLLM's CUDA-graph dispatcher under the run's engine settings.
-        eng = SimEngine(0, EngineSpec(model_dir=mdir, model_name=model, kv_cache_bytes=8 << 30,
-                                      max_model_len=max_model_len, max_num_batched_tokens=max_num_batched_tokens,
-                                      max_num_seqs=max_num_seqs), self.cost)
-        self.cudagraph = eng.core.model_executor.worker.cudagraph
+        bundled_profile(hardware, model)  # raises without a shipped profile (make_pricer would use the fork's)
+        self.cost, self.cudagraph = make_pricer(model, hardware, fork or default_fork(), max_num_seqs,
+                                                max_num_batched_tokens, max_model_len)
         self.cpu_fixed_ns = int(step_cpu_us * 1e3)  # as augur.cli: --step-cpu-us
         self.cpu_per_request_ns = int(step_cpu_per_request_us * 1e3)
         self.spec_ns = int(spec_us_per_request * 1e3)  # as augur: per request verified with drafts
@@ -71,7 +63,7 @@ class Pricer:
 
     def gpu_ns(self, reqs, spec_k: int = 0) -> int:
         """Price of one step. ``spec_k``: speculative tokens per decode (the executor's uniform-decode query length)."""
-        from augur.cost import SeqWork, StepShape
+        from augur.cost import SeqWork, StepShape, adjust_gpu_ns
 
         seqs = tuple(SeqWork(num_new=int(n), num_computed_before=int(c), is_decode=bool(d)) for n, c, d in reqs)
         if not seqs:
@@ -80,10 +72,8 @@ class Pricer:
         uniform = all(s.num_new == 1 + spec_k for s in seqs)
         _, desc = self.cudagraph.dispatch(num_tokens=total, uniform_decode=uniform)
         shape = StepShape(seqs=seqs, padded_tokens=desc.num_tokens)
-        gpu = self.cost.step_ns(shape)
-        if self.class_scales:
-            gpu = round(gpu * self.class_scales.get(shape.step_class, 1.0))
-        return gpu + self.spec_ns * sum(1 for s in seqs if s.is_decode and s.num_new > 1)
+        return adjust_gpu_ns(self.cost.step_ns(shape), shape, class_scales=self.class_scales,
+                             spec_ns_per_request=self.spec_ns)
 
     def cpu_ns(self, n_reqs: int) -> int:
         return (self.cpu_fixed_ns + self.cpu_per_request_ns * n_reqs) if n_reqs else 0

@@ -25,6 +25,7 @@ import numpy as np
 
 from augur.cost import SeqWork, StepShape
 from augur.cost.profiles import default_fork
+from augur.trace.workload import call_id
 from augur.verify.prefix_share import prompt_chains, shared_tokens
 from augur.verify.replay import is_async, read_log, steps
 
@@ -52,8 +53,8 @@ def real_steps(events, chains=None):
         # only the emitted tokens, accepted drafts + 1, enter the KV cache; rejected drafts do not).
         decode = {rid: computed.get(rid, 0) >= prompt.get(rid, 0) and emitted.get(rid, 0) >= 1
                   and (n == 1 or n <= 1 + MAX_DRAFTS) for rid, n in s["tok"].items()}
-        shared = shared_tokens(chains, [(rid, computed.get(rid, 0)) for rid, n in s["tok"].items()
-                                        if decode[rid] or n == 1]) if chains else {}
+        shared = shared_tokens([(rid, chains.get(call_id(rid), ()), computed.get(rid, 0)) for rid, n in s["tok"].items()
+                                if decode[rid] or n == 1]) if chains else {}
         for rid, n in s["tok"].items():
             before = computed.get(rid, 0)
             seqs.append(SeqWork(num_new=n, num_computed_before=before, is_decode=decode[rid] or n == 1,
