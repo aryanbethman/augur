@@ -706,7 +706,10 @@ class Coordinator:
         starts = getattr(cost, "starts", None)
         if not starts or cost.k >= len(starts) or self.now >= starts[cost.k]:
             return False
-        at = cost.next_schedule_ns(self.now)
+        # Async: when a step was just launched at this instant, the schedule logged now is that step's, not a next
+        # one (a real engine blocked in a launch scheduled again only later, with the requests that arrived meanwhile).
+        launched_now = eng.async_sched and cost.k > 0 and starts[cost.k - 1] == self.now
+        at = cost.next_schedule_ns(self.now + 1 if launched_now else self.now)
         if at == self.now:
             return False
         at = starts[cost.k] if at is None else min(at, starts[cost.k])
