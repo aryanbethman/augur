@@ -616,6 +616,26 @@ Multi-GPU timing has not been compared with real hardware: the collective
 model is ASTRA-Sim's (ring over point-to-point links), not a measurement. On the 4060 Ti
 benchmarks above augur takes 1–4 s per run against 55–152 s for the real one.
 
+**Against BLIS** (`scripts/baselines/speed.py`; constant load per GPU, one GPU per engine, round-robin, prefix
+caching off, each run pinned to two P-core threads of the i7-12700 host, 3 runs (2 at 1,024 GPUs), CPU seconds
+median, startup included). augur prices Qwen3-1.7B on the 4060 Ti tables; BLIS uses its own latency model with the
+nearest model in its catalog (qwen3-14b on H100), so its step counts differ by up to ~15%:
+
+| Workload | GPUs | augur CPU s / RSS | BLIS CPU s / RSS | augur steps per CPU s | BLIS steps per CPU s |
+| --- | --- | --- | --- | --- | --- |
+| ShareGPT (12 requests per GPU) | 16 | 14.5 / 1.4 GB | 1.1 / 0.2 GB | 1,441 | 19,371 |
+| | 256 | 77.7 / 1.9 GB | 18.4 / 3.0 GB | 4,363 | 18,772 |
+| | 1,024 | 341 / 3.5 GB | 152 / 29.6 GB | 3,934 | 9,016 |
+| SWE-bench (1 session per GPU) | 16 | 14.8 / 1.4 GB | 1.7 / 0.2 GB | 2,780 | 19,981 |
+| | 256 | 80.0 / 1.7 GB | 25.5 / 1.5 GB | 7,200 | 18,620 |
+| | 1,024 | 618 / 2.6 GB | 192 / 7.4 GB | 3,719 | 9,805 |
+
+BLIS is 3-13x faster at 16-256 GPUs and 2.2-3.2x at 1,024, where it needs up to 8x augur's memory. augur's time goes
+to vLLM's own scheduler and KV manager (~60% of the event loop at 256 GPUs on ShareGPT; the table pricer 5-15%;
+on SWE-bench also building the filler prompt ids of long prompts). 1,024 GPUs take 5.7 min (ShareGPT) and 10 min
+(SWE-bench) of wall time. Given augur's price through a pipe, BLIS's scheduler costs 1.2-2.2x less CPU than augur.
+The pipe rows used a BLIS build with one shared pricer process that is not in the repo yet.
+
 ## Modeled, not yet checked against real vLLM
 
 - **KV offload to CPU** (`--kv-offload-gib`), now partly checked. vLLM's OffloadingConnector

@@ -133,8 +133,10 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     metrics); calibration moves it about half a point; BLIS with the same price does as well (faithful scheduler)
 22. [~] Where BLIS is ahead. Done: `--cost roofline` (7ebce16; docs/accuracy.md section 2), a coarse fallback for
     unprofiled GPUs (held-out 4060 Ti: +22-42% end to end; 3-13% median decode step error on the PRO 6000 and H100).
-    Left: a one-point calibration for a new GPU; measure augur's speed against BLIS's at 256-1,024 GPUs on a quiet
-    host and report it honestly
+    Speed against BLIS (a472238; docs/accuracy.md section 7): BLIS 3-13x less CPU at 16-256 GPUs, 2.2-3.2x at 1,024,
+    where augur needs up to 8x less memory; augur's time is vLLM's own scheduler and KV manager. Left: a one-point
+    calibration for a new GPU; the shared-pricer BLIS patch into scripts/baselines; filler-id construction on long
+    prompts (15% of the SWE-bench event loop) is an easy speed-up
 
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
 DP2 + EP2 on the tables, the sync offload replay difference fixed.
