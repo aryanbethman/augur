@@ -273,6 +273,26 @@ far each metric moves. On this benchmark:
 A large spread marks an operating point where no single number, simulated or
 measured, is reliable.
 
+**What if one setting changed?** Pairs of real runs of the same workload that differ in one setting test this held
+out: augur is calibrated on run A (`python -m augur.verify.calibrate`: one GPU-time scale per step class, so each
+class's total matches A; `--step-class-scales` applies it) and predicts run B. Mean absolute error over ten metrics
+(mean / p50 / p99 TTFT, TPOT, latency, and throughput), for B itself and for the effect B / A, augur uncalibrated /
+calibrated / BLIS given the same calibrated price:
+
+| Change from A | Error of B | Error of the effect B / A |
+| --- | --- | --- |
+| ShareGPT 300: fcfs → priority | 2.2 / 1.8 / 1.8% | 2.2 / 1.7 / 1.6% |
+| ShareGPT 300: KV cut to 520 blocks | 4.9 / 4.4 / 4.4% | 5.0 / 4.3 / 4.1% |
+| ShareGPT 300: prefix caching off, 512-token budget | 0.8 / 0.9 / 0.9% | 0.5 / 0.6 / 0.6% |
+| SWE-bench 50: KV cut to 1,550 blocks | 2.6 / 3.0 / 3.8% | 4.1 / 3.2 / 3.2% |
+
+Large effects come out at their size: at 520 blocks mean TTFT grows 5.1x (real 4.9x) and throughput falls to 0.32x
+(real 0.33x); priority scheduling's p99 TPOT grows 2.25x (real 2.23x). Calibration moves the error by about half a
+point here because the profile is already within 1-3% on the base runs; what is left is the per-step CPU time at
+batch sizes the base run never had. With the same price BLIS predicts the same effects, as its scheduler is exact
+on these runs (section 5). The ShareGPT base was recorded with the client's old 100-connection cap; simulating it
+as recorded or unthrottled differs by under 1%.
+
 **Where the error comes from** (`python -m augur.verify.breakdown`). For each
 real run, augur's error (its normal run minus the real one) splits exactly into
 three parts, from three more runs of the same requests: the real log replayed

@@ -112,6 +112,7 @@ when comparing with it.
 | `augur ... --replay-durations <log>` + `python -m augur.verify.replay compare` | Reruns a logged run with its arrival times and step durations; scheduling decisions must match step for step |
 | `augur.verify.stepcheck` | Prices every step of a real run and compares with its measured time |
 | `augur.verify.breakdown` | Splits augur's end-to-end error on a real run into outside the step loop, step time and scheduling decisions |
+| `augur.verify.calibrate` | Fits one step-time scale per step class on a real run, for `--step-class-scales` (what-if runs from one real run) |
 | `pytest` | Replay self-tests, and the scheduler against LLMServingSim's stored outputs (`tests/test_vs_llmservingsim.py`) |
 
 How close it gets, and how that was measured: [docs/accuracy.md](docs/accuracy.md).

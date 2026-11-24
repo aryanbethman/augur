@@ -122,8 +122,10 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     (decode +60% median, mixed +29%) against 0.97 on ShareGPT, so augur's own runs there are 15-85% slow end to end.
     Find which step shapes the 4060 Ti profile overprices (likely attention with long cached history at large
     batch) and fix the profile or the lookup
-21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
-    effect; contrast with a port, which reproduces 57% of the steps of the same run
+21. [x] Counterfactuals from one real run (ee6029d; docs/accuracy.md section 3): `python -m augur.verify.calibrate`
+    fits one scale per step class on the real run, `--step-class-scales` applies it. On four held-out pairs (priority,
+    KV cut to 520 / 1,550 blocks, prefix off) augur predicts the effect of the change within 0.5-5% (mean over 10
+    metrics); calibration moves it about half a point; BLIS with the same price does as well (faithful scheduler)
 22. [~] Where BLIS is ahead. Done: `--cost roofline` (7ebce16; docs/accuracy.md section 2), a coarse fallback for
     unprofiled GPUs (held-out 4060 Ti: +22-42% end to end; 3-13% median decode step error on the PRO 6000 and H100).
     Left: a one-point calibration for a new GPU; measure augur's speed against BLIS's at 256-1,024 GPUs on a quiet
