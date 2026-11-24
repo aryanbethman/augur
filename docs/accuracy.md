@@ -466,6 +466,34 @@ per group, session prompts that are not the previous prompt plus output) and tim
 arrived 10 us before vLLM's next schedule, in the 69 us of host time between steps that BLIS does not model).
 Frontier preempts 1.3-23x as often as vLLM and Vidur 1.5-5x, and neither follows vLLM's steps past 98-325.
 
+**Prompts that overlap in part** (`scripts/baselines/overlap_workloads.py`, seeded; prompts assembled from disjoint
+ShareGPT and SWE-bench token ids so that they share tokens only where the pattern says): multi-tenant system prompts
+under a common preamble (400 requests), few-shot prompts drawing different example subsets (350), RAG prompts with
+shared documents (350), and agent sessions that share a system prompt and trim their context in ~20% of rounds (28
+sessions, 330 calls). Real runs on GPU 0 (sync, normal KV size), prefix-hit rate 0.65 / 0.38 / 0.37 / 0.68; augur
+replays them exactly (1,578, 1,636, 1,887 and 5,560 steps). BLIS gets the best prefix-group encoding we could build
+(`BLIS_ENCODING=best`: groups chosen by local search to minimise mis-stated tokens; it states 42-67% of prompt tokens
+as shared against a true 43-69%; the simple encoding states 9-35%). With the real step durations, E2E mean against
+the real engine (TTFT in brackets), steps identical:
+
+| Workload | augur | BLIS (best encoding) | BLIS (simple) | Frontier | Vidur |
+| --- | --- | --- | --- | --- | --- |
+| Tenants | 0.0, 100% | +21.6 [+48.2], 4% | +45.9, 3% | −0.1 [−0.6], 67% | +93.0, 2% |
+| Few-shot | 0.0, 100% | +11.0 [+22.1], 7% | +34.1, 5% | −0.1 [−0.3], 77% | +44.0, 4% |
+| RAG | 0.0, 100% | +12.1 [+20.6], 3% | +23.8, 3% | −0.1 [−0.5], 65% | +48.3, 2% |
+| Agent sessions | 0.0, 100% | +26.8 [+1,101], 59% | +53.8 [+2,255], 52% | +0.5 [+20.4], 85% | +104.5, 27% |
+
+BLIS diverges at step 1-12 of every run, each time at the first request of a prefix group that shares a preamble,
+task header or system prompt with another group, which one length per group cannot say. On the agent sessions it
+also re-shares previous outputs the trimmed rounds dropped, and schedules 784k tokens against vLLM's 489k. Frontier,
+which takes block hashes, gets the sharing right and lands within 1% end to end, but still leaves vLLM's steps at
+step 156-351 (one admission or decode a step apart). Only the real scheduler on the real tokens reproduces every
+step. In each simulator's own run (augur's prices, augur's arrivals) BLIS is within 0-3% of augur's E2E mean on the
+three flat workloads (TTFT +5-9%) and +49% on the agent sessions. Against the real client all simulators are 15-85%
+slow here, augur included: the 4060 Ti profile overprices these long-context, nearly full-cache steps (stepcheck
+predicted / measured 1.44 on the tenants run, against 0.97 on ShareGPT), a gap shared by every simulator in this
+test because they all take augur's price.
+
 ## 6. Speed
 
 Wall time simulating Llama-3.1-70B TP4 on H100s (ShareGPT 750

@@ -112,10 +112,15 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     days after the vLLM release) from its history
 19. [ ] Third-party and unreleased code on day one: LMCache unmodified (plan item 14) and a vLLM release candidate or
     open pull request run without changes to augur
-20. [ ] Workloads where a port's inputs lose information: prompts that overlap in part (shared system prompts,
-    few-shot, RAG), which BLIS encodes as prefix groups. The stress runs (plan item 13) showed that BLIS's scheduler
-    is exact and every difference left comes from its inputs (prefix groups, session prompts) or host timing, so
-    this is where the gap is. Measure BLIS's error against augur's on each
+20. [x] Prompts that overlap in part (2882883; docs/accuracy.md section 5): tenants, few-shot, RAG and trimmed agent
+    sessions, real runs replayed exactly by augur. With real step durations BLIS (best prefix-group encoding) is
+    +11-27% E2E mean off (TTFT up to +1,101% on agent sessions) and keeps 3-59% of steps; Frontier, given block
+    hashes, is within 1% but leaves vLLM's steps at 156-351. Open: workloads with many partly overlapping short
+    prefixes (per-user prompts), which one length per group handles worst
+23. [ ] Profile gap at long context and full cache: on the tenants run stepcheck's predicted / measured is 1.44
+    (decode +60% median, mixed +29%) against 0.97 on ShareGPT, so augur's own runs there are 15-85% slow end to end.
+    Find which step shapes the 4060 Ti profile overprices (likely attention with long cached history at large
+    batch) and fix the profile or the lookup
 21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
     effect; contrast with a port, which reproduces 57% of the steps of the same run
 22. [~] Where BLIS is ahead. Done: `--cost roofline` (7ebce16; docs/accuracy.md section 2), a coarse fallback for
