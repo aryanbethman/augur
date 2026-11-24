@@ -19,6 +19,11 @@ the same piece in both. The patterns (sizes in the module's ``PATTERNS``):
   output and a tool result, and now and then the context is trimmed (older turns dropped) or summarised (replaced
   by a new summary): the next prompt then shares the head of the previous one and nothing after it.
 
+Four more, for held-out real runs (``HELDOUT``; ``gen all`` leaves them out): ``bursty`` (the ShareGPT trace's requests
+with gamma-process arrivals, CV 4), ``longctx`` (12k-24k-token prompts cut from the SWE-bench trace), ``swefast`` (the
+SWE-bench sessions arriving at another rate) and ``peruser`` (short prompts: a shared preamble, then one of a few
+personal prefixes of the user that agree for part of their length, then the user's turn).
+
 ``stats`` reports each workload's sharing from the token ids: the tokens of each prompt reusable from earlier
 prompts (the longest run of full 16-token blocks it has in common with one earlier prompt, as vLLM's prefix cache
 would hit it with unlimited memory), against what a prefix-group trace (BLIS) can state: workloads.py's
@@ -43,6 +48,12 @@ MAX_PROMPT = 7000  # + the output must fit max-model-len 8192
 
 # requests (sessions for agent), arrivals per second (sessions per second for agent)
 PATTERNS = {"tenants": (400, 6.0), "fewshot": (350, 5.0), "rag": (350, 5.0), "agent": (28, 0.45)}
+# requests, arrivals per second (sessions per second for swefast)
+HELDOUT = {"bursty": (300, 1.2), "longctx": (100, 0.2), "swefast": (50, 1.0), "peruser": (400, 5.0)}
+SWE_RATE = 0.2  # the SWE-bench trace's sessions per second
+BURST_CV = 4.0
+LONGCTX_PROMPT = (12000, 23800)  # + the output must fit max-model-len 24576
+PERUSER_MAX = 800
 
 
 class Pool:
@@ -174,15 +185,67 @@ def agent(rng: random.Random, n: int, rate: float, chat: Pool, swe: Pool) -> lis
     return out
 
 
-GENERATORS = {"tenants": tenants, "fewshot": fewshot, "rag": rag, "agent": agent}
+def peruser(rng: random.Random, n: int, rate: float, chat: Pool, _swe: Pool) -> list[dict]:
+    """60 users with 2-4 personal prefixes each: the user's text, or its first 30-90% and another end. Every prompt
+    is the shared preamble, one prefix and the turn: 200-800 tokens, so two prompts of a user agree for the
+    preamble and as much of the prefix as their versions have in common."""
+    preamble = chat.take(96)
+    users = []
+    for _ in range(60):
+        base = chat.take(rng.randint(120, 520))
+        vs = [(3, base)]
+        for _ in range(rng.randint(1, 3)):
+            cut = int(len(base) * rng.uniform(0.3, 0.9))
+            vs.append((1, base[:cut] + chat.take(rng.randint(40, 160))))
+        users.append(vs)
+    out = []
+    for t in arrivals(rng, n, rate):
+        vs = users[zipf_choice(rng, len(users), 0.6)]
+        body = rng.choices([v for _, v in vs], weights=[w for w, _ in vs])[0]
+        out.append(request(t, (preamble + body + chat.take(rng.randint(30, 150)))[:PERUSER_MAX], rng))
+    return out
+
+
+def longctx(rng: random.Random, n: int, rate: float, _chat: Pool, swe: Pool) -> list[dict]:
+    """Prompts of 12k-24k tokens, each the next run of the SWE-bench pool (the pool wraps, at an offset that is
+    not the same twice, so no two prompts share a block-aligned prefix)."""
+    return [request(t, swe.take(rng.randint(*LONGCTX_PROMPT)), rng) for t in arrivals(rng, n, rate)]
+
+
+def bursty(rng: random.Random, n: int, rate: float, src: list[dict]) -> list[dict]:
+    """The trace's requests in order, arriving as a gamma renewal process of mean ``rate`` and CV ``BURST_CV``:
+    shape 1/CV^2, so bursts of near-simultaneous requests between long gaps."""
+    shape = 1 / BURST_CV**2
+    t, out = 0.0, []
+    for d in src[:n]:
+        t += rng.gammavariate(shape, 1 / (rate * shape))
+        out.append({**d, "arrival_time_ns": int(t * 1e9)})
+    return out
+
+
+def swefast(_rng: random.Random, n: int, rate: float, src: list[dict]) -> list[dict]:
+    """The trace's sessions with their arrival times scaled to ``rate`` sessions per second (the tool waits inside
+    a session stay)."""
+    k = SWE_RATE / rate
+    return [{**d, "arrival_time_ns": int(d["arrival_time_ns"] * k)} for d in src[:n]]
+
+
+GENERATORS = {"tenants": tenants, "fewshot": fewshot, "rag": rag, "agent": agent, "peruser": peruser,
+              "longctx": longctx}
+SOURCED = {"bursty": (bursty, SHAREGPT), "swefast": (swefast, SWEBENCH)}  # generators of a trace's own lines
 
 
 def generate(pattern: str, seed: int = 0, n: int | None = None, rate: float | None = None,
-             chat: list[list[int]] | None = None, swe: list[list[int]] | None = None) -> list[dict]:
-    """The workload's JSONL lines (flat requests, or sessions for ``agent``). ``chat`` and ``swe`` are the source
-    documents (default: the files on this host)."""
-    dn, dr = PATTERNS[pattern]
+             chat: list[list[int]] | None = None, swe: list[list[int]] | None = None,
+             src: list[dict] | None = None) -> list[dict]:
+    """The workload's JSONL lines (flat requests, or sessions for ``agent`` and ``swefast``). ``chat`` and ``swe``
+    are the source documents, ``src`` the trace's own lines for ``bursty`` and ``swefast`` (default: the files on
+    this host)."""
+    dn, dr = {**PATTERNS, **HELDOUT}[pattern]
     rng = random.Random(f"{pattern}/{seed}")
+    if pattern in SOURCED:
+        fn, path = SOURCED[pattern]
+        return fn(rng, n or dn, rate or dr, src if src is not None else [json.loads(line) for line in open(path)])
     chat_pool = Pool(chat if chat is not None else sharegpt_docs(), rng)
     swe_pool = Pool(swe if swe is not None else swebench_docs(), rng)
     return GENERATORS[pattern](rng, n or dn, rate or dr, chat_pool, swe_pool)
@@ -241,7 +304,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="overlap_workloads")
     sub = p.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gen")
-    g.add_argument("pattern", choices=[*PATTERNS, "all"])
+    g.add_argument("pattern", choices=[*PATTERNS, *HELDOUT, "all"])
     g.add_argument("out", help="a file, or for 'all' a directory")
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--n", type=int, default=None)
