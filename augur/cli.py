@@ -264,10 +264,12 @@ def _parser() -> argparse.ArgumentParser:
                         "and latency grow by this, inter-token latencies do not, and a session's next call "
                         "is released this much later. Engine behaviour is unchanged. Default measured with "
                         "vLLM 0.33 on an i7-12700. Ignored with --replay-durations and --replay-arrivals")
-    p.add_argument("--step-cpu-us", type=float, default=2000.0,
+    p.add_argument("--step-cpu-us", type=float, default=1300.0,
                    help="vLLM's per-step CPU time, which GPU profiles do not hold (sync: added to the step; "
-                        "async: delays the launch, hidden behind the previous batch). Default measured with "
-                        "vLLM 0.33 on an i7-12700; 0 for GPU time only. Ignored with --replay-durations")
+                        "async: delays the launch, hidden behind the previous batch). Default: the constant that "
+                        "fits 15 real sync runs best (RTX 4060 Ti, Qwen3-1.7B, vLLM 0.33, i7-12700; 0.7 to 2.2 ms "
+                        "from run to run, with no dependence on the batch that holds up on held-out runs); "
+                        "0 for GPU time only. Ignored with --replay-durations")
     p.add_argument("--step-time-scale", type=float, default=1.0,
                    help="multiply every GPU step time from the cost model by this (sensitivity runs: 0.99, 1.01); "
                         "not the CPU term, KV transfers or front-end latency. Ignored with --replay-durations")

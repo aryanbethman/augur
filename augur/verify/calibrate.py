@@ -5,7 +5,7 @@ augur prices a step from a GPU profile (augur.verify.stepcheck holds the per-ste
 first, and `--step-class-scales` applies it to the simulation of the changed setting.
 
 Method. A step is decode (no prefill sequence), prefill (only prefill sequences) or mixed. A measured step is the
-schedule-to-update time, which holds vLLM's CPU work; augur adds that as a constant (--step-cpu-us, 2000 by default,
+schedule-to-update time, which holds vLLM's CPU work; augur adds that as a constant (--step-cpu-us, 1300 by default,
 none for async scheduling where it hides behind the previous batch) and prices the GPU work. Per class c, the scale is
 
     s_c = sum(measured - cpu) / sum(predicted)     over the class's steps
@@ -73,7 +73,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-num-batched-tokens", type=int, default=2048)
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--step-cpu-us", type=float, default=None,
-                    help="CPU time per step that augur adds to the GPU price (default: augur's 2000 for a synchronous "
+                    help="CPU time per step that augur adds to the GPU price (default: augur's 1300 for a synchronous "
                          "run, 0 for an async one)")
     ap.add_argument("--min-steps", type=int, default=MIN_STEPS,
                     help="a class with fewer steps takes the scale of all steps")
@@ -87,7 +87,7 @@ def main(argv=None) -> int:
     except FileNotFoundError as e:
         print(f"augur.verify.calibrate: {e}", file=sys.stderr)
         return 2
-    cpu_ns = (a.step_cpu_us if a.step_cpu_us is not None else (0.0 if is_async(events) else 2000.0)) * 1e3
+    cpu_ns = (a.step_cpu_us if a.step_cpu_us is not None else (0.0 if is_async(events) else 1300.0)) * 1e3
     priced = [p for p in price_steps(events, cost, disp) if not p.xfer]
     cl = [classify(p.shape) for p in priced]
     m = [p.measured_ns for p in priced]
