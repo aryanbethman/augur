@@ -79,6 +79,11 @@ the CPU one through vLLM's offload tiering (`--kv-offload-tier
 NAME:GIB:GBPS[:LATENCY_NS]`, repeatable; `cxl:GIB` takes LLMServingSim's CXL
 numbers, 60 GB/s and 250 ns). KV offload also runs with prefill/decode (vLLM's
 MultiConnector of NIXL and the OffloadingConnector) and with DP.
+`--kv-offload-extra-config JSON` passes the OffloadingConnector's
+`kv_connector_extra_config`, so an out-of-tree CPU-tier eviction policy loads
+from the same file a real vLLM server loads (`examples/kv_offload_policies.py`;
+docs/accuracy.md section 6). `--replicate-sessions K` repeats a session
+workload K times with disjoint prefixes, for larger clusters.
 
 `--contention on` turns every KV transfer (offload, tiers, prefill/decode
 pulls) into a flow through shared resources (PCIe links, the host's PCIe root
@@ -140,7 +145,7 @@ tests/                 pytest; replay self-tests and LLMServingSim comparison ne
   data/llmservingsim/  LLMServingSim reference outputs for the comparison
 scripts/               real-run, profiling and test-data scripts
   baselines/           the same-step-time test against BLIS, Frontier and Vidur (docs/accuracy.md section 5)
-examples/              research uses, e.g. a custom scheduler
+examples/              research uses: a custom scheduler, KV offload eviction policies as vLLM plugins
 docs/accuracy.md       current accuracy against real vLLM and other simulators
 augur-todo.md          open work, in priority order
 ```

@@ -494,7 +494,35 @@ slow here, augur included: the 4060 Ti profile overprices these long-context, ne
 predicted / measured 1.44 on the tenants run, against 0.97 on ShareGPT), a gap shared by every simulator in this
 test because they all take augur's price.
 
-## 6. Speed
+## 6. A KV offload policy written as a vLLM plugin
+
+vLLM 0.33's CPU offloading manager takes its eviction policy by name from the connector's extra config
+(`eviction_policy`, `cache_policy_module_path`), so a policy can live outside vLLM. `examples/kv_offload_policies.py`
+holds two, written once and loaded unchanged by a real `vllm serve` (`--kv-transfer-config`) and by augur
+(`--kv-offload-extra-config`): ToolWaitPolicy evicts the blocks of sessions with a request in flight first (their KV
+is also on the GPU) and those of sessions waiting on a tool last; ReuseFrequencyPolicy evicts the blocks that served
+the fewest requests first. Against vLLM's own LRU and ARC: SWE-bench 50 sessions, Qwen3-1.7B, one RTX 4060 Ti, sync,
+GPU KV pinned to 9 GiB (5,266 blocks), an 8 GiB CPU tier (`scripts/real_offload_check.sh` with `KV_GIB`,
+`OFFLOAD_GIB`, `POLICY`). One real run per policy; augur replays each step for step with the plugin loaded (11,384,
+11,269, 11,390 and 11,337 steps). augur's own run, mean TTFT / latency in s and prefix-hit rate, real vs augur:
+
+| Policy | Mean TTFT | Mean latency | Prefix hits | CPU-tier hits |
+| --- | --- | --- | --- | --- |
+| ToolWaitPolicy (plugin) | 17.89 / 17.75 | 29.94 / 29.61 | 33.8 / 36.4% | 21.8 / 23.1% |
+| ReuseFrequencyPolicy (plugin) | 18.50 / 18.83 | 30.87 / 31.23 | 27.3 / 26.8% | 14.6 / 13.8% |
+| LRU (vLLM's default) | 19.71 / 19.84 | 32.52 / 32.68 | 21.6 / 20.8% | 9.3 / 8.2% |
+| ARC | 19.99 / 19.92 | 32.93 / 32.75 | 19.5 / 20.2% | 7.8 / 7.7% |
+
+augur's mean TTFT is within 2% for every policy and it ranks them as the real runs do on mean and p99 TTFT, mean
+latency and both hit rates (ToolWait 9.3% ahead of LRU on real mean TTFT, ReuseFrequency 6%); on p99 latency it swaps
+LRU and ARC, which the real runs separate by 0.1%. With 16, 64 and 256 engines (session-affine routing, 50 sessions
+per engine, `--replicate-sessions`) augur keeps the same order and gaps (ToolWait ~9%, ReuseFrequency ~5% ahead of
+LRU); at that load per engine each engine behaves like the validated one, so this shows consistency at scale, not a
+check of it. Limits: one workload, model and GPU, one run per policy, and margins only a few times augur's 1-2%
+error. The ranking belongs to this configuration (a CPU tier small for the working set, long tool waits). A port such
+as BLIS would need each policy rewritten first.
+
+## 7. Speed
 
 Wall time simulating Llama-3.1-70B TP4 on H100s (ShareGPT 750
 requests at 10 req/s, 89 s simulated):

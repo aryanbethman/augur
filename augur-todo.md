@@ -104,9 +104,10 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     sync, 88,562 async; the CPU NgramProposer 89%); the decisions part of the ngram runs fell from +6-9% to +0.1-0.6%
     of mean latency. Left: the verification steps' price (step time −7.6% sync, −3.7% async); only ngram k=3 on
     ShareGPT checked against real logs
-17. [ ] Plugin case study: a KV eviction or offload policy (or a scheduler) written as a vLLM plugin, ranked against
-    alternatives at hundreds of GPUs in augur, then the same code run on the 4060 Ti to confirm the ranking; BLIS
-    would need it rewritten in Go first
+17. [x] Plugin case study (50ec0bf; docs/accuracy.md section 6): two CPU-tier eviction policies in
+    examples/kv_offload_policies.py, loaded unchanged by vLLM 0.33 and augur. Real runs replay exactly; augur within 2%
+    of real mean TTFT and the same ranking as the real runs (ToolWait > ReuseFrequency > LRU ≈ ARC); same order at
+    16-256 engines. Open: more than one run per policy; a second workload; kv-aware routing at scale; real multi-GPU
 18. [ ] vLLM version study (plan item 15, moved up): the lines changed to move augur to the next release, a decision
     change between the two versions that only the new code produces, and what each of BLIS's ports took (lines,
     days after the vLLM release) from its history
