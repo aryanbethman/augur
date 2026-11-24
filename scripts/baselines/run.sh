@@ -6,7 +6,8 @@
 #          any other real run: AUGUR_RUN_DIR=<run dir> AUGUR_WORKLOAD=<workload jsonl> run.sh NAME [STAGE...]  (NAME is the
 #          directory under out/baselines/; the run dir holds steps.*.jsonl and, for the settings, server.log). The
 #          settings come from its server.log; these env vars state or override them: MAX_MODEL_LEN MAX_BATCHED_TOKENS
-#          MAX_NUM_SEQS NUM_GPU_BLOCKS PREFIX_CACHING=on|off SCHEDULING_POLICY=fcfs|priority ASYNC_SCHEDULING=sync|async.
+#          MAX_NUM_SEQS NUM_GPU_BLOCKS PREFIX_CACHING=on|off SCHEDULING_POLICY=fcfs|priority ASYNC_SCHEDULING=sync|async
+#          BLIS_ENCODING=greedy|best (how BLIS gets prefix groups and sessions; greedy, the default, is the earlier runs').
 #          The workload's per-request "priority" goes to BLIS (blis_priority.patch, built into
 #          inference-sim-prio/blis-ext-prio) and Frontier; Vidur has none, so it is not run. Prefix caching off:
 #          BLIS and Frontier switch it off, Vidur has none.
@@ -40,7 +41,7 @@ esac
 PREP=""
 for kv in max-model-len:MAX_MODEL_LEN max-num-batched-tokens:MAX_BATCHED_TOKENS max-num-seqs:MAX_NUM_SEQS \
           num-gpu-blocks:NUM_GPU_BLOCKS prefix-caching:PREFIX_CACHING scheduling-policy:SCHEDULING_POLICY \
-          async-scheduling:ASYNC_SCHEDULING; do
+          async-scheduling:ASYNC_SCHEDULING blis-encoding:BLIS_ENCODING; do
   v=${kv#*:}; [ -n "${!v:-}" ] && PREP="$PREP --${kv%%:*} ${!v}"
 done
 O=$W/out/baselines/$run
