@@ -76,15 +76,16 @@ Real runs on the test host
     left: one prefill + one decode engine (needs NIXL installed)
 11. [ ] Winner-changes pilot: sweep one setting with real runs; does augur pick the real best setting while the
     copied schedulers do not?
-12. [ ] Held-out accuracy: 2-3 workloads not used for any fit (another chat set, long context to 32k, bursty
-    arrivals)
+12. [x] Held-out accuracy (e2ceeb1, 640cce0; docs/accuracy.md section 3): bursty ShareGPT, 12k-24k-token prompts,
+    SWE-bench 5x faster and short per-user prompts, all replayed exactly (an async replay hold fixed); augur within
+    0.9-3.0% of real mean latency on three, +8.1% on the per-user run (the fixed CPU term on short steps)
 13. [x] More single-GPU decision coverage (2026-11-24, five real runs, all replayed exactly; docs/accuracy.md
     section 1): KV cut to 520 blocks sync and async (~32k steps, 225-228 preemptions), SWE-bench with 1,550 blocks
     (39k steps), priority scheduling, prefix caching off with a 512-token budget. Preemptions stay in the hundreds:
     each frees a whole request, and 520 blocks is the floor for 8k-token requests. Baselines on them (339aa06;
     docs/accuracy.md section 5): BLIS replays the sync, priority and prefix-off runs step for step (with a priority
     patch to its host); its only differences are its inputs (prefix groups, session format) and async host time.
-    Open: SWE-bench at a higher session rate
+    SWE-bench at 5x the session rate: see item 12
 14. [ ] LMCache connector unmodified, replayed against a real LMCache run. Next-features 3
 15. [ ] vLLM upgrade study: move to the next vLLM release, count the lines changed, rerun the six real replays
 
@@ -104,9 +105,10 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     sync, 88,562 async; the CPU NgramProposer 89%); the decisions part of the ngram runs fell from +6-9% to +0.1-0.6%
     of mean latency. Left: the verification steps' price (step time −7.6% sync, −3.7% async); only ngram k=3 on
     ShareGPT checked against real logs
-17. [ ] Plugin case study: a KV eviction or offload policy (or a scheduler) written as a vLLM plugin, ranked against
-    alternatives at hundreds of GPUs in augur, then the same code run on the 4060 Ti to confirm the ranking; BLIS
-    would need it rewritten in Go first
+17. [x] Plugin case study (50ec0bf; docs/accuracy.md section 6): two CPU-tier eviction policies in
+    examples/kv_offload_policies.py, loaded unchanged by vLLM 0.33 and augur. Real runs replay exactly; augur within 2%
+    of real mean TTFT and the same ranking as the real runs (ToolWait > ReuseFrequency > LRU ≈ ARC); same order at
+    16-256 engines. Open: more than one run per policy; a second workload; kv-aware routing at scale; real multi-GPU
 18. [ ] vLLM version study (plan item 15, moved up): the lines changed to move augur to the next release, a decision
     change between the two versions that only the new code produces, and what each of BLIS's ports took (lines,
     days after the vLLM release) from its history
@@ -115,14 +117,20 @@ against ports, decided after the heavy-preemption runs (plan item 13).
 20. [x] Prompts that overlap in part (2882883; docs/accuracy.md section 5): tenants, few-shot, RAG and trimmed agent
     sessions, real runs replayed exactly by augur. With real step durations BLIS (best prefix-group encoding) is
     +11-27% E2E mean off (TTFT up to +1,101% on agent sessions) and keeps 3-59% of steps; Frontier, given block
-    hashes, is within 1% but leaves vLLM's steps at 156-351. Open: workloads with many partly overlapping short
-    prefixes (per-user prompts), which one length per group handles worst
-23. [ ] Profile gap at long context and full cache: on the tenants run stepcheck's predicted / measured is 1.44
-    (decode +60% median, mixed +29%) against 0.97 on ShareGPT, so augur's own runs there are 15-85% slow end to end.
-    Find which step shapes the 4060 Ti profile overprices (likely attention with long cached history at large
-    batch) and fix the profile or the lookup
-21. [ ] Exact counterfactuals on a real trace: replay a real log step for step, change one setting, report the
-    effect; contrast with a port, which reproduces 57% of the steps of the same run
+    hashes, is within 1% but leaves vLLM's steps at 156-351. Short per-user prompts (item 12) did not
+    separate them: the best encoding states 63.8% of a true 66% shared, and BLIS kept 98% of steps
+23. [x] Decodes that share KV blocks (d63658f; docs/accuracy.md section 2): the profile timed attention on private
+    blocks, but prefix-cached decodes read shared blocks from L2. A microbenchmark of vLLM's decode kernel gives a
+    sharing term (shipped as `shared_kv` in the 4060 Ti profile); stepcheck on the tenants run 1.435 → 1.007 and
+    augur's own runs on the overlap workloads +16-85% → +1.2-5% mean latency. Open: other GPUs (L2 size), query
+    length > 1, prefill chunks, shared generated text (prefix_share counts prompt blocks only)
+24. [ ] Per-step CPU time as a function of the batch (requests, tokens), not a constant 2 ms: it is the error left
+    on short-step workloads (per-user prompts +8%) and in the counterfactuals at new batch sizes. Fit on all real
+    sync runs, hold some out
+21. [x] Counterfactuals from one real run (ee6029d; docs/accuracy.md section 3): `python -m augur.verify.calibrate`
+    fits one scale per step class on the real run, `--step-class-scales` applies it. On four held-out pairs (priority,
+    KV cut to 520 / 1,550 blocks, prefix off) augur predicts the effect of the change within 0.5-5% (mean over 10
+    metrics); calibration moves it about half a point; BLIS with the same price does as well (faithful scheduler)
 22. [~] Where BLIS is ahead. Done: `--cost roofline` (7ebce16; docs/accuracy.md section 2), a coarse fallback for
     unprofiled GPUs (held-out 4060 Ti: +22-42% end to end; 3-13% median decode step error on the PRO 6000 and H100).
     Left: a one-point calibration for a new GPU; measure augur's speed against BLIS's at 256-1,024 GPUs on a quiet

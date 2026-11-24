@@ -464,6 +464,9 @@ class Coordinator:
     def _scaled(g, per_rank, shapes):
         f = g[0].ctx.step_time_scale
         per_rank = per_rank if f == 1.0 else [round(ns * f) for ns in per_rank]
+        cs = g[0].ctx.class_scales
+        if cs:
+            per_rank = [round(ns * cs.get(sh.step_class, 1.0) if not sh.dummy else ns) for ns, sh in zip(per_rank, shapes)]
         if any(e.ctx.net is not None for e in g):  # a rank's PCIe traffic slows its own forward
             per_rank = [round(ns * e.ctx.interference_factor(sh)) for e, ns, sh in zip(g, per_rank, shapes)]
         return per_rank
@@ -706,7 +709,10 @@ class Coordinator:
         starts = getattr(cost, "starts", None)
         if not starts or cost.k >= len(starts) or self.now >= starts[cost.k]:
             return False
-        at = cost.next_schedule_ns(self.now)
+        # Async: when a step was just launched at this instant, the schedule logged now is that step's, not a next
+        # one (a real engine blocked in a launch scheduled again only later, with the requests that arrived meanwhile).
+        launched_now = eng.async_sched and cost.k > 0 and starts[cost.k - 1] == self.now
+        at = cost.next_schedule_ns(self.now + 1 if launched_now else self.now)
         if at == self.now:
             return False
         at = starts[cost.k] if at is None else min(at, starts[cost.k])

@@ -69,10 +69,11 @@ import json
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
+from augur.cost import parse_class_scales
 from augur.cost.profiles import default_fork
 from augur.trace.workload import Workload, call_id
 from augur.verify.replay import ReplayWorkload, compare, is_async, read_log, steps
@@ -146,12 +147,13 @@ class Timing:
     frontend_ns: int
     frontend_ns_per_token: float
     delivery_ns: int
+    class_scales: dict = field(default_factory=dict)  # --step-class-scales
 
 
 def timing(a: argparse.Namespace) -> Timing:
     return Timing(int(a.step_cpu_us * 1e3), int(a.step_cpu_per_request_us * 1e3), int(a.spec_us_per_request * 1e3),
                   a.step_time_scale, int(a.frontend_latency_ms * 1e6), a.frontend_us_per_token * 1e3,
-                  int(a.delivery_latency_ms * 1e6))
+                  int(a.delivery_latency_ms * 1e6), parse_class_scales(a.step_class_scales))
 
 
 def frontend_ns(t: Timing, info: CallInfo) -> int:
@@ -272,7 +274,7 @@ def retime(events: list[dict], priced: list, calls: dict[str, CallInfo], t: Timi
                 late.requests += len(wait)
                 late.delay_ns += start - after
         seqs = p.shape.seqs
-        gpu = round(p.predicted_ns * t.step_time_scale) + t.spec_ns_per_request * sum(
+        gpu = round(p.predicted_ns * t.step_time_scale * t.class_scales.get(p.shape.step_class, 1.0)) + t.spec_ns_per_request * sum(
             1 for x in seqs if x.is_decode and x.num_new > 1)
         launch = max(start + t.cpu_ns + t.cpu_per_request_ns * len(seqs), gpu_free)
         gpu_free = launch + gpu
@@ -379,7 +381,7 @@ def main(argv=None) -> int:
         sim = from_csv(f"{work}/sim.csv", calls)
     cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len,
                              a.cost == "roofline", a.roofline_params)
-    priced = price_steps(events, cost, disp)
+    priced = price_steps(events, cost, disp, a.workload)
     retimed, late = retime(events, priced, calls, t)
 
     ids = sorted(set(real) & set(replay) & set(retimed) & set(arrivals) & set(sim))

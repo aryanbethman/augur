@@ -56,6 +56,7 @@ class Session:
     arrival_ns: int
     sub_requests: list[dict]
     next_index: int = 0
+    shift: int = 0  # --replicate-sessions: added to every recorded token id of this copy (mod REPLICA_VOCAB)
 
 
 class _Filler:
@@ -95,6 +96,12 @@ class Workload:
     # Output ids a real run generated (augur.verify.client --tokens-out), by call id: they replace the trace's
     # (or the unique ids) so that calls whose generations coincide share prefix-cache blocks, as they did there.
     output_tokens: str | None = None
+    # K > 1 (--replicate-sessions): every session K times, as ``<id>-r<k>``, arriving up to ``replica_jitter_s`` later
+    # than the original (copy 0 is the original). Copies k > 0 have every recorded token id shifted by a copy-specific
+    # amount, so they share no prefix with each other while keeping the original's sharing inside a copy. A copy
+    # holds the original's records, not its own: a cluster of hundreds of engines costs no more memory per session.
+    replicas: int = 1
+    replica_jitter_s: float = 5.0
     _filler: _Filler = field(default_factory=_Filler)
     _generated: dict = field(default_factory=dict)
 
@@ -104,7 +111,31 @@ class Workload:
             with open(self.output_tokens) as f:
                 self._generated = {r["call_id"]: r["output_tok_ids"] for r in map(json.loads, f)}
 
+    def _replicated(self) -> Iterator[Session]:
+        rng = random.Random(0)
+        with open(self.path) as f:
+            base = [(i, json.loads(line)) for i, line in enumerate(f) if line.strip()]
+        copies = []
+        for k in range(self.replicas):
+            for line_no, d in base:
+                if "sub_requests" not in d:
+                    raise ValueError("--replicate-sessions replicates sessions; the workload has flat requests")
+                if not d["sub_requests"]:
+                    continue
+                jitter = int(rng.random() * self.replica_jitter_s * 1e9) if k else 0
+                copies.append((int(d["arrival_time_ns"]) + jitter, k, line_no, d))
+        copies.sort(key=lambda c: c[:3])
+        for n, (arrival, k, line_no, d) in enumerate(copies):
+            if self.max_entries is not None and n >= self.max_entries:
+                return
+            sid = str(d.get("session_id", f"session_{line_no}"))
+            yield Session(session_id=f"{sid}-r{k}", arrival_ns=arrival, sub_requests=d["sub_requests"],
+                          shift=REPLICA_STRIDE * k)
+
     def entries(self) -> Iterator[Call | Session]:
+        if self.replicas > 1:
+            yield from self._replicated()
+            return
         with open(self.path) as f:
             n = 0
             for line_no, line in enumerate(f):
@@ -125,13 +156,18 @@ class Workload:
                                          arrival_ns=int(d["arrival_time_ns"]))
                 n += 1
 
-    def make_call(self, d: dict, call_id: str, session_id: str | None, index: int, arrival_ns: int) -> Call:
+    def make_call(self, d: dict, call_id: str, session_id: str | None, index: int, arrival_ns: int,
+                  shift: int = 0) -> Call:
         n_in = int(d["input_toks"])
         n_out = int(d["output_toks"])
         rec_in = list(d.get("input_tok_ids") or ())[:n_in]
+        if shift:
+            rec_in = [(t + shift) % REPLICA_VOCAB for t in rec_in]
         if len(rec_in) < n_in:
             rec_in += self._filler.ids(n_in - len(rec_in), call_id + "/in")
         rec_out = list(d.get("output_tok_ids") or ())[:n_out] if self.recorded_outputs else []
+        if shift:
+            rec_out = [(t + shift) % REPLICA_VOCAB for t in rec_out]
         rec_out = self._generated.get(call_id, rec_out)[:n_out]
         recorded = n_out > 0 and len(rec_out) == n_out
         if len(rec_out) < n_out:
@@ -144,7 +180,11 @@ class Workload:
         i = s.next_index
         s.next_index += 1
         return self.make_call(s.sub_requests[i], call_id=f"{s.session_id}#{i}", session_id=s.session_id,
-                              index=i, arrival_ns=arrival_ns)
+                              index=i, arrival_ns=arrival_ns, shift=s.shift)
+
+
+REPLICA_VOCAB = 151643  # Qwen's regular vocabulary: a shifted id stays below the special tokens
+REPLICA_STRIDE = 104729  # a prime, so two copies' ids differ by more than a small offset
 
 
 _BENCH_RID = re.compile(r"^(?:cmpl-)?bench-[0-9a-f]{8}-(\d+)-")

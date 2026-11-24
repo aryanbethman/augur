@@ -8,6 +8,7 @@ import json
 import os
 import sys
 
+from augur.cost import parse_class_scales
 from augur.cost.profiles import default_fork
 from augur.cost.tables import GPU_FACTS, gpu_mem_bw_gbps, measured_reserve_gib, profile_vllm_memory
 from augur.sim.router import ROUTERS, make_router
@@ -149,6 +150,10 @@ def _parser() -> argparse.ArgumentParser:
                         "configs/model/<model>.json, else the config of a profile shipped with augur)")
     p.add_argument("--workload", required=True, help="JSONL in the fork's format (flat and/or agentic)")
     p.add_argument("--num-entries", type=int, default=None, help="first N requests/sessions only")
+    p.add_argument("--replicate-sessions", type=int, default=1, metavar="K",
+                   help="a session workload K times over, for a larger cluster: copy k of session S is S-r<k>, "
+                        "arriving up to --replicate-jitter-s after S; copies share no prefix (workload.py)")
+    p.add_argument("--replicate-jitter-s", type=float, default=5.0)
     p.add_argument("--engines", type=int, default=1, help="colocated engines (ignored with --prefill-engines)")
     p.add_argument("--prefill-engines", type=int, default=0, help="PD: prefill engines (NIXL kv_producer)")
     p.add_argument("--decode-engines", type=int, default=0, help="PD: decode engines (NIXL kv_consumer)")
@@ -266,6 +271,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--step-time-scale", type=float, default=1.0,
                    help="multiply every GPU step time from the cost model by this (sensitivity runs: 0.99, 1.01); "
                         "not the CPU term, KV transfers or front-end latency. Ignored with --replay-durations")
+    p.add_argument("--step-class-scales", default=None, metavar="JSON|CLASS=X,...",
+                   help="multiply the GPU step time of each step class (decode, prefill, mixed) by its own factor, on top of "
+                        "--step-time-scale: a JSON file from `python -m augur.verify.calibrate` or text like "
+                        "decode=0.99,mixed=1.03. Ignored with --replay-durations")
     p.add_argument("--step-cpu-per-request-us", type=float, default=0.0,
                    help="vLLM's per-step CPU time per scheduled request")
     p.add_argument("--filler-vocab", type=int, default=None,
@@ -351,6 +360,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="KV offload to CPU memory, GiB per engine: vLLM's --kv-offloading-size (native "
                         "OffloadingConnector; its scheduler half runs unmodified, augur/sim/offload.py stands in "
                         "for its GPU worker)")
+    p.add_argument("--kv-offload-extra-config", type=json.loads, default=None, metavar="JSON",
+                   help="the OffloadingConnector's kv_connector_extra_config, as `vllm serve --kv-transfer-config "
+                        "{\"kv_connector_extra_config\": JSON}` takes it: e.g. {\"eviction_policy\": \"ToolWaitPolicy\", "
+                        "\"cache_policy_module_path\": \"examples.kv_offload_policies\"} loads an out-of-tree CPU-tier "
+                        "eviction policy, the same file a real vLLM 0.33 loads")
     p.add_argument("--kv-offload-gbps", type=float, default=None,
                    help="GPU <-> CPU KV transfer bandwidth, GB/s each way (default: the CPU memory's, "
                         "--cpu-mem-bw or the cluster config's cpu_mem.mem_bw, as LLMServingSim prices its KV "
@@ -469,6 +483,7 @@ def _build_engines(a, spec, cost, replay_costs, topology) -> list:
             e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
             e.ctx.spec_ns_per_request = int(a.spec_us_per_request * 1e3)
             e.ctx.step_time_scale = a.step_time_scale
+            e.ctx.class_scales = parse_class_scales(a.step_class_scales)
     if a.step_log:
         for e in engines:
             e.step_log = []
@@ -666,6 +681,7 @@ def main(argv: list[str] | None = None) -> int:
                       kv_cache_dtype=a.kv_cache_dtype, num_gpu_blocks=a.num_gpu_blocks,
                       kv_offload_gib=a.kv_offload_gib,
                       kv_offload_link=_offload_link(a, *cpu_flags) if a.kv_offload_gib else None,
+                      kv_offload_extra=a.kv_offload_extra_config,
                       kv_offload_tiers=a.kv_offload_tiers, hbm_gb=a.hbm_gb, hardware=a.hardware,
                       kv_events=a.router == "kv-aware",
                       step_log_tag=bool(a.step_log_vllm) and a.num_engines > 1)
@@ -727,7 +743,8 @@ def main(argv: list[str] | None = None) -> int:
                                   output_tokens=a.replay_tokens)
     else:
         workload = Workload(a.workload, max_entries=a.num_entries, recorded_outputs=not a.no_recorded_outputs,
-                            filler_vocab=a.filler_vocab, output_tokens=a.replay_tokens)
+                            filler_vocab=a.filler_vocab, output_tokens=a.replay_tokens,
+                            replicas=a.replicate_sessions, replica_jitter_s=a.replicate_jitter_s)
     router_options = dict(seed=a.router_seed, cache_threshold=a.router_cache_threshold,
                           balance_abs_threshold=a.router_balance_abs_threshold,
                           balance_rel_threshold=a.router_balance_rel_threshold,

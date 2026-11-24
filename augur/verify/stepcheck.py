@@ -25,14 +25,16 @@ import numpy as np
 
 from augur.cost import SeqWork, StepShape
 from augur.cost.profiles import default_fork
+from augur.verify.prefix_share import prompt_chains, shared_tokens
 from augur.verify.replay import is_async, read_log, steps
 
 
 MAX_DRAFTS = 8  # a decode step carries at most this many draft tokens (num_speculative_tokens)
 
 
-def real_steps(events):
-    """[(shape without padding, measured ns)] for a step log."""
+def real_steps(events, chains=None):
+    """[(shape without padding, measured ns)] for a step log.  ``chains`` (``prefix_share.prompt_chains`` of the run's
+    workload): fill ``SeqWork.shared_kv`` from the prompt blocks requests had in common."""
     # Async runs overlap scheduling with the GPU: a batch runs from when it was
     # scheduled or the previous batch finished, whichever is later, to its update.
     async_run = is_async(events)
@@ -43,15 +45,20 @@ def real_steps(events):
     for s, u in steps(events):
         seqs = []
         emitted = u["out"]
-        for rid, n in s["tok"].items():
-            if rid in s["new"]:
+        for rid in s["new"]:
+            if rid in s["tok"]:
                 computed[rid] = s["new"][rid]
+        # A decode step is a request past its prompt: 1 token, or 1 + drafts under speculative decoding (where
+        # only the emitted tokens, accepted drafts + 1, enter the KV cache; rejected drafts do not).
+        decode = {rid: computed.get(rid, 0) >= prompt.get(rid, 0) and emitted.get(rid, 0) >= 1
+                  and (n == 1 or n <= 1 + MAX_DRAFTS) for rid, n in s["tok"].items()}
+        shared = shared_tokens(chains, [(rid, computed.get(rid, 0)) for rid, n in s["tok"].items()
+                                        if decode[rid] or n == 1]) if chains else {}
+        for rid, n in s["tok"].items():
             before = computed.get(rid, 0)
-            # A decode step is a request past its prompt: 1 token, or 1 + drafts under speculative decoding (where
-            # only the emitted tokens, accepted drafts + 1, enter the KV cache; rejected drafts do not).
-            decode = before >= prompt.get(rid, 0) and emitted.get(rid, 0) >= 1 and (n == 1 or n <= 1 + MAX_DRAFTS)
-            seqs.append(SeqWork(num_new=n, num_computed_before=before, is_decode=decode or n == 1))
-            computed[rid] = before + (emitted[rid] if decode and n > 1 else n)
+            seqs.append(SeqWork(num_new=n, num_computed_before=before, is_decode=decode[rid] or n == 1,
+                                shared_kv=shared.get(rid, 0)))
+            computed[rid] = before + (emitted[rid] if decode[rid] and n > 1 else n)
         for rid in s["pre"]:
             computed[rid] = 0
         start = max(s["t"], prev_finish) if async_run and prev_finish is not None else s["t"]
@@ -61,9 +68,7 @@ def real_steps(events):
 
 
 def classify(shape: StepShape) -> str:
-    if shape.num_prefill == 0:
-        return "decode"
-    return "prefill" if shape.num_decode == 0 else "mixed"
+    return shape.step_class
 
 
 @dataclass
@@ -106,13 +111,16 @@ def make_pricer(model, hardware, fork, max_num_seqs, max_num_batched_tokens, max
     return cost, eng.core.model_executor.worker.cudagraph
 
 
-def price_steps(events, cost, disp) -> list[PricedStep]:
-    """Every step of a log, measured and priced. Called by: main, augur.verify.breakdown."""
+def price_steps(events, cost, disp, workload=None) -> list[PricedStep]:
+    """Every step of a log, measured and priced. ``workload``: the file the run was driven by, which lets a cost model
+    that prices shared KV blocks (``cost.prices_sharing``) see what requests had in common (augur.verify.prefix_share).
+    Called by: main, augur.verify.breakdown."""
     from vllm.config import CUDAGraphMode
 
     xfers = [u.get("xfer") or {} for _, u in steps(events)]  # same order as real_steps
     out = []
-    for (shape, measured), x in zip(real_steps(events), xfers):
+    chains = prompt_chains(workload) if workload and getattr(cost, "prices_sharing", False) else None
+    for (shape, measured), x in zip(real_steps(events, chains), xfers):
         uniform = all(x.num_new == 1 for x in shape.seqs)
         mode, desc = disp.dispatch(num_tokens=shape.total_tokens, uniform_decode=uniform)
         padded = StepShape(seqs=shape.seqs, padded_tokens=desc.num_tokens)
@@ -129,6 +137,9 @@ def main(argv=None) -> int:
     p.add_argument("--max-num-seqs", type=int, default=128)
     p.add_argument("--max-num-batched-tokens", type=int, default=2048)
     p.add_argument("--max-model-len", type=int, default=8192)
+    p.add_argument("--workload", default=None, help="the workload file the run was driven by: with it, requests that "
+                                                    "shared prompt blocks are priced as sharing them (a profile with "
+                                                    "a shared_kv model; see augur.verify.prefix_share)")
     p.add_argument("--csv", default=None, help="per-step rows: class, tokens, seqs, padded, measured, predicted, and the "
                                                "offload bytes loaded and stored by transfers reported in the step")
     p.add_argument("--cost", default="auto", choices=["auto", "roofline"],
@@ -145,7 +156,7 @@ def main(argv=None) -> int:
         return 2
     rows = [(classify(p.shape), p.shape.total_tokens, len(p.shape.seqs), p.shape.padded_tokens, p.graph,
              p.measured_ns, p.predicted_ns, p.xfer.get("load", [0])[0], p.xfer.get("store", [0])[0])
-            for p in price_steps(read_log(a.log), cost, disp)]
+            for p in price_steps(read_log(a.log), cost, disp, a.workload)]
 
     m = np.array([r[5] for r in rows], dtype=float)
     pr = np.array([r[6] for r in rows], dtype=float)
