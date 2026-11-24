@@ -54,6 +54,7 @@ class EngineSpec:
     spec_accept_rate: float = 0.0
     kv_offload_gib: float | None = None  # vLLM --kv-offloading-size: CPU tier for the KV cache (native connector)
     kv_offload_link: OffloadLink | None = None  # GPU <-> CPU transfer cost (required with kv_offload_gib)
+    kv_offload_extra: dict | None = None  # merged into the OffloadingConnector's kv_connector_extra_config (e.g. eviction_policy)
     kv_offload_tiers: tuple[TierSpec, ...] = ()  # secondary tiers behind the CPU one, in order (vLLM tiering)
     hbm_gb: float | None = None  # simulated GPU memory: unset batch limits are `vllm serve`'s for this GPU
     hardware: str = ""  # simulated GPU's name, which vLLM's batch defaults also look at
@@ -215,6 +216,7 @@ class SimEngine:
         if offload is not None:
             if spec.kv_events:
                 extra["self_describing_kv_events"] = True  # CPU-tier events carry every block hash
+            extra.update(spec.kv_offload_extra or {})
             offload["kv_connector_extra_config"] = extra
         # vLLM's real NIXL connector; only its scheduler half is built (our
         # executor stands in for the worker half and never loads NIXL).
@@ -233,6 +235,10 @@ class SimEngine:
             return KVTransferConfig(**offload)
         if nixl is not None:
             return KVTransferConfig(**nixl, engine_id=f"augur-{engine_id}")
+        if spec.kv_offload_gib and spec.kv_offload_extra:
+            # vLLM's --kv-offloading-size fills in the connector and its size; this adds to its extra config, as
+            # `--kv-transfer-config {"kv_connector_extra_config": ...}` does on a real server.
+            return KVTransferConfig(kv_connector_extra_config=dict(spec.kv_offload_extra))
         return None
 
     @property

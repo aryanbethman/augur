@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Real vLLM run with KV offload to CPU (GPU 0), then augur's checks against it.
-# usage: [ASYNC=1] [SKIP_REAL=1] [KV_GIB=N] [HOST_LOAD=N] [HOST_MEM_BG=GBPS] [AUGUR_VENV=.venv]
+# usage: [ASYNC=1] [SKIP_REAL=1] [OFFLOAD_GIB=16] [POLICY=NAME] [KV_GIB=N] [HOST_LOAD=N] [HOST_MEM_BG=GBPS] [AUGUR_VENV=.venv]
 #        [AUGUR_FORK=~/llmss-vllm-sim-20261114] scripts/real_offload_check.sh
 #   (~15 min of GPU per run; 16 GiB pinned host memory)
 #   KV_GIB: GPU KV cache of N GiB (--kv-cache-memory-bytes) instead of what 0.85 of the GPU leaves, so more prefix
 #   hits come back from the CPU tier and transfers overlap more. HOST_LOAD: N processes stream host memory during the
 #   real run (scripts/host_mem_load.py); HOST_MEM_BG: what augur's fabric takes as their share of host memory.
+#   OFFLOAD_GIB: the CPU tier's size (default 16). POLICY: its eviction policy, a name vLLM knows (lru, arc) or a class in
+#   POLICY_MODULE (default examples.kv_offload_policies, this checkout's plugin file); the real server and augur load
+#   the same file. Output goes to out/real/swe50_offload<GIB>[_<POLICY>].
 #   1. vllm serve Qwen3-1.7B, 16 GiB CPU tier, augur's logging scheduler (this checkout's hooks: they log offload jobs),
 #      the 50-session SWE-bench trace through augur.verify.client
 #   2. augur replay of that log: scheduling decisions must match step for step
@@ -14,7 +17,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 async=${ASYNC:-0}
-name=swe50_offload16; [ "$async" = 1 ] && name=${name}_async || true
+gib=${OFFLOAD_GIB:-16}
+name=swe50_offload$gib; [ -n "${POLICY:-}" ] && name=${name}_$POLICY || true; [ "$async" = 1 ] && name=${name}_async || true
 [ -n "${KV_GIB:-}" ] && name=${name}_kv${KV_GIB} || true
 [ "${HOST_LOAD:-0}" != 0 ] && name=${name}_load${HOST_LOAD} || true
 out=out/real/$name
@@ -24,13 +28,19 @@ W=${AUGUR_FORK:-$HOME/llmss-vllm-sim-20261114}/workloads/swe-bench-qwen3-30b-a3b
 P=$VENV/bin/python
 # PYTHONPATH: the server must import this checkout's augur.verify.hooks. PYTHONHASHSEED: augur pins 0; vLLM's
 # offload eviction order depends on it, so the real server must use the same.
+cfg=
+if [ -n "${POLICY:-}" ]; then  # the OffloadingConnector's kv_connector_extra_config: the same JSON for vllm serve and augur
+  case $POLICY in lru|arc) cfg="{\"eviction_policy\": \"$POLICY\"}";;
+    *) cfg="{\"eviction_policy\": \"$POLICY\", \"cache_policy_module_path\": \"${POLICY_MODULE:-examples.kv_offload_policies}\"}";; esac
+fi
 export CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 AUGUR_STEP_LOG=$out/steps PYTHONPATH=$PWD PYTHONHASHSEED=0
 if [ "${SKIP_REAL:-0}" != 1 ]; then  # SKIP_REAL=1: reuse the real run already in $out, redo only the checks
 if [ "$async" = 1 ]; then sched="--async-scheduling --scheduler-cls augur.verify.hooks.LoggingAsyncScheduler"
 else sched="--no-async-scheduling --scheduler-cls augur.verify.hooks.LoggingScheduler"; fi
 "$VENV/bin/vllm" serve Qwen/Qwen3-1.7B --port 8013 --seed 0 \
   --max-num-seqs 128 --max-num-batched-tokens 2048 --max-model-len 24576 --gpu-memory-utilization 0.85 \
-  --kv-offloading-size 16 --kv-offloading-backend native $sched \
+  --kv-offloading-size $gib --kv-offloading-backend native $sched \
+  ${cfg:+--kv-transfer-config "{\"kv_connector_extra_config\": $cfg}"} \
   ${KV_GIB:+--kv-cache-memory-bytes $((KV_GIB * 1073741824))} > "$out/server.log" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null; wait $srv 2>/dev/null || true' EXIT
@@ -52,16 +62,16 @@ uptime > "$out/uptime_end.txt"
 kill $srv; wait $srv 2>/dev/null || true; trap - EXIT
 fi
 
-rm -f $out/augur_replay.*.jsonl
+rm -f $out/augur_replay.*.jsonl $out/augur_norm.*.jsonl
 log=$(ls $out/steps.*.jsonl)
 blocks=$(( $(grep -oE "GPU KV cache size: [0-9,]+" $out/server.log | tail -1 | grep -oE "[0-9,]+$" | tr -d ,) / 16 ))
 if [ "$async" = 1 ]; then amode=--async-scheduling; else amode=--no-async-scheduling; fi
 common=(--model Qwen/Qwen3-1.7B --hardware RTX4060Ti --num-gpu-blocks $blocks --max-model-len 24576 --max-num-seqs 128
         --max-num-batched-tokens 2048 $amode --no-recorded-outputs --filler-vocab 150000 --workload "$W"
-        --kv-offload-gib 16 --quiet)
+        --kv-offload-gib $gib ${cfg:+--kv-offload-extra-config "$cfg"} --quiet)
 
 # 2. decisions
-$P -m augur.cli "${common[@]}" --replay-durations "$log" --step-log-vllm $out/augur_replay --output $out/augur_replay.csv
+$P -m augur.cli "${common[@]}" --replay-durations "$log" --replay-tokens $out/tokens.jsonl --step-log-vllm $out/augur_replay --output $out/augur_replay.csv
 $P -m augur.verify.replay compare "$log" $(ls $out/augur_replay.*.jsonl) | tee $out/replay_compare.json || echo "replay differs (see above)"
 
 # 3. bandwidth the real transfers achieved (bytes / GPU-timed seconds, per direction)
@@ -80,7 +90,7 @@ EOF
 echo "measured GPU<->CPU GB/s (slower direction): $gbps"
 
 # 4. end to end at that bandwidth
-$P -m augur.cli "${common[@]}" --kv-offload-gbps "$gbps" --output $out/augur.csv
+$P -m augur.cli "${common[@]}" --kv-offload-gbps "$gbps" --step-log-vllm $out/augur_norm --output $out/augur.csv > $out/augur.json
 
 # 5. end to end at the idle host's PCIe rates (12.7 GB/s H2D, 13.15 D2H; scripts/contention_bench.py), so any
 #    slowdown must come from the model: contention off (each transfer has the link to itself) and on (augur's fabric:
