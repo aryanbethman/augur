@@ -139,6 +139,7 @@ augur/
     astra.py           collectives and DP rounds through ASTRA-Sim
     profiles.py        which GPU profiles exist
   profile.py           `python -m augur.profile`: profile a GPU and model, convert, record provenance
+  profile_shared.py    measure and fit how decode attention speeds up when requests share KV blocks
   profiles/            shipped profiles: <hardware>/<org>--<model>/<dtype>-tp<N>.json.gz
   trace/               workloads in (fork JSONL), per-call results out (fork CSV)
   verify/              checking against real vLLM (table above)

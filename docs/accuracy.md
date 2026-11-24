@@ -105,6 +105,21 @@ worse than the profile: held-out totals between 0.56 and 1.15, because a
 workload's steps cover too little of the shape space to identify the terms.
 The layer profile stays.
 
+**Decodes that share KV blocks.** The profile times decode attention with every request on its own blocks. With
+prefix caching, requests in one batch read the same physical blocks, which then come from L2 rather than DRAM: on
+the partly-overlapping-prompt runs of section 5 the profile overpriced decode steps by 60% at the median (tenants;
+predicted / measured 1.44 overall), rising with the number of decodes and the shared fraction. Timing vLLM's paged
+decode kernel on GPU 0 with private and aliased blocks (`python -m augur.profile_shared measure`; 308 shots, cold
+L2 between layers, repeated within 0.2% on average) reproduces the profile with nothing shared and gives 0.44 of the
+private time for 64 decodes sharing 90% of 4,096 tokens. The decode part of attention is now scaled by
+min(1, (u³ + c(n)³)^(1/3)), u the distinct over total KV tokens of the step's decodes, c(n) 0.54 at 2 decodes to
+0.40 at 128 (fit rmse 0.025), from the block ids vLLM's KV manager assigns; it ships as a `shared_kv` entry with the
+shots in the profile, and unshared prices are unchanged. Fitted on the microbenchmark alone, it brings stepcheck's
+predicted / measured to 1.007 / 0.985 / 0.998 / 0.968 on the tenants, few-shot, RAG and agent runs (from 1.435 /
+1.145 / 1.136 / 1.057); ShareGPT moves by at most 0.002, SWE-bench and the benchmark run not at all. Measured on the
+RTX 4060 Ti (32 MB L2) with query length 1 only; prefill chunks are not discounted. Only a simulator that knows
+which blocks each request holds can price this.
+
 **vLLM's CPU time.** A synchronous step also holds vLLM's own work (schedule,
 process outputs): 1–3 ms longer than the profile's price at every batch size.
 `--step-cpu-us` adds it, default 2,000 (the best end-to-end fit on both sync
@@ -509,10 +524,9 @@ also re-shares previous outputs the trimmed rounds dropped, and schedules 784k t
 which takes block hashes, gets the sharing right and lands within 1% end to end, but still leaves vLLM's steps at
 step 156-351 (one admission or decode a step apart). Only the real scheduler on the real tokens reproduces every
 step. In each simulator's own run (augur's prices, augur's arrivals) BLIS is within 0-3% of augur's E2E mean on the
-three flat workloads (TTFT +5-9%) and +49% on the agent sessions. Against the real client all simulators are 15-85%
-slow here, augur included: the 4060 Ti profile overprices these long-context, nearly full-cache steps (stepcheck
-predicted / measured 1.44 on the tenants run, against 0.97 on ShareGPT), a gap shared by every simulator in this
-test because they all take augur's price.
+three flat workloads (TTFT +5-9%) and +49% on the agent sessions. These comparisons used augur's price before the
+shared-KV term of section 2, so against the real client every simulator was 15-85% slow here; with that term augur's
+own runs are within 1.2-5% of real mean latency (tenants +5.0%, few-shot +1.5%, RAG +3.5%, agent sessions +1.2%).
 
 ## 6. A KV offload policy written as a vLLM plugin
 

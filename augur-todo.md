@@ -118,10 +118,11 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     +11-27% E2E mean off (TTFT up to +1,101% on agent sessions) and keeps 3-59% of steps; Frontier, given block
     hashes, is within 1% but leaves vLLM's steps at 156-351. Open: workloads with many partly overlapping short
     prefixes (per-user prompts), which one length per group handles worst
-23. [ ] Profile gap at long context and full cache: on the tenants run stepcheck's predicted / measured is 1.44
-    (decode +60% median, mixed +29%) against 0.97 on ShareGPT, so augur's own runs there are 15-85% slow end to end.
-    Find which step shapes the 4060 Ti profile overprices (likely attention with long cached history at large
-    batch) and fix the profile or the lookup
+23. [x] Decodes that share KV blocks (d63658f; docs/accuracy.md section 2): the profile timed attention on private
+    blocks, but prefix-cached decodes read shared blocks from L2. A microbenchmark of vLLM's decode kernel gives a
+    sharing term (shipped as `shared_kv` in the 4060 Ti profile); stepcheck on the tenants run 1.435 → 1.007 and
+    augur's own runs on the overlap workloads +16-85% → +1.2-5% mean latency. Open: other GPUs (L2 size), query
+    length > 1, prefill chunks, shared generated text (prefix_share counts prompt blocks only)
 21. [x] Counterfactuals from one real run (ee6029d; docs/accuracy.md section 3): `python -m augur.verify.calibrate`
     fits one scale per step class on the real run, `--step-class-scales` applies it. On four held-out pairs (priority,
     KV cut to 520 / 1,550 blocks, prefix off) augur predicts the effect of the change within 0.5-5% (mean over 10
