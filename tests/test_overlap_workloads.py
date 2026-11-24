@@ -199,3 +199,73 @@ def test_best_encoding_writes_blis_csv_with_prefix_groups_and_split_sessions(tmp
     assert "accumulate" in open(tmp_path / "blis_replay.yaml").read()
     live = list(csv.DictReader(open(tmp_path / "blis.csv")))
     assert live[1]["think_time_us"] == "1018000" and live[2]["think_time_us"] == ""
+
+
+def trace_lines(n, sessions=False):
+    rng = random.Random(3)
+    flat = [{"input_toks": 50, "output_toks": 20, "arrival_time_ns": i * 10**8, "input_tok_ids": CHAT[i % len(CHAT)][:50],
+             "output_tok_ids": CHAT[i % len(CHAT)][50:70]} for i in range(n)]
+    if not sessions:
+        return flat
+    return [{"session_id": f"s{i}", "arrival_time_ns": int(i * 5e9 + rng.random() * 1e9),
+             "sub_requests": [{"input_toks": 50, "output_toks": 20, "tool_duration_ns": 10**9, "input_tok_ids": CHAT[i % len(CHAT)][:50]}]}
+            for i in range(n)]
+
+
+def test_heldout_workloads_are_seeded_and_stable():
+    lines = {"bursty": gen_h("bursty", n=60), "longctx": gen_h("longctx", n=20), "peruser": gen_h("peruser", n=80)}
+    assert {k: digest(v) for k, v in lines.items()} == HELDOUT_EXPECTED
+    for k, v in lines.items():
+        assert digest(gen_h(k, 0, len(v))) == digest(v) and digest(gen_h(k, 1, len(v))) != digest(v)
+
+
+HELDOUT_EXPECTED = {"bursty": "88be458a17972409", "longctx": "cfcc396a7cb258a1", "peruser": "591826a04f2b6027"}
+
+
+def gen_h(pattern, seed=0, n=None):
+    return ow.generate(pattern, seed, n, chat=CHAT, swe=SWE, src=trace_lines(60))
+
+
+def test_bursty_keeps_the_requests_and_draws_gamma_gaps_of_the_asked_rate_and_cv():
+    src = trace_lines(60)
+    out = ow.generate("bursty", 0, 60, 4.0, src=src)
+    assert [{k: v for k, v in d.items() if k != "arrival_time_ns"} for d in out] == \
+        [{k: v for k, v in d.items() if k != "arrival_time_ns"} for d in src]
+    t = [d["arrival_time_ns"] for d in out]
+    assert t == sorted(t)
+    big = ow.generate("bursty", 0, 20000, 4.0, src=trace_lines(20000))
+    t = [0] + [d["arrival_time_ns"] / 1e9 for d in big]
+    gaps = [b - a for a, b in zip(t, t[1:])]
+    mean = sum(gaps) / len(gaps)
+    cv = (sum((g - mean) ** 2 for g in gaps) / len(gaps)) ** 0.5 / mean
+    assert abs(1 / mean - 4.0) < 0.5 and abs(cv - ow.BURST_CV) < 0.4
+
+
+def test_longctx_prompts_are_12k_to_24k_and_share_no_prefix():
+    lines = ow.generate("longctx", 0, 30, chat=CHAT, swe=SWE)
+    lens = [d["input_toks"] for d in lines]
+    assert all(12000 <= n <= 23800 for n in lens) and len(set(lens)) > 20
+    assert all(d["input_toks"] + d["output_toks"] <= 24576 for d in lines)
+    assert max(lcp(a["input_tok_ids"], b["input_tok_ids"]) for i, a in enumerate(lines) for b in lines[i + 1:]) < 16
+
+
+def test_swefast_scales_session_arrivals_and_nothing_else():
+    src = trace_lines(30, sessions=True)
+    out = ow.generate("swefast", 0, 30, 1.0, src=src)  # 5x the trace's 0.2 sessions per second
+    for a, b in zip(src, out):
+        assert b["arrival_time_ns"] == int(a["arrival_time_ns"] / 5)
+        assert b["sub_requests"] == a["sub_requests"]
+    assert len(ow.generate("swefast", 0, 10, 0.4, src=src)) == 10
+
+
+def test_peruser_prompts_are_short_and_a_users_versions_agree_in_part():
+    prompts = flat_prompts(ow.generate("peruser", 0, 300, chat=CHAT, swe=SWE))
+    assert all(150 <= len(p) <= ow.PERUSER_MAX for p in prompts)
+    assert min(lcp(prompts[0], p) for p in prompts) >= 96  # the shared preamble
+    users = {}
+    for p in prompts:
+        users.setdefault(tuple(p[96:112]), []).append(p)
+    assert 10 < len(users) <= 60
+    # inside a user, pairs agree beyond the preamble: some share a whole prefix, some only the part the versions have in common
+    agree = [lcp(a, b) - 96 for g in users.values() for i, a in enumerate(g) for b in g[i + 1:]]
+    assert max(agree) > 150 and sum(0 < x < 150 for x in agree) > 0
