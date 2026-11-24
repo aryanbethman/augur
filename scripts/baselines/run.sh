@@ -11,6 +11,7 @@
 #          The workload's per-request "priority" goes to BLIS (blis_priority.patch, built into
 #          inference-sim-prio/blis-ext-prio) and Frontier; Vidur has none, so it is not run. Prefix caching off:
 #          BLIS and Frontier switch it off, Vidur has none.
+#          PRICER_ARGS='--step-class-scales scales.json' gives BLIS's pricer a calibration (augur.verify.calibrate).
 #   STAGE  prepare augur blis frontier vidur replay compare   (default: all of them; frontier and vidur only for runs
 #          they can take: they have no async scheduling, speculative decoding or KV offload, so those are skipped
 #          unless a stage is named: run.sh bench_r6 prepare augur blis frontier vidur compare)
@@ -115,7 +116,7 @@ blis() {
   # Qwen3-1.7B's block (28 layers x 2 x 8 KV heads x 128 x 2 bytes x 16 tokens)
   [ -n "$(get kv_offloading_gib)" ] && export BLIS_OFFLOAD_GBPS=12.7 BLIS_OFFLOAD_BLOCK_BYTES=1835008
   rm -f $O/blis_steps$V.jsonl
-  BLIS_PRICER_CMD="env PYTHONPATH=$W VLLM_LOGGING_LEVEL=ERROR $PY $S/pricer.py serve --max-model-len $mml $PX" \
+  BLIS_PRICER_CMD="env PYTHONPATH=$W VLLM_LOGGING_LEVEL=ERROR $PY $S/pricer.py serve --max-model-len $mml $PX ${PRICER_ARGS:-}" \
   BLIS_NUM_GPU_BLOCKS=$(get num_gpu_blocks) BLIS_STEP_LOG=$O/blis_steps$V.jsonl \
     $bin replay --scenarios $O/scen --scenario scenario.yaml --trace-header $O/blis$V.yaml \
       --trace-data $O/blis$V.csv $flags --output $O/blis_result$V.json > $O/blis$V.log 2>&1

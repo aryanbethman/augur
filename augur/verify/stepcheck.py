@@ -61,9 +61,7 @@ def real_steps(events):
 
 
 def classify(shape: StepShape) -> str:
-    if shape.num_prefill == 0:
-        return "decode"
-    return "prefill" if shape.num_decode == 0 else "mixed"
+    return shape.step_class
 
 
 @dataclass

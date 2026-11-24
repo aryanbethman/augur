@@ -98,6 +98,7 @@ class SimContext:
     cpu_per_request_ns: int = 0
     last_cpu_ns: int = 0
     step_time_scale: float = 1.0  # multiplies the cost model's GPU time, not the CPU time
+    class_scales: dict = field(default_factory=dict)  # per step class (augur.cost.STEP_CLASSES), on top of step_time_scale
     # KV offload to CPU (augur.sim.offload.SimOffloadWorker): set by the
     # coordinator before each step, the virtual time of this execute_model
     # call and when the GPU work queued before it is done.
@@ -406,6 +407,8 @@ class SimWorker:
                 gpu += self.ctx.drafter.step_ns(shape, len(drafts_next))
             if self.ctx.step_time_scale != 1.0:
                 gpu = round(gpu * self.ctx.step_time_scale)
+            if self.ctx.class_scales:
+                gpu = round(gpu * self.ctx.class_scales.get(shape.step_class, 1.0))
             if self.ctx.spec_ns_per_request and not hasattr(self.ctx.cost, "durations"):
                 gpu += self.ctx.spec_ns_per_request * sum(1 for x in seqs if x.is_decode and x.num_new > 1)
             if self.ctx.net is not None and not hasattr(self.ctx.cost, "durations"):
