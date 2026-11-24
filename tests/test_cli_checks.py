@@ -107,6 +107,15 @@ def test_kv_size_follows_the_hardware_and_matches_real_vllm_runs(workload):
     assert 84_704 <= tokens <= 87_680 and err.count("estimated") == 1
 
 
+def test_ngram_runs_keep_the_kv_cache_real_ngram_runs_kept(workload):
+    # Real vLLM 0.33 ngram runs (k=3) on the same GPU and flags: "GPU KV cache size" 81,104-86,400 tokens, their
+    # reserve 0.13 GiB above plain runs' (2026-11-24; before, augur gave them a plain run's KV cache).
+    plain, _ = _kv_run(workload, "--hardware", "RTX4060Ti")
+    ngram, _ = _kv_run(workload, "--hardware", "RTX4060Ti", "--num-speculative-tokens", "3")
+    assert 81_104 <= ngram <= 86_400
+    assert 0.12 * 2**30 // 1_835_008 * 16 < plain - ngram < 0.14 * 2**30 // 1_835_008 * 16  # 0.13 GiB, 1.75 MiB/block
+
+
 def test_hbm_gb_overrides_the_hardware_preset_and_unknown_hardware_needs_it(workload, capsys):
     small, _ = _kv_run(workload, "--hardware", "RTX4060Ti", "--hbm-gb", "10")
     assert small < 45_000  # 10 GiB: ~4.4 GiB of KV

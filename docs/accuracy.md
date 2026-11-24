@@ -75,9 +75,13 @@ runs, shipped with the 4060 Ti profile). Against vLLM's "GPU KV cache size" in
 those seven runs (85,552 tokens for all of them in augur): −2.4% to +1.0%. vLLM's
 own reserve moved 0.65-0.97 GiB from run to run, worth about 3.5% of the cache.
 With no measured reserve, augur's estimate from the model shape gives −0.2% to
-+3.3%. Weights: 3.20 GiB estimated, 3.22 GiB loaded. Not modeled: the larger
-reserve of ngram runs (0.79-1.36 GiB), so augur's cache is up to 5.5% larger
-there.
++3.3%. Weights: 3.20 GiB estimated, 3.22 GiB loaded. Speculative runs keep
+more: in the four real ngram runs (k=3) peak activation is 0.13 GiB above that
+of the plain runs in the same memory mode (0.63 against 0.50 GiB, 0.95 against
+0.82), the sampler's logits for the draft positions. augur adds 2.4 bytes per
+draft logit (max_num_seqs x k x vocabulary; 0.13 GiB here) to the measured or
+estimated reserve (since 2026-11-24), which puts its ngram cache at 84,320
+tokens against the real runs' 81,104-86,400. One model and one k.
 
 ## 2. Step times: the profile
 
@@ -146,8 +150,17 @@ attention and elementwise tables are not usable) but 13 / 47 / 26% for decode / 
 Ti, whose GEMMs reach 97% of datasheet peak against 77-80% elsewhere, which no shared efficiency captures. End to
 end on the real 4060 Ti runs with it held out: mean TTFT / TPOT / latency +27 / +22 / +25% (ShareGPT sync), +42 /
 +29 / +37% (SWE-bench), and +268% mean TTFT at the 6 req/s knee, where slow steps grow the queue. The breakdown
-puts that error in step time (decisions within 2.3%), so comparisons that turn on scheduling hold under it. One
-measured GEMM rate and decode step for a new GPU (`--roofline-params FILE`) should cut the error most; untested.
+puts that error in step time (decisions within 2.3%), so comparisons that turn on scheduling hold under it.
+
+One-point calibration for a new GPU (`python -m augur.cost.roofline_fit onepoint`, since 2026-11-24): time one decode
+step (32 requests at 1,024 tokens of context) and one 1,024-token prefill chunk on it; their ratios to the roofline
+are the decode and prefill scales of `--step-class-scales`, mixed steps taking the geometric mean. Checked on the
+shipped profiles with each GPU held out of the fit (`roofline_fit onepoint-check`), median step error over the 8
+profiles goes from 7.8 / 8.5 / 11.9% to 2.7 / 5.8 / 9.6% (decode / prefill / mixed); on the RTX 4060 Ti from
+13.1 / 46.8 / 26.4% to 5.1 / 2.5 / 10.0%. It does not help everywhere: mixed steps of the RTX PRO 6000's
+Qwen3-30B-A3B at TP2 go from 4.3% to 16.6%, as the decode and prefill scales differ there (0.71, 0.98).
+Sliding-window layers (Mistral, Qwen2 past `max_window_layers`, `sliding_attention` in `layer_types`) are priced
+over the window only; a config with a window but no layer layout is refused.
 
 ## 3. End to end
 
@@ -311,7 +324,20 @@ predicted / measured:
 | Short per-user prompts (60 users, partly shared prefixes, 5 req/s), sync | +23.0 / +7.9 / +8.1% | 0.959 |
 
 On the per-user run the GPU price is close but the fixed 2 ms CPU term overprices its short (~19 ms) decode steps;
-the same workload at 10 req/s, where the engine never idles, is +6.4 / +1.9 / +2.0%. Making the bursty run replay
+the same workload at 10 req/s, where the engine never idles, is +6.4 / +1.9 / +2.0%. With the 1.3 ms term (since
+2026-11-24) the per-user run is +20.4 / +3.2 / +3.4%. Why (2026-11-24, from its logs): vLLM's CPU time per step there
+is 0.69 ms (median, steps less the profile's price; 1.4-1.9 ms on ShareGPT, SWE-bench and the long prompts), and the
+engine is busy 99.7% of the time, so the term's 0.6 ms on 19 ms steps is a 3% throughput loss. At the run's own 0.69
+ms TPOT and latency come to −1.0 / −0.8%, but TTFT stays +16%. No per-step form fits every run better than the
+constant: with each run held out, a term per ms of GPU time gives mean / worst step-time error 1.8 / 4.5% across the
+15 sync runs, and a term proportional to GPU time alone 2.5 / 6.1%, against 1.3 / 3.4% for the constant. The rest of
+the TTFT gap is outside the engine. The engine takes a request only between steps (its log's add is 0.01 ms before
+the next schedule), so the real time from send to add holds the wait for the step in flight: 14.9 ms mean, spread
+over a step (p10 6.2, p90 22.4 ms), while delivery from the logged first token to the client is about 0 ms. augur
+simulates that wait in its engine and also adds its front end (3.4 ms + 3 us per token) and 8 ms of delivery, which
+was measured on an async run, where tokens leave the engine only after the next launch. Half a step (~7-10 ms of a
+44 ms TTFT) is counted twice. A delivery default per scheduling mode would fix it; it needs checking on every sync
+and async run first. Long-TTFT runs do not show it (it is under 1% of their TTFT). Making the bursty run replay
 exactly needed a fix: after a launch that stalled the real engine's loop, replay now waits for the next logged
 schedule.
 
@@ -385,7 +411,11 @@ runs falls to +0.1 / +0.2 / +0.1% (sync) and +0.6 / +0.3 / +0.4% (async) of
 mean TTFT / TPOT / latency (from +9.2 / +2.3 / +6.4% and +12.9 / +3.4 / +8.8%
 with the rate), every p50/p90/p99 within ±1.5%, and the error left is step
 time: mean latency −7.6% (sync) and −3.7% (async). The rate-based totals were
-closer only because the two errors cancelled. In the offload
+closer only because the two errors cancelled. Since 2026-11-24 `--spec-us-per-request` is 180 us, not 100 (the two
+runs' verification steps fit 213 sync, 144 async; each fit applied to the other run leaves −5.2 / +3.1% of step
+time): step time is −3.1% (sync) and +1.2% (async) of mean latency, and the totals are −2.7 / −3.5 / −3.1% and
++2.2 / +1.1 / +1.7% mean TTFT / TPOT / latency. What is left grows with context, which points at the q=4 attention
+table. In the offload
 runs, transfer stalls are not re-timed, so they count under decisions.
 On the five runs at the end of the section 1 table (KV cut down, priority, prefix caching off), decisions stay
 within ±1.3% of every mean and step time carries the error: mean latency +5.1 / +1.2% with 520 KV blocks (sync /
@@ -598,7 +628,8 @@ requests at 10 req/s, 89 s simulated):
 | 16 (4 × TP4) | 10.6 s, 1.2 GB | 27 s | 8 min 06 s |
 | 256 (64 × TP4) | 20 s, 1.5 GB | 44 s | 2 h 11 min |
 
-Both simulators agree on this run (TPOT 750/750 identical at 256).
+Both simulators agree on this run (TPOT 750/750 identical at 256; rechecked 2026-11-24 with the per-hardware
+memory and estimated reserve defaults, 21 s; it needs the run's cluster config, without which TPOT is 2x).
 LLMServingSim runs every step through ASTRA-Sim. augur prices the collectives
 of a dense model on one node itself (a closed form of ASTRA-Sim's ring
 all-reduce and all-gather, identical to the binary to the ns on every tested
@@ -649,7 +680,8 @@ BLIS is 3-13x faster at 16-256 GPUs and 2.2-3.2x at 1,024, where it needs up to 
 to vLLM's own scheduler and KV manager (~60% of the event loop at 256 GPUs on ShareGPT; the table pricer 5-15%;
 on SWE-bench also building the filler prompt ids of long prompts). 1,024 GPUs take 5.7 min (ShareGPT) and 10 min
 (SWE-bench) of wall time. Given augur's price through a pipe, BLIS's scheduler costs 1.2-2.2x less CPU than augur.
-The pipe rows used a BLIS build with one shared pricer process that is not in the repo yet.
+The pipe rows used a BLIS build with one shared pricer process whose source is not in the repo, and no longer on
+the test host either (only its binary): those rows cannot be rebuilt from the repo until that patch is recovered.
 
 ## Modeled, not yet checked against real vLLM
 

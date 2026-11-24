@@ -47,7 +47,7 @@ class Pricer:
 
     def __init__(self, hardware: str = "RTX4060Ti", model: str = "Qwen/Qwen3-1.7B", max_num_seqs: int = 128,
                  max_num_batched_tokens: int = 2048, max_model_len: int = 8192, step_cpu_us: float = 2000.0,
-                 step_cpu_per_request_us: float = 0.0, spec_us_per_request: float = 100.0,
+                 step_cpu_per_request_us: float = 0.0, spec_us_per_request: float = 180.0,
                  fork: str | None = None, class_scales: dict | None = None) -> None:
         from augur.cost.profiles import default_fork
         from augur.cost.tables import bundled_profile
@@ -115,7 +115,7 @@ def _add_args(p) -> None:
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--step-cpu-us", type=float, default=2000.0)
     p.add_argument("--step-cpu-per-request-us", type=float, default=0.0)
-    p.add_argument("--spec-us-per-request", type=float, default=100.0)
+    p.add_argument("--spec-us-per-request", type=float, default=180.0)  # augur.cli's default
     p.add_argument("--step-class-scales", default=None, help="augur --step-class-scales: a calibrate.py JSON or decode=1.01,...")
 
 

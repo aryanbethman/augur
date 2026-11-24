@@ -17,6 +17,10 @@ audit fixes (2026-11-18), --profile-variant (2026-11-19).
 
 Contention-aware co-simulation (design doc) is merged (2026-11-21), off by default (`--contention on`).
 
+2026-11-24 (branch feature/leftovers-20261124): ngram reserve and verification price, sliding-window roofline,
+one-point roofline calibration, filler ids drawn 6x faster (same ids), per-user TTFT explained, async DP analysed (not fixed),
+shared generated text checked, 256-GPU LLMServingSim match rechecked; audit nice-to-haves.
+
 2026-11-23 (branch feature/next-features-20261123): RTX 4060 Ti profile with q=1,2,4 attention (fork e8625e0, not
 pushed); MoE TP4 and DP2 + EP2 on the tables; contention checked against two real offload runs and
 --hbm-interference refitted (decode 1.1, prefill 0.1); exact replay of the sync 4 GiB-KV offload run.
@@ -42,14 +46,26 @@ Fixes
 1. [x] KV size (c7ab353): GPU_FACTS in cost/tables.py gives each --hardware its memory (--hbm-gb overrides); the
    reserve is vLLM 0.33's (non-torch + peak activation, which holds the CUDA-graph estimate) from the profile's
    measured vllm_memory, else estimated from the model shape with a warning. Against the 7 real 4060 Ti logs:
-   −2.4% to +1.0% (estimate: −0.2% to +3.3%). Open: the H100 and RTX PRO 6000 totals are from public logs, not
-   measured here; ngram runs' larger reserve (0.79-1.36 GiB) is not modeled
+   −2.4% to +1.0% (estimate: −0.2% to +3.3%). Speculative runs: +2.4 bytes per draft logit (max_num_seqs x k x
+   vocabulary; 0.13 GiB at k=3, fitted on the 4 real ngram runs' peak activation against plain runs, 2026-11-24).
+   Open: the H100 and RTX PRO 6000 totals are from public logs, not measured here; the speculative term is one
+   model and one k
 2. [x] Flags (2a0dc58): --scheduler-cls (wrapped so --step-log-vllm still logs), --scheduling-policy priority with a
    per-request "priority" in workloads (the client sends it when non-zero; untested against a real server),
    --kv-cache-dtype fp8 (block count doubles; prices stay bf16, warned)
 3. [x] Real DP runs replayable (44ded75): the logging scheduler records DP rounds and dummy forwards; replay holds a
-   call until its logged round (sync); --replay-tokens takes a real run's output tokens. Open: real async DP MoE
-   replay differs from the first step (the async DP path still places arrivals by time)
+   call until its logged round (sync); --replay-tokens takes a real run's output tokens. Sync rechecked 2026-11-24:
+   1,919/1,919 and 2,151/2,151.
+   [ ] Async DP (analysed 2026-11-24, not fixed): it is not arrival placement. vLLM 0.33's DP loop with async
+   scheduling (DPEngineCoreProc.run_busy_loop, step_with_batch_queue, batch queue of 2) runs per rank: take inputs,
+   schedule k_i and launch it, block on k_(i-1), whose output resolves only when forward i ends (in both real rank
+   logs every upd of k_i lands at the end of the round that runs k_(i+1)); a rank that ran nothing runs a dummy
+   forward synchronously; a CPU sync of all ranks at step 1 and every dp_sync_interval steps; forward j of every
+   rank pairs into round j (EP collectives), and the ranks' iterations drift apart in between. So each iteration
+   lasts a forward and the next batch is scheduled after it: scheduling is not hidden. augur's async DP path
+   (Coordinator._dpa_*) schedules the next batch at once, as single-engine async does, so replay differs at step 1
+   (370/1,985 and 462/2,187 steps) and augur's normal async DP runs hide CPU time the real loop pays. Fix: model
+   that loop in _dpa_*; then the async DP tests' "hides CPU time" expectation changes
 
 Additions
 4. [x] Same-step-time test (scripts/baselines/, 9c9ab90 + 78250e4; docs/accuracy.md section 5): BLIS lands within
@@ -63,10 +79,11 @@ Additions
 7. [x] KV cache spec from vLLM's own model definition (cbcfdac, 0b7002e): augur/sim/kvspec.py builds the model on the
    meta device and asks its layers, as GPUModelRunner does; cached per process (~1 s once, for vLLM's kernel
    imports). Sliding window (Mistral-7B), MLA (DeepSeek-V2-Lite), hybrid Mamba (granite-4.0-h-micro) and mixed
-   sliding/full (Olmo-3-7B) build vLLM's specs and replay their own logs exactly (--cost fixed). Open: pricing for
-   them (sliding-window attention priced at full context, no MLA or Mamba kernels in the tables, weight and reserve
-   estimates ignore MLA and hybrid layers, hybrid offload bytes per block overstated); a real decision check on a
-   small sliding-window model needs its weights (a download)
+   sliding/full (Olmo-3-7B) build vLLM's specs and replay their own logs exactly (--cost fixed). Sliding-window
+   layers are priced over the window under --cost roofline, the only pricer that has such models (2026-11-24;
+   Mistral, Qwen2 past max_window_layers, layer_types; a window with no layer layout is refused). Open: no MLA or
+   Mamba kernels in the tables or the roofline, weight and reserve estimates ignore MLA and hybrid layers, hybrid
+   offload bytes per block overstated; a real decision check on a small sliding-window model needs its weights
 8. [ ] Pipeline parallelism; EAGLE with DP; MoE MTP pricing. Next-features 2 and 4
 9. [ ] Packaging: Dockerfile, fork and ASTRA-Sim setup script, CI for the tests that need no fork, LICENSE.
    Next-features 6
@@ -103,8 +120,11 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     them; drafts are the V2 runner's (numpy mirror of its Triton n-gram kernels, tested against the kernels in
     Triton's CPU interpreter), verified greedily. Accepted counts match the real logs on every request-step (88,640
     sync, 88,562 async; the CPU NgramProposer 89%); the decisions part of the ngram runs fell from +6-9% to +0.1-0.6%
-    of mean latency. Left: the verification steps' price (step time −7.6% sync, −3.7% async); only ngram k=3 on
-    ShareGPT checked against real logs
+    of mean latency. Verification price (2026-11-24): --spec-us-per-request 100 -> 180 us; the GPU 0 runs' steps fit
+    213 (sync) and 144 (async), step totals −7.5 / −3.4% -> −3.2 / +1.2% (each run's own fit applied to the other:
+    −5.2 / +3.1%). Not the CUDA-graph padding: pricing with the speculative dispatcher moves totals 0.2%. Left: the
+    residual grows with context (~0.2 us per context token of the step's decodes), so the q=4 attention table looks
+    low; stepcheck builds its dispatcher without the speculative config (0.2%); only ngram k=3 on ShareGPT checked
 17. [x] Plugin case study (50ec0bf; docs/accuracy.md section 6): two CPU-tier eviction policies in
     examples/kv_offload_policies.py, loaded unchanged by vLLM 0.33 and augur. Real runs replay exactly; augur within 2%
     of real mean TTFT and the same ranking as the real runs (ToolWait > ReuseFrequency > LRU ≈ ARC); same order at
@@ -122,12 +142,19 @@ against ports, decided after the heavy-preemption runs (plan item 13).
 23. [x] Decodes that share KV blocks (d63658f; docs/accuracy.md section 2): the profile timed attention on private
     blocks, but prefix-cached decodes read shared blocks from L2. A microbenchmark of vLLM's decode kernel gives a
     sharing term (shipped as `shared_kv` in the 4060 Ti profile); stepcheck on the tenants run 1.435 → 1.007 and
-    augur's own runs on the overlap workloads +16-85% → +1.2-5% mean latency. Open: other GPUs (L2 size), query
-    length > 1, prefill chunks, shared generated text (prefix_share counts prompt blocks only)
+    augur's own runs on the overlap workloads +16-85% → +1.2-5% mean latency. Shared generated text checked
+    (2026-11-24, scripts/prefix_share_check.py): the prompt-only rebuild equals vLLM's block ids in every step of the
+    stress run (31,931 steps, 225 preemptions) and the agent sessions (5,560); vLLM shares a block only through a
+    later request's prefix lookup, so text generated side by side is never shared. Open: other GPUs (L2 size), query
+    length > 1, prefill chunks
 24. [x] Per-step CPU time (a58d108; docs/accuracy.md section 2): no batch term generalizes across 15 sync runs (a
     run-level offset of 0.7-2.2 ms dominates); the constant refitted, --step-cpu-us 2000 → 1300, mean step-time error
-    2.1 → 1.3%, end-to-end latency 2.5 → 1.7%. Open: the per-user run's TTFT (+20%); breakdown's step/decision split
-    is not meaningful on always-busy runs (per-user, bursty)
+    2.1 → 1.3%, end-to-end latency 2.5 → 1.7%. Per-user TTFT +20% explained (2026-11-24, docs/accuracy.md section 3):
+    its CPU time is 0.69 ms a step (TPOT / latency −1.0 / −0.8% at that value; no per-step form beats the constant
+    held out), and the TTFT left (+16%) is the wait for the step in flight counted twice: augur simulates it and its
+    8 ms delivery default, measured on an async run, holds it too (real sync delivery ~0 ms). Open: a delivery
+    default per scheduling mode, checked on every sync and async run; breakdown's step/decision split is not
+    meaningful on always-busy runs (per-user, bursty)
 21. [x] Counterfactuals from one real run (ee6029d; docs/accuracy.md section 3): `python -m augur.verify.calibrate`
     fits one scale per step class on the real run, `--step-class-scales` applies it. On four held-out pairs (priority,
     KV cut to 520 / 1,550 blocks, prefix off) augur predicts the effect of the change within 0.5-5% (mean over 10
@@ -135,9 +162,13 @@ against ports, decided after the heavy-preemption runs (plan item 13).
 22. [~] Where BLIS is ahead. Done: `--cost roofline` (7ebce16; docs/accuracy.md section 2), a coarse fallback for
     unprofiled GPUs (held-out 4060 Ti: +22-42% end to end; 3-13% median decode step error on the PRO 6000 and H100).
     Speed against BLIS (a472238; docs/accuracy.md section 7): BLIS 3-13x less CPU at 16-256 GPUs, 2.2-3.2x at 1,024,
-    where augur needs up to 8x less memory; augur's time is vLLM's own scheduler and KV manager. Left: a one-point
-    calibration for a new GPU; the shared-pricer BLIS patch into scripts/baselines; filler-id construction on long
-    prompts (15% of the SWE-bench event loop) is an easy speed-up
+    where augur needs up to 8x less memory; augur's time is vLLM's own scheduler and KV manager. Done 2026-11-24:
+    one-point calibration (`roofline_fit onepoint`; held out per GPU, median step error 7.8 / 8.5 / 11.9% ->
+    2.7 / 5.8 / 9.6% decode / prefill / mixed); in-vocabulary filler ids drawn in bulk, the same ids, 6x faster
+    to draw (speed.py's 16-GPU SWE-bench run: 10.9 -> 10.7 s wall, same output; 256-1,024 GPUs not rerun).
+    Left: the shared-pricer BLIS build (~/speedrun/blis-ext-count, BLIS_STEP_COUNT_FILE) has no source on anjuna3
+    any more, only the binary: recover the patch from where it was built or rewrite it, else the docs' pipe rows
+    cannot be rebuilt from the repo
 
 Done 2026-11-23: contention checked against real contended runs (K refitted), q=1,2,4 shipped profile, MoE TP4 and
 DP2 + EP2 on the tables, the sync offload replay difference fixed.
@@ -336,7 +367,10 @@ DP2 + EP2 on the tables, the sync offload replay difference fixed.
 - [x] Repo restructured by role (sim/ cost/ trace/ verify/), pytest tests, docs/accuracy.md (960750c);
       ngram self-test found + fixed a replay preemption bug (52e39e0)
 - [x] LLMServingSim comparison is a pytest test with its reference data in the repo (ccae81a); 23 tests pass from a fresh clone
-- [x] LLMServingSim 256-GPU run on the current branch: matches augur; 2h11m vs 44 s
+- [x] LLMServingSim 256-GPU run on the current branch: matches augur; 2h11m vs 44 s. Rechecked 2026-11-24 with the
+      new KV defaults (--hbm-gb per hardware, estimated reserve) and the table pricer: TPOT 750/750, mean TTFT and
+      latency equal, 21 s. It needs the run's cluster config (out/lss/llama70b_h100_tp4_1inst.json): without it
+      TPOT is 2x
 - [x] LLMServingSim template store bounded (fork 879b69d); identical output at 16 NPUs
 - [x] 51.6 GB peak RSS at 256 NPUs: that was LLMServingSim's; augur is 1.5 GB at 256 GPUs (2026-11-21)
 - [x] ASTRA-Sim determinism (2026-11-21, 825d797): ASTRA-Sim writes ./tmp__mem/remote_mem.json in its cwd, which was

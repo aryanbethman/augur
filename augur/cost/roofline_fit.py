@@ -2,6 +2,13 @@
 
     python -m augur.cost.roofline_fit fit [--exclude HARDWARE_OR_PROFILE ...] [--out params.json]
     python -m augur.cost.roofline_fit loo [--by profile|gpu]
+    python -m augur.cost.roofline_fit onepoint --model M --hardware H --decode-ms D --prefill-ms P [--out scales.json]
+    python -m augur.cost.roofline_fit onepoint-check
+
+``onepoint`` calibrates the roofline for a new GPU from two timed steps (``ONE_POINT``: 32 decodes at 1,024 tokens of
+context, and one 1,024-token prefill chunk): the measured / predicted ratios are the decode and prefill scales of
+``--step-class-scales`` (mixed steps take their geometric mean).  ``onepoint-check`` tests that on the shipped profiles:
+each GPU held out of the fit, calibrated on its two reference steps, priced over the whole grid.
 
 The data are the profiles' own tables evaluated by ``TableCost`` on a grid of step shapes (decode batches of 1-128
 requests at 64-2048 tokens of context; single and double prefill chunks of 16-2048 tokens over 0-1024 of history;
@@ -70,6 +77,17 @@ def shapes() -> list[tuple[str, StepShape]]:
     return out
 
 
+# The two steps a one-point calibration times on a new GPU.
+ONE_POINT = {"decode": StepShape(tuple(SeqWork(1, 1024, True) for _ in range(32))),
+             "prefill": StepShape((SeqWork(1024, 0, False),))}
+
+
+def one_point_scales(measured_ns: dict, predicted_ns: dict) -> dict:
+    """--step-class-scales from the ``ONE_POINT`` steps' measured and roofline times (ns, by class). Pure."""
+    d, p = (measured_ns[c] / predicted_ns[c] for c in ("decode", "prefill"))
+    return {"decode": d, "prefill": p, "mixed": float(np.sqrt(d * p))}
+
+
 @dataclass
 class Profile:
     name: str
@@ -82,6 +100,7 @@ class Profile:
     feats: dict  # tokens, rows, pairs, kv, new, seqs: arrays over shapes
     measured: dict  # op -> time of one occurrence, array over shapes (ops we can compare only)
     counts: dict
+    shapes: list  # the grid's shapes inside the profile's range, in the order of ``classes``
 
     def predict(self, prm: RooflineParams) -> dict:
         f = self.feats
@@ -122,7 +141,8 @@ def load_profiles() -> list[Profile]:
         flops, bw = gpu_peaks(hw)
         short = model.split("/")[-1]
         out.append(Profile(f"{hw} {short} tp{tp}", hw, tp, arch, flops, bw, np.array([c for c, _ in keep]), feats,
-                           {n: np.array(measured[n], dtype=float) for n in names}, {n: counts[n] for n in names}))
+                           {n: np.array(measured[n], dtype=float) for n in names}, {n: counts[n] for n in names},
+                           [s for _, s in keep]))
     return out
 
 
@@ -201,6 +221,23 @@ def print_loo(profiles: list[Profile], by: str) -> None:
         print(f"  {k:<18} %5.1f / %5.1f (%+5.1f)" % summary(np.concatenate(v)))
 
 
+def print_one_point_check(profiles: list[Profile]) -> None:
+    """Each GPU held out of the fit, its step error over the grid before and after a one-point calibration."""
+    print("one-point calibration, each GPU held out of the fit: |predicted / measured - 1| in %, median / p90 "
+          "(signed median), before -> after")
+    print(f"{'held out':<36} {'scales (decode, prefill, mixed)':<26} {'decode':<34} {'prefill':<34} {'mixed':<34}")
+    for name, prm, p in loo(profiles, "gpu"):
+        step = errors(p, prm)["step"] + 1  # predicted / measured
+        at = {c: p.shapes.index(ONE_POINT[c]) for c in ONE_POINT}
+        scales = one_point_scales({c: 1.0 for c in at}, {c: step[i] for c, i in at.items()})
+        after = step * np.array([scales[c] for c in p.classes]) - 1
+        cells = []
+        for cls in ("decode", "prefill", "mixed"):
+            m = p.classes == cls
+            cells.append("%4.1f/%5.1f(%+5.1f) -> %4.1f/%4.1f(%+4.1f)" % (*summary(step[m] - 1), *summary(after[m])))
+        print(f"{name:<36} {'%.2f, %.2f, %.2f' % tuple(scales.values()):<26} " + " ".join(cells))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="augur.cost.roofline_fit", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -209,8 +246,37 @@ def main(argv=None) -> int:
     f.add_argument("--out", default=None, help="write the parameters here (JSON, for augur --roofline-params)")
     l = sub.add_parser("loo")
     l.add_argument("--by", choices=["profile", "gpu"], default="profile")
+    o = sub.add_parser("onepoint", help="--step-class-scales for a new GPU from two timed steps (ONE_POINT)")
+    o.add_argument("--model-config", required=True, help="the model's config.json")
+    o.add_argument("--hardware", required=True)
+    o.add_argument("--decode-ms", type=float, required=True, help="GPU time of 32 decodes at 1,024 tokens of context")
+    o.add_argument("--prefill-ms", type=float, required=True, help="GPU time of one 1,024-token prefill chunk")
+    o.add_argument("--tp", type=int, default=1)
+    o.add_argument("--params", default=None, help="roofline parameters JSON (default: the fitted ones)")
+    o.add_argument("--peak-tflops", type=float, default=None)
+    o.add_argument("--npu-mem-bw", type=float, default=None)
+    o.add_argument("--out", default=None, help="write the scales here (JSON, for augur --step-class-scales)")
+    sub.add_parser("onepoint-check")
     a = ap.parse_args(argv)
+    if a.cmd == "onepoint":
+        from augur.cost.roofline import RooflineCost
+        params = DEFAULT_PARAMS
+        if a.params:
+            with open(a.params, encoding="utf-8") as fh:
+                params = RooflineParams.from_json(json.load(fh))
+        cost = RooflineCost(a.model_config, a.hardware, a.tp, params, a.peak_tflops, npu_mem_bw=a.npu_mem_bw)
+        scales = one_point_scales({"decode": a.decode_ms * 1e6, "prefill": a.prefill_ms * 1e6},
+                                  {c: cost.step_ns(s) for c, s in ONE_POINT.items()})
+        text = json.dumps({"scales": scales}, indent=1)
+        print(text)
+        if a.out:
+            with open(a.out, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        return 0
     profiles = load_profiles()
+    if a.cmd == "onepoint-check":
+        print_one_point_check(profiles)
+        return 0
     if a.cmd == "loo":
         print_loo(profiles, a.by)
         return 0

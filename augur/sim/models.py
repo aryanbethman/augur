@@ -111,3 +111,19 @@ def estimate_reserve_bytes(config_json: str, max_num_batched_tokens: int, max_nu
     forward = 2 * max_num_batched_tokens * (2 * inter // tp + 2 * h)
     sampler = _SAMPLER_FP32_COPIES * 4 * max_num_seqs * c["vocab_size"] // tp
     return _NON_TORCH_BYTES + _CUDA_GRAPH_BYTES + forward + sampler
+
+
+# Speculative decoding: the sampler's warm-up also holds logits for each sequence's k draft positions. Fitted on 4 real
+# ngram runs (k=3, Qwen3-1.7B, max_num_seqs 128, vLLM 0.33, RTX 4060 Ti): peak activation 0.13 GiB above the plain
+# runs of the same memory mode (0.63 vs 0.50 GiB, 0.95 vs 0.82 GiB) = 2.4 bytes per draft logit. One model and one k.
+_SPEC_BYTES_PER_DRAFT_LOGIT = 2.4
+
+
+def spec_reserve_bytes(config_json: str, max_num_seqs: int, num_speculative_tokens: int) -> int:
+    """Memory a speculating vLLM keeps besides what the same run without speculation keeps (0 without speculation):
+    max_num_seqs x k draft logits over the full vocabulary (rank 0 gathers all of it at TP>1). Called by: augur.cli."""
+    if not num_speculative_tokens:
+        return 0
+    c = json.load(open(config_json))
+    vocab = c.get("text_config", c)["vocab_size"]
+    return int(_SPEC_BYTES_PER_DRAFT_LOGIT * max_num_seqs * num_speculative_tokens * vocab)

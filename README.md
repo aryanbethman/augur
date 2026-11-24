@@ -44,8 +44,8 @@ The KV cache is sized as vLLM sizes it: the GPU's memory for `--hardware`
 keeps besides them (non-torch memory and peak activation, which holds the
 CUDA-graph estimate). That reserve comes from the profile when
 `python -m augur.profile` measured it, else from an estimate off the model
-shape (augur warns); `--kv-reserve-gib`, `--kv-cache-gb` and `--num-gpu-blocks`
-override it. `--kv-cache-dtype fp8` halves a block's bytes (attention is still
+shape (augur warns), plus the draft positions' logits when the run speculates;
+`--kv-reserve-gib`, `--kv-cache-gb` and `--num-gpu-blocks` override it. `--kv-cache-dtype fp8` halves a block's bytes (attention is still
 priced as bf16).
 
 `--scheduler-cls DOTTED.PATH` runs your own vLLM scheduler class (a `Scheduler`
@@ -189,6 +189,8 @@ one. `--model-config` takes any Hugging Face `config.json`, and
 prices any model on any GPU in `GPU_FACTS` (A100, L40S, H100, H200, B200 and
 others) from FLOPs, bytes and datasheet peaks, with no profile: a coarse
 fallback, 25-40% off end to end on a held-out GPU (docs/accuracy.md section 2).
+`python -m augur.cost.roofline_fit onepoint` turns one timed decode step and one
+timed prefill step on a new GPU into `--step-class-scales` for it.
 
 To add a GPU or model, run `python -m augur.profile --model M --hardware NAME
 --tp N` on that GPU: it profiles with the LLMServingSim fork's profiler (KV up

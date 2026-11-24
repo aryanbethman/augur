@@ -165,10 +165,10 @@ def _parser() -> argparse.ArgumentParser:
                    help="drafter: ngram (prompt lookup, no draft cost), eagle / eagle3 (a head derived from the "
                         "target's config, priced as one target layer per pass), mtp (the target's own MTP layers; "
                         "models that define them)")
-    p.add_argument("--spec-us-per-request", type=float, default=100.0,
+    p.add_argument("--spec-us-per-request", type=float, default=180.0,
                    help="speculative decoding: extra step time per request verified with drafts (rejection sampling, "
-                        "draft bookkeeping), on top of the profile; 100 us (step fits say 160-210, whole-run fits 0-100) on an RTX 4060 Ti "
-                        "(vLLM 0.33), after attention is priced at the multi-token query length (needs a profile made "
+                        "draft bookkeeping), on top of the profile; 180 us on an RTX 4060 Ti (vLLM 0.33; the two real "
+                        "ngram k=3 runs' steps fit 213 sync, 144 async; docs/accuracy.md section 3), after attention is priced at the multi-token query length (needs a profile made "
                         "with --attention-decode-q-lens, else attention is priced as a one-token decode). Ignored "
                         "with --replay-durations")
     p.add_argument("--spec-accept-rate", type=float, default=0.7,
@@ -447,20 +447,23 @@ def _pick_cost(a, cpu_flags) -> str | None:
 def _kv_reserve_bytes(a, mdir, profile) -> int:
     """What vLLM keeps from the KV cache besides the weights: --kv-reserve-gib, else the memory numbers measured with
     the profile (python -m augur.profile), else an estimate from the model shape (warned once unless the KV size is
-    moot because of --num-gpu-blocks). Called by: main."""
+    moot because of --num-gpu-blocks); either of the last two plus the speculative logits' share when the run
+    speculates (the profiles are measured without it). Called by: main."""
     if a.kv_reserve_gib is not None:
         return int(a.kv_reserve_gib * 2**30)
     from augur.sim.engine import default_batch_limits
-    from augur.sim.models import estimate_reserve_bytes
+    from augur.sim.models import estimate_reserve_bytes, spec_reserve_bytes
     tokens, seqs = default_batch_limits(a.hardware, a.hbm_gb)
     tokens, seqs = a.max_num_batched_tokens or tokens, a.max_num_seqs or seqs
+    config = os.path.join(mdir, "config.json")
+    spec = spec_reserve_bytes(config, seqs, a.num_speculative_tokens or 0)
     mem = profile_vllm_memory(profile) if profile else None
     if mem and "peak_activation_gib" in mem:
         if mem.get("max_num_batched_tokens", tokens) != tokens and not a.num_gpu_blocks:
             print(f"augur: the profile's vLLM memory was measured with --max-num-batched-tokens "
                   f"{mem['max_num_batched_tokens']}, this run uses {tokens}: the reserve is not rescaled", file=sys.stderr)
-        return int(measured_reserve_gib(mem) * 2**30)
-    reserve = estimate_reserve_bytes(os.path.join(mdir, "config.json"), tokens, seqs, a.tp)
+        return int(measured_reserve_gib(mem) * 2**30) + spec
+    reserve = estimate_reserve_bytes(config, tokens, seqs, a.tp) + spec
     if not a.num_gpu_blocks:
         print(f"augur: no measured vLLM memory for this profile: the reserve is estimated at {reserve / 2**30:.2f} GiB "
               "(--kv-reserve-gib sets it; python -m augur.profile --stages memory measures it)", file=sys.stderr)
@@ -484,12 +487,13 @@ def _build_engines(a, spec, cost, replay_costs, topology) -> list:
     else:
         engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost, net_of(i)) for i in range(a.engines)]
     if not a.replay_durations:  # a logged step's duration already holds its CPU time
+        class_scales = parse_class_scales(a.step_class_scales)
         for e in engines:
             e.ctx.cpu_fixed_ns = int(a.step_cpu_us * 1e3)
             e.ctx.cpu_per_request_ns = int(a.step_cpu_per_request_us * 1e3)
             e.ctx.spec_ns_per_request = int(a.spec_us_per_request * 1e3)
             e.ctx.step_time_scale = a.step_time_scale
-            e.ctx.class_scales = parse_class_scales(a.step_class_scales)
+            e.ctx.class_scales = class_scales
     if a.step_log:
         for e in engines:
             e.step_log = []

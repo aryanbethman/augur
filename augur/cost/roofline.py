@@ -21,7 +21,8 @@ TP exceeds their number):
 * attention, one kernel for the step's prefill requests and one for its decodes (the profiles' mixed steps cost the
   sum of the two), each summed over its requests (``q`` new tokens after ``c`` cached ones): ``4*heads*head_dim*
   sum(q*(c + (q+1)/2))`` FLOPs (causal); bytes: the K/V of every request (``c + q`` tokens), q, the output and the
-  K/V written.
+  K/V written.  Sliding-window layers (``attention_sw``: Mistral, Qwen2 past ``max_window_layers``, the
+  ``sliding_attention`` entries of ``layer_types``) count only the keys inside the window.
 * layernorm, qk_norm, rotary, act_fn, embedding: memory traffic only (``elem_bw_scale`` x bandwidth, which is above 1
   where the profilers' repeated runs kept the tensors in L2); the sampler: one pass over the bf16 logits.
 
@@ -89,6 +90,8 @@ class Arch(NamedTuple):
     top_k: int = 0
     moe_inter: int = 0
     moe_layers: int = 0
+    window: int = 0  # sliding-window length of the sliding layers (0: none)
+    sw_layers: int = 0  # how many layers attend over a sliding window
 
     @classmethod
     def from_config(cls, path) -> "Arch":
@@ -107,23 +110,50 @@ class Arch(NamedTuple):
         h, layers, heads = c["hidden_size"], c["num_hidden_layers"], c["num_attention_heads"]
         experts = c.get("num_experts") or c.get("n_routed_experts") or c.get("num_local_experts") or 0
         dense = len(c.get("mlp_only_layers") or []) + (c.get("first_k_dense_replace") or 0) if experts else layers
+        window, sw_layers = _sliding_layers(c, layers)
         return cls(hidden=h, layers=layers, heads=heads, kv_heads=c.get("num_key_value_heads") or heads,
                    head_dim=c.get("head_dim") or h // heads, inter=c["intermediate_size"], vocab=c["vocab_size"],
                    qk_norm=c.get("model_type") in ("qwen3", "qwen3_moe"), experts=experts,
                    top_k=c.get("num_experts_per_tok", 0) if experts else 0,
                    moe_inter=(c.get("moe_intermediate_size") or c["intermediate_size"]) if experts else 0,
-                   moe_layers=layers - dense if experts else 0)
+                   moe_layers=layers - dense if experts else 0, window=window, sw_layers=sw_layers)
 
 
-def attention_features(shape: StepShape) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+def _sliding_layers(c: dict, layers: int) -> tuple[int, int]:
+    """(window, sliding layers) of a config, as Hugging Face lays them out: ``layer_types`` when the config lists them;
+    else Qwen2-style ``use_sliding_window`` (the layers from ``max_window_layers`` on slide); else every layer of a
+    Mistral or Mixtral. Raises NotImplementedError for a window whose layers the config does not say."""
+    window = c.get("sliding_window") or 0
+    if not window:
+        return 0, 0
+    if c.get("layer_types"):
+        n = sum(t == "sliding_attention" for t in c["layer_types"])
+    elif "use_sliding_window" in c:
+        n = layers - min(c.get("max_window_layers") or 0, layers) if c["use_sliding_window"] else 0
+    elif c.get("model_type") in ("mistral", "mixtral"):
+        n = layers
+    else:
+        raise NotImplementedError(f"--cost roofline: {c.get('model_type')} has sliding_window {window} but its config "
+                                  "does not say which layers use it (no layer_types)")
+    return (window, n) if n else (0, 0)
+
+
+def attention_features(shape: StepShape, window: int = 0) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
     """((P, K, Q, n) of the prefill requests, the same of the decode requests): causal query-key pairs, K/V tokens
-    read, new tokens and requests."""
+    read, new tokens and requests. ``window``: each query sees at most that many keys (itself included), so a chunk of
+    q queries after c cached tokens reads min(c + q, window + q - 1) K/V tokens."""
     acc = {True: [0, 0, 0, 0], False: [0, 0, 0, 0]}
     for s in shape.seqs:
         a = acc[s.is_decode]
-        a[0] += s.num_new * s.num_computed_before + s.num_new * (s.num_new + 1) // 2
-        a[1] += s.num_computed_before + s.num_new
-        a[2] += s.num_new
+        c, q = s.num_computed_before, s.num_new
+        if window:
+            below = max(0, min(q, window - c))  # queries whose whole history fits in the window
+            a[0] += below * c + below * (below + 1) // 2 + (q - below) * window
+            a[1] += min(c + q, window + q - 1)
+        else:
+            a[0] += q * c + q * (q + 1) // 2
+            a[1] += c + q
+        a[2] += q
         a[3] += 1
     return tuple(acc[False]), tuple(acc[True])
 
@@ -133,10 +163,11 @@ def _gemm(m, k, n, flops, bw, prm: RooflineParams):
                        (k * n + m * (k + n)) * BYTES / (bw * prm.gemm_mem_eff)) + prm.gemm_ovh_ns)
 
 
-def op_ns(arch: Arch, flops: float, bw: float, tp: int, prm: RooflineParams, tokens, rows, pre, dec) -> dict:
+def op_ns(arch: Arch, flops: float, bw: float, tp: int, prm: RooflineParams, tokens, rows, pre, dec,
+          window_features=None) -> dict:
     """Time (ns) of one occurrence of every op of a step, as arrays or floats over steps: ``flops`` FLOP/ns and ``bw``
     bytes/ns are the GPU's peaks; ``tokens`` T, ``rows`` R and the attention features ``pre``, ``dec`` of
-    ``attention_features``.
+    ``attention_features``; ``window_features``, the same over the sliding window, prices ``attention_sw``.
     Ops with ``rows`` = 0 (lm_head, sampler) are 0 there."""
     h, hd = arch.hidden, arch.head_dim
     heads, kv_heads = arch.heads / tp, -(-arch.kv_heads // tp)
@@ -154,6 +185,9 @@ def op_ns(arch: Arch, flops: float, bw: float, tp: int, prm: RooflineParams, tok
         return np.where(np.asarray(seqs) > 0, np.maximum(4.0 * heads * hd * pairs / (flops * prm.attn_flops_eff),
                                                          nbytes / (bw * mem_eff)) + prm.attn_ovh_ns, 0.0)
     out["attention"] = attention(prm.attn_pre_mem_eff, *pre) + attention(prm.attn_mem_eff, *dec)
+    if window_features is not None:
+        pre_sw, dec_sw = window_features
+        out["attention_sw"] = attention(prm.attn_pre_mem_eff, *pre_sw) + attention(prm.attn_mem_eff, *dec_sw)
     out["gate_up_proj"] = _gemm(t, h, 2 * arch.inter // tp, flops, bw, prm)
     out["act_fn"] = elem(3 * t * (arch.inter // tp))
     out["down_proj"] = _gemm(t, arch.inter // tp, h, flops, bw, prm)
@@ -175,8 +209,10 @@ def layer_counts(arch: Arch) -> dict[str, int]:
     """How many times each op runs in a step (the head ops once)."""
     dense, moe = arch.layers - arch.moe_layers, arch.moe_layers
     n = {"embedding": 1, "final_layernorm": 1, "lm_head": 1, "sampler": 1, "layernorm": 2 * arch.layers,
-         "qkv_proj": arch.layers, "rotary_emb": arch.layers, "o_proj": arch.layers, "attention": arch.layers,
-         "gate_up_proj": dense, "act_fn": dense, "down_proj": dense}
+         "qkv_proj": arch.layers, "rotary_emb": arch.layers, "o_proj": arch.layers,
+         "attention": arch.layers - arch.sw_layers, "gate_up_proj": dense, "act_fn": dense, "down_proj": dense}
+    if arch.sw_layers:
+        n["attention_sw"] = arch.sw_layers
     if arch.qk_norm:
         n["qk_norm"] = arch.layers
     if moe:
@@ -222,7 +258,8 @@ class RooflineCost(RingTP):
         """Total time of each op over the whole step (its time x how often it runs); the GPU part of ``step_ns``."""
         rows = 0 if shape.dummy else len(shape.seqs)
         per = op_ns(self.arch, self._flops, self._bw, self.tp, self.params, max(shape.forward_tokens, 1), rows,
-                    *attention_features(shape))
+                    *attention_features(shape),
+                    attention_features(shape, self.arch.window) if self.arch.sw_layers else None)
         return {name: float(per[name]) * n for name, n in self._counts.items()}
 
     def step_ns(self, shape: StepShape) -> int:

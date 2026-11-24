@@ -84,7 +84,7 @@ def main(argv=None) -> int:
     ap.add_argument("--output", default=None, help="write the scales here as JSON (augur --step-class-scales takes it)")
     a = ap.parse_args(argv)
 
-    from augur.verify.stepcheck import classify, make_pricer, price_steps
+    from augur.verify.stepcheck import make_pricer, price_steps
     try:
         cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len)
     except FileNotFoundError as e:
@@ -97,7 +97,7 @@ def main(argv=None) -> int:
     events = read_log(a.log)
     cpu_ns = (a.step_cpu_us if a.step_cpu_us is not None else (0.0 if is_async(events) else 1300.0)) * 1e3
     priced = [p for p in price_steps(events, cost, disp, a.workload) if not p.xfer]
-    cl = [classify(p.shape) for p in priced]
+    cl = [p.shape.step_class for p in priced]
     m = [p.measured_ns for p in priced]
     pr = [p.predicted_ns for p in priced]
 
