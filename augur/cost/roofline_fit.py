@@ -102,7 +102,7 @@ def load_profiles() -> list[Profile]:
             arch = Arch.from_dict(json.load(fh)["model_config"])
         keep = []
         for cls, shape in grid:
-            pre, n_dec, dq, _, kv_max = cost._batch_key(shape)
+            pre, n_dec, dq, _, kv_max, _ = cost._batch_key(shape)
             if not cost._beyond_axes(pre, n_dec, kv_max, dq, shape.forward_tokens, len(shape.seqs)):
                 keep.append((cls, shape))
         rows = []

@@ -379,7 +379,7 @@ def main(argv=None) -> int:
         sim = from_csv(f"{work}/sim.csv", calls)
     cost, disp = make_pricer(a.model, a.hardware, a.fork, a.max_num_seqs, a.max_num_batched_tokens, a.max_model_len,
                              a.cost == "roofline", a.roofline_params)
-    priced = price_steps(events, cost, disp)
+    priced = price_steps(events, cost, disp, a.workload)
     retimed, late = retime(events, priced, calls, t)
 
     ids = sorted(set(real) & set(replay) & set(retimed) & set(arrivals) & set(sim))

@@ -1,0 +1,13 @@
+{
+ "at": "2026-11-24T02:22:28+00:00",
+ "gpu": "NVIDIA GeForce RTX 4060 Ti",
+ "grid": "main",
+ "heads": [
+  16,
+  8,
+  128
+ ],
+ "rotating_caches": 4,
+ "torch": "2.14.0+cu130",
+ "vllm": "0.33.0"
+}

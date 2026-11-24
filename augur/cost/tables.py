@@ -34,6 +34,14 @@ The layer order, ``L`` and the table values are read from the profile file.
   longest KV and ``alpha`` comes from a calibrated bucket table (decode count,
   prefill chunk and relative gap ``(t_max - t_mean) / t_mean``).
 
+* shared KV (optional ``shared_kv`` entry of the profile): the attention table is measured with every decode on
+  blocks of its own, so each KV byte comes from GPU memory.  Under prefix caching, requests of a batch share
+  blocks (``SeqWork.shared_kv``); a block several of them read stays in the L2 cache and the kernel runs faster than
+  the table says.  With ``u`` = distinct KV tokens / total KV tokens of the decodes and ``c(n)`` the profile's floor
+  at ``n`` decodes (linear in n, clamped), the decode part of the attention time (the lookup less the lookup without
+  decodes) is scaled by ``min(1, (u**p + c(n)**p) ** (1/p))``.  The profile's provenance says how ``p`` and ``c``
+  were fitted.  Without the entry, or when nothing is shared, the lookup above is the price.
+
 Mixture-of-experts models (``kind: "moe"``).  Every layer outside the MoE block is priced as above.  The MoE
 block of a decoder layer costs a function of the forward token count ``T`` only (the fork's balanced gate
 is deterministic in ``T``), so the profile stores it as a table of ``T`` and ``L`` copies are summed:
@@ -401,6 +409,7 @@ class TableCost(RingTP):
         self._attn = {layer: {int(q): _Attention(spec) for q, spec in by_q.items()}
                       for layer, by_q in p["attention"].items()}
         self._skew = p["skew"]
+        self._shared = p.get("shared_kv")
         self._moe_exact = (moe or {}).get("exact", {})
         self._moe_balanced = (moe or {}).get("balanced", {})
         self._moe_dp = (moe or {}).get("dp", {})
@@ -456,17 +465,37 @@ class TableCost(RingTP):
             return kernel["default"]
         return cell["alpha"][_anchor_index(cell["anchors"], n)]
 
-    def _attention_ns(self, layer, pc, key, n, kv_mean, kv_max, q):
+    @property
+    def prices_sharing(self) -> bool:
+        """Whether the profile has a shared-KV model: the executor then fills ``SeqWork.shared_kv``."""
+        return bool(self._shared)
+
+    def _shared_scale(self, n, kv_total, shared) -> float:
+        """Factor on the decode part of the attention time when ``shared`` of the decodes' ``kv_total`` KV tokens
+        are in blocks another decode of the step also reads (module docstring)."""
+        spec = self._shared
+        u = 1.0 - min(shared, kv_total) / kv_total
+        p = spec["p"]
+        floor = _interp1d(spec["nd"], spec["floor"], n)
+        return min(1.0, (u ** p + floor ** p) ** (1.0 / p))
+
+    def _attention_ns(self, layer, pc, key, n, kv_mean, kv_max, q, shared=0):
         table = self._attention_table(layer, q)
         t_mean = table.lookup(pc, key, n, kv_mean)
         if n <= 1 or kv_max == kv_mean:
-            return max(1, int(round(t_mean)))
-        t_max = table.lookup(pc, key, n, kv_max)
-        lev = (t_max - t_mean) / t_mean if t_mean > 0 else 0.0
-        alpha = self._alpha(layer, n, pc, lev, q)
-        if alpha == 0.0 or t_max <= t_mean:  # dense kernels never saturate in key length
-            return max(1, int(round(t_mean)))
-        return max(1, int(round(t_mean + alpha * (t_max - t_mean))))
+            ns = max(1, int(round(t_mean)))
+        else:
+            t_max = table.lookup(pc, key, n, kv_max)
+            lev = (t_max - t_mean) / t_mean if t_mean > 0 else 0.0
+            alpha = self._alpha(layer, n, pc, lev, q)
+            if alpha == 0.0 or t_max <= t_mean:  # dense kernels never saturate in key length
+                ns = max(1, int(round(t_mean)))
+            else:
+                ns = max(1, int(round(t_mean + alpha * (t_max - t_mean))))
+        if shared > 0 and n > 1 and kv_mean > 0 and self._shared:
+            base = table.lookup(pc, key, 0, 0) if pc and 0 in table.nd_vals else 0  # the prefill chunk alone
+            ns = max(1, int(round(base + (ns - base) * self._shared_scale(n, n * kv_mean, shared))))
+        return ns
 
     def _beyond_axes(self, pre, n_dec, kv_max, dq, tokens, rows):
         """Axes on which this step is above the profile's largest value, as ((axis, value, limit), ...).
@@ -537,19 +566,19 @@ class TableCost(RingTP):
 
     # --- drafter passes (EAGLE / MTP) -----------------------------------------
 
-    @staticmethod
-    def _batch_key(shape: StepShape) -> tuple:
+    def _batch_key(self, shape: StepShape) -> tuple:
         """What a batch's layer prices depend on: (prefill chunks, decodes, decode query length, mean and max
-        decode KV length)."""
+        decode KV length, decode KV tokens shared with another decode; 0 unless the profile prices sharing)."""
         pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
         dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
         n_dec = len(dec)
         dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1) or 1
-        return pre, n_dec, dq, sum(dec) // n_dec if n_dec else 0, max(dec, default=0)
+        shared = sum(min(s.shared_kv, s.num_computed_before) for s in shape.seqs if s.is_decode) if self._shared else 0
+        return pre, n_dec, dq, sum(dec) // n_dec if n_dec else 0, max(dec, default=0), shared
 
     def _pricer(self, batch: tuple, tokens: int, rows: int):
         """price(layer name) for one batch (``_batch_key``) of ``tokens`` forward tokens and ``rows`` sequences."""
-        pre, n_dec, dq, kv_mean, kv_max = batch
+        pre, n_dec, dq, kv_mean, kv_max, shared = batch
         t, r = max(int(tokens), 1), max(int(rows), 1)
 
         def price(name):
@@ -560,7 +589,7 @@ class TableCost(RingTP):
                 chunk = sum(q for q, _ in pre)
                 if chunk == 0 and n_dec == 0:  # no attention kernel is launched (fork: _emit_npu_attention)
                     return 0
-                return self._attention_ns(name, chunk, _prefill_key(pre), n_dec, kv_mean, kv_max, dq)
+                return self._attention_ns(name, chunk, _prefill_key(pre), n_dec, kv_mean, kv_max, dq, shared)
             if name in self._per_seq:
                 keys, vals = self._per_seq[name]
                 return max(1, int(_interp1d(keys, vals, r)))
@@ -654,7 +683,7 @@ class TableCost(RingTP):
 
     def step_ns(self, shape: StepShape) -> int:
         batch = self._batch_key(shape)
-        pre, n_dec, dq, _, kv_max = batch
+        pre, n_dec, dq, _, kv_max, _ = batch
         tokens = shape.forward_tokens
         rows = 0 if shape.dummy else len(shape.seqs)
         key = (*batch, tokens, rows)

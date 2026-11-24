@@ -19,6 +19,9 @@ class SeqWork:
     num_new: int  # tokens computed this step
     num_computed_before: int  # tokens already in the KV cache (incl. prefix hits)
     is_decode: bool  # query length 1 (vLLM's decode/prefill split), not a multi-token chunk
+    # Of its ``num_computed_before`` tokens of KV, those held in cache blocks that a sequence before it in this step
+    # also references (prefix caching: one physical block, read by several requests). 0: nothing shared, or unknown.
+    shared_kv: int = 0
 
 
 @dataclass(frozen=True)
