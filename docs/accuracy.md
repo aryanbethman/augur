@@ -122,10 +122,20 @@ which blocks each request holds can price this.
 
 **vLLM's CPU time.** A synchronous step also holds vLLM's own work (schedule,
 process outputs): 1–3 ms longer than the profile's price at every batch size.
-`--step-cpu-us` adds it, default 2,000 (the best end-to-end fit on both sync
-workloads below; measured with vLLM 0.33 on an i7-12700, and it will differ on
-other host CPUs). Under async scheduling vLLM hides this work behind the
-previous batch, and results do not move with it.
+`--step-cpu-us` adds it, default 1,300 (since 2026-11-24; 2,000 before, and the
+tables in this file made before that date used 2,000). Fitted on 15 sync runs
+of 4 workload families: the constant left out one run at a time stays within
+1,209-1,307 us, and no batch term (per request, per new or finished request,
+per token, per context token) generalizes from run to run, where an offset of
+0.7-2.2 ms between runs is larger than any batch dependence. Against 2,000, the
+mean step-time error over the 15 runs falls from 2.1 to 1.3% (worst 5.8 →
+3.4%) and the mean end-to-end error from 4.6 / 2.2 / 2.5% to 3.1 / 1.5 / 1.7%
+(mean TTFT / TPOT / latency); ShareGPT 300 and SWE-bench sync, where 2,000 was
+tuned, move from about −0.2 to −1.3% latency, and the 16 GiB offload run from
+−3.0 to −5.4%. Measured with vLLM 0.33 on an i7-12700; other host CPUs will
+differ. Under async scheduling vLLM hides this work behind the previous batch
+(the next batch is scheduled at least 13 ms before the previous one ends), and
+results do not move with it.
 
 **GPUs with no profile: `--cost roofline`.** Each operation takes max(FLOPs / (peak × efficiency), bytes /
 (bandwidth × efficiency)) plus a per-kernel overhead, from the model's config and the GPU's datasheet peaks

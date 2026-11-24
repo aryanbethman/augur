@@ -124,9 +124,10 @@ against ports, decided after the heavy-preemption runs (plan item 13).
     sharing term (shipped as `shared_kv` in the 4060 Ti profile); stepcheck on the tenants run 1.435 → 1.007 and
     augur's own runs on the overlap workloads +16-85% → +1.2-5% mean latency. Open: other GPUs (L2 size), query
     length > 1, prefill chunks, shared generated text (prefix_share counts prompt blocks only)
-24. [ ] Per-step CPU time as a function of the batch (requests, tokens), not a constant 2 ms: it is the error left
-    on short-step workloads (per-user prompts +8%) and in the counterfactuals at new batch sizes. Fit on all real
-    sync runs, hold some out
+24. [x] Per-step CPU time (a58d108; docs/accuracy.md section 2): no batch term generalizes across 15 sync runs (a
+    run-level offset of 0.7-2.2 ms dominates); the constant refitted, --step-cpu-us 2000 → 1300, mean step-time error
+    2.1 → 1.3%, end-to-end latency 2.5 → 1.7%. Open: the per-user run's TTFT (+20%); breakdown's step/decision split
+    is not meaningful on always-busy runs (per-user, bursty)
 21. [x] Counterfactuals from one real run (ee6029d; docs/accuracy.md section 3): `python -m augur.verify.calibrate`
     fits one scale per step class on the real run, `--step-class-scales` applies it. On four held-out pairs (priority,
     KV cut to 520 / 1,550 blocks, prefix off) augur predicts the effect of the change within 0.5-5% (mean over 10
