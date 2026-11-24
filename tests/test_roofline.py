@@ -165,3 +165,54 @@ def test_pricing_distinct_steps_holds_no_memory_per_step(configs):
     held, _ = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     assert held < 1 << 20
+
+
+KVSPEC = os.path.join(os.path.dirname(__file__), "data", "kvspec")
+
+
+def test_windowed_attention_features_count_only_keys_inside_the_window():
+    for c, q, w in [(0, 5, 3), (2, 4, 3), (10, 1, 4), (1, 1, 8), (6, 6, 6)]:
+        pairs = sum(min(w, c + i) for i in range(1, q + 1))
+        reads = len(set(k for i in range(1, q + 1) for k in range(max(0, c + i - w), c + i)))
+        pre, _ = attention_features(StepShape((SeqWork(q, c, False),)), window=w)
+        assert pre[:2] == (pairs, reads), (c, q, w)
+
+
+def test_a_sliding_window_model_costs_no_more_past_its_window():
+    # Regression (2026-11-24): sliding-window layers were priced at the full context.
+    cost = RooflineCost(os.path.join(KVSPEC, "sliding.json"), "RTX4060Ti")  # Mistral: every layer slides, window 64
+    assert cost.step_ns(decode(8, 64)) == cost.step_ns(decode(8, 5000)) < cost.step_ns(prefill(512, 4000))
+    assert cost.step_ns(prefill(64, 5000)) == cost.step_ns(prefill(64, 9000))
+
+
+def test_only_the_layers_listed_as_sliding_stop_at_the_window(tmp_path):
+    mixed = json.load(open(os.path.join(KVSPEC, "mixed.json")))  # Olmo-3: three sliding layers, then a full one
+    full = dict(mixed, layer_types=["full_attention"] * 4)
+    (tmp_path / "full.json").write_text(json.dumps(full))
+    cost_mixed = RooflineCost(os.path.join(KVSPEC, "mixed.json"), "RTX4060Ti")
+    cost_full = RooflineCost(str(tmp_path / "full.json"), "RTX4060Ti")
+    grow = lambda cost: cost.ops_ns(decode(32, 50_000))["attention"] - cost.ops_ns(decode(32, 5_000))["attention"]
+    assert grow(cost_mixed) == pytest.approx(grow(cost_full) / 4)
+
+
+def test_a_window_whose_layers_the_config_does_not_say_is_refused():
+    with pytest.raises(NotImplementedError, match="layer_types"):
+        Arch.from_dict({"model_type": "gemma2", "hidden_size": 256, "num_hidden_layers": 4, "num_attention_heads": 4,
+                        "intermediate_size": 512, "vocab_size": 1000, "sliding_window": 64})
+
+
+def test_one_point_scales_are_measured_over_predicted():
+    from augur.cost.roofline_fit import one_point_scales
+    scales = one_point_scales({"decode": 110.0, "prefill": 90.0}, {"decode": 100.0, "prefill": 100.0})
+    assert scales == pytest.approx({"decode": 1.1, "prefill": 0.9, "mixed": (1.1 * 0.9) ** 0.5})
+
+
+def test_onepoint_gives_scales_of_one_for_a_gpu_that_times_what_the_roofline_says(configs, tmp_path):
+    from augur.cost import parse_class_scales
+    from augur.cost import roofline_fit
+    cost = RooflineCost(configs["qwen"], "RTX4060Ti")
+    d, p = (cost.step_ns(roofline_fit.ONE_POINT[c]) / 1e6 for c in ("decode", "prefill"))
+    out = tmp_path / "scales.json"
+    assert roofline_fit.main(["onepoint", "--model-config", configs["qwen"], "--hardware", "RTX4060Ti",
+                              "--decode-ms", repr(d), "--prefill-ms", repr(p), "--out", str(out)]) == 0
+    assert parse_class_scales(str(out)) == pytest.approx({"decode": 1.0, "prefill": 1.0, "mixed": 1.0})

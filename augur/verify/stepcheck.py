@@ -68,10 +68,6 @@ def real_steps(events, chains=None):
     return out
 
 
-def classify(shape: StepShape) -> str:
-    return shape.step_class
-
-
 @dataclass
 class PricedStep:
     shape: StepShape  # padded as the run's CUDA-graph dispatcher pads it
@@ -155,7 +151,7 @@ def main(argv=None) -> int:
     except FileNotFoundError as e:
         print(f"augur.verify.stepcheck: {e}", file=sys.stderr)
         return 2
-    rows = [(classify(p.shape), p.shape.total_tokens, len(p.shape.seqs), p.shape.padded_tokens, p.graph,
+    rows = [(p.shape.step_class, p.shape.total_tokens, len(p.shape.seqs), p.shape.padded_tokens, p.graph,
              p.measured_ns, p.predicted_ns, p.xfer.get("load", [0])[0], p.xfer.get("store", [0])[0])
             for p in price_steps(read_log(a.log), cost, disp, a.workload)]
 

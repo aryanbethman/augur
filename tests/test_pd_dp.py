@@ -114,3 +114,22 @@ def test_async_dp_first_round_waits_for_the_cpu_when_the_gpu_is_idle(tmp_path, w
 def test_async_dp_run_finishes_every_call(tmp_path, workload):
     coord, _, rec = dp_run(tmp_path, workload, True)
     assert len(rec.done) == 12 and coord.dp_rounds > 0
+
+
+def test_pd_engines_keep_no_recorded_ids_once_calls_finish(tmp_path):
+    # Regression (2026-11-24): a prefill engine marked each request "recorded" for token-faithful speculation but only
+    # dropped its output ids when the request left, so the set grew by one id per call for the whole run.
+    path = tmp_path / "w.jsonl"
+    with open(path, "w") as f:
+        for i in range(6):
+            f.write(json.dumps({"input_toks": 64, "output_toks": 4, "arrival_time_ns": i * 1_000_000,
+                                "input_tok_ids": list(range(i * 100, i * 100 + 64)), "output_tok_ids": [7, 8, 9, 10]})
+                    + "\n")
+    spec = EngineSpec(model_dir=model_dir("", MODEL, str(tmp_path), None), model_name=MODEL, kv_cache_bytes=1 << 30,
+                      max_model_len=8192, max_num_batched_tokens=512, max_num_seqs=16, num_gpu_blocks=600)
+    engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), FixedCost(base_ns=8_000_000))
+               for i, r in enumerate(["kv_producer", "kv_consumer"])]
+    coord = Coordinator(engines, make_router("round-robin"), Workload(str(path)),
+                        decode_router=make_router("round-robin"))
+    assert len(coord.run().done) == 6
+    assert [e.ctx.recorded for e in engines] == [set(), set()]

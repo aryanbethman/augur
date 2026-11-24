@@ -30,6 +30,8 @@ import zlib
 from dataclasses import dataclass, field
 from typing import Iterator
 
+import numpy as np
+
 # Filler ids live far above any real vocabulary, each request in its own range.
 _FILLER_BASE = 1 << 40
 _FILLER_STRIDE = 1 << 24
@@ -74,10 +76,27 @@ class _Filler:
 
     def ids(self, count: int, key: str = "") -> list[int]:
         if self.vocab:
-            rng = random.Random(zlib.crc32(key.encode()))
-            return [rng.randrange(1000, self.vocab) for _ in range(count)]
+            return _randranges(random.Random(zlib.crc32(key.encode())), 1000, self.vocab, count)
         base = _FILLER_BASE + next(self._n) * _FILLER_STRIDE
         return list(range(base, base + count))
+
+
+def _randranges(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
+    """``[rng.randrange(lo, hi) for _ in range(count)]``, the same ids, from 32-bit words drawn in bulk. randrange
+    takes the top k bits of the generator's next 32-bit word (k = bit length of hi - lo) and draws again while that is
+    out of range; getrandbits(32 * m) returns the next m words, the first in the lowest bits. ``rng`` ends further on
+    than randrange would leave it (the last batch is not used up). Called by: _Filler.ids (long prompts: 15% of an SWE-bench run's event loop went to randrange)."""
+    n = hi - lo
+    k = n.bit_length()
+    if count <= 0 or n <= 0 or k > 32:
+        return [rng.randrange(lo, hi) for _ in range(count)]
+    out = np.empty(0, dtype=np.int64)
+    while len(out) < count:
+        m = int((count - len(out)) * (1 << k) / n) + 64
+        words = np.frombuffer(rng.getrandbits(32 * m).to_bytes(4 * m, "little"), dtype="<u4")
+        r = (words >> np.uint32(32 - k)).astype(np.int64)
+        out = np.concatenate([out, r[r < n]])
+    return (out[:count] + lo).tolist()
 
 
 @dataclass

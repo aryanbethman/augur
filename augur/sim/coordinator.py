@@ -279,6 +279,7 @@ class Coordinator:
                     # the client; the client's tokens come from the decode engine.
                     if o.finish_reason is not None:
                         eng.ctx.output_ids.pop(o.request_id, None)
+                        eng.ctx.recorded.discard(o.request_id)
                         rec.prefill_done_ns = self.now
                         self.router.release(self._calls[cid], self.now)
                         if not o.kv_transfer_params:
