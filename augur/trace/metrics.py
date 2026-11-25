@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import os
+from array import array
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -38,7 +39,7 @@ class CallRecord:
     session_id: str | None = None
     index: int = 0
     first_sched_ns: int | None = None
-    token_times: list[int] = field(default_factory=list)
+    token_times: array = field(default_factory=lambda: array("q"))  # 8 B a token: a list of ints is 40 B, and every finished call keeps its own
     end_ns: int | None = None
     cached_tokens: int = 0
     num_preemptions: int = 0
