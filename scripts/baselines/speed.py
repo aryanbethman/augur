@@ -219,7 +219,7 @@ def _cmd(sim: str, out: str, m: dict, startup: bool = False, count: bool = False
              "--max-num-seqs", str(SEQS), "--max-num-batched-tokens", str(BATCHED), "--max-model-len",
              str(m["max_model_len"]), "--no-prefix-caching", "--no-async-scheduling", "--step-cpu-us", "2000",
              "--no-recorded-outputs", "--filler-vocab", "150000", "--quiet", "--workload", f"{out}/wl.jsonl",
-             "--output", f"{out}/augur.csv"] + (["--num-entries", "1"] if startup else [])
+             "--output", "/dev/null"] + (["--num-entries", "1"] if startup else [])  # the request CSV is ~7 KB a call
         return c, {"VLLM_LOGGING_LEVEL": "ERROR", "PYTHONPATH": os.getcwd()}, f"{out}/augur.csv"
     # blis: the plain patched binary (its own latency model); blis-pipe: a build whose engines share one pricer process
     # (blis-ext starts one per engine, 1.2 GB each) and that counts steps (BLIS_STEP_COUNT_FILE)
@@ -393,7 +393,6 @@ def profile(a) -> int:
     argv = cmd[cmd.index("--model"):]
     if a.prefix_caching:  # the workloads carry no token ids, so there is nothing to share, but every block is still hashed
         argv.remove("--no-prefix-caching")
-    argv[argv.index("--output") + 1] = f"{a.out}/augur_prof.csv"
     from augur import cli
     pr = Profiler(interval=a.interval)
     t0 = time.time()
