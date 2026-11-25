@@ -199,6 +199,7 @@ class _Attention:
             kd = axes[s["kd"]]
             self.slices[(s["pc"], s["nd"])] = (s["kp"], [(kd, row) for row in s["ns"]])
         self.pairs = sorted(self.slices)
+        self._memo = {}  # lookup() is pure and batch shapes repeat (several layers, steps and engines share one)
         self.pc_vals = sorted({pc for pc, _ in self.pairs})
         self.nd_vals = sorted({nd for _, nd in self.pairs})
         # largest profiled value on each axis; a lookup above it extrapolates
@@ -227,6 +228,13 @@ class _Attention:
         return v_lo + t_kp * (v_hi - v_lo)
 
     def lookup(self, prefill_chunk, prefill_key, n_decode, kv):
+        key = (prefill_chunk, prefill_key, n_decode, kv)
+        hit = self._memo.get(key)
+        if hit is None:
+            hit = self._memo[key] = self._lookup(prefill_chunk, prefill_key, n_decode, kv)
+        return hit
+
+    def _lookup(self, prefill_chunk, prefill_key, n_decode, kv):
         kv = max(int(kv), 0)
         lo_pc, hi_pc, t_pc = _axis_bracket(self.pc_vals, max(int(prefill_chunk), 0))
         lo_nd, hi_nd, t_nd = _axis_bracket(self.nd_vals, max(int(n_decode), 0))
@@ -571,12 +579,19 @@ class TableCost(RingTP):
     def _batch_key(self, shape: StepShape) -> tuple:
         """What a batch's layer prices depend on: (prefill chunks, decodes, decode query length, mean and max
         decode KV length, decode KV tokens shared with another decode; 0 unless the profile prices sharing)."""
-        pre = tuple((s.num_new, s.num_computed_before) for s in shape.seqs if not s.is_decode)
-        dec = [s.num_computed_before for s in shape.seqs if s.is_decode]
+        pre, dec, dq, shared = [], [], 0, 0
+        for s in shape.seqs:  # one pass: this runs on every step
+            if s.is_decode:
+                dec.append(s.num_computed_before)
+                if s.num_new > dq:
+                    dq = s.num_new
+                if s.shared_kv:
+                    shared += min(s.shared_kv, s.num_computed_before)
+            else:
+                pre.append((s.num_new, s.num_computed_before))
         n_dec = len(dec)
-        dq = max((s.num_new for s in shape.seqs if s.is_decode), default=1) or 1
-        shared = sum(min(s.shared_kv, s.num_computed_before) for s in shape.seqs if s.is_decode) if self._shared else 0
-        return pre, n_dec, dq, sum(dec) // n_dec if n_dec else 0, max(dec, default=0), shared
+        return (tuple(pre), n_dec, dq or 1, sum(dec) // n_dec if n_dec else 0, max(dec, default=0),
+                shared if self._shared else 0)
 
     def _pricer(self, batch: tuple, tokens: int, rows: int):
         """price(layer name) for one batch (``_batch_key``) of ``tokens`` forward tokens and ``rows`` sequences."""
