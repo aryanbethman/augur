@@ -6,6 +6,7 @@ import os
 import random
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -62,8 +63,8 @@ CASES = {
 def test_three_workers_match_one_process(tmp_path, workload, sessions, case):
     kind, args = CASES[case]
     wl = workload if kind == "flat" else sessions
-    one = run(tmp_path, 1, wl, *args)
-    three = run(tmp_path, 3, wl, *args)
+    with ThreadPoolExecutor(2) as pool:  # the two runs are independent: start-up of one overlaps the other
+        one, three = pool.map(lambda w: run(tmp_path, w, wl, *args), (1, 3))
     assert three[0] == one[0]  # the result CSV
     assert three[1] == one[1]  # the step log
     assert three[2] == one[2]  # the printed summary
@@ -71,7 +72,9 @@ def test_three_workers_match_one_process(tmp_path, workload, sessions, case):
 
 
 def test_workers_refuse_what_they_cannot_split(tmp_path, workload):
-    for extra in (["--dp", "2"], ["--prefill-engines", "1", "--decode-engines", "1"]):
-        p = subprocess.run([sys.executable, "-m", "augur.cli", *BASE, *FIXED, *extra, "--workload", workload,
-                            "--workers", "2"], capture_output=True, text=True)
-        assert p.returncode == 2 and "--workers > 1 does not support" in p.stderr
+    def refused(extra):
+        return subprocess.run([sys.executable, "-m", "augur.cli", *BASE, *FIXED, *extra, "--workload", workload,
+                               "--workers", "2"], capture_output=True, text=True)
+    with ThreadPoolExecutor(2) as pool:
+        for p in pool.map(refused, (["--dp", "2"], ["--prefill-engines", "1", "--decode-engines", "1"])):
+            assert p.returncode == 2 and "--workers > 1 does not support" in p.stderr
