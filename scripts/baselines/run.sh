@@ -7,6 +7,7 @@
 #          directory under out/baselines/; the run dir holds steps.*.jsonl and, for the settings, server.log). The
 #          settings come from its server.log; these env vars state or override them: MAX_MODEL_LEN MAX_BATCHED_TOKENS
 #          MAX_NUM_SEQS NUM_GPU_BLOCKS PREFIX_CACHING=on|off SCHEDULING_POLICY=fcfs|priority ASYNC_SCHEDULING=sync|async
+#          SHARED_KV=on (augur only: the profile's shared-KV decode term, off by default so that every simulator has one price)
 #          BLIS_ENCODING=greedy|best (how BLIS gets prefix groups and sessions; greedy, the default, is the earlier runs').
 #          The workload's per-request "priority" goes to BLIS (blis_priority.patch, built into
 #          inference-sim-prio/blis-ext-prio) and Frontier; Vidur has none, so it is not run. Prefix caching off:
@@ -72,7 +73,7 @@ augur() {
   rm -f $O/augur_steps.*.jsonl
   $PY -m augur.cli --model Qwen/Qwen3-1.7B --hardware RTX4060Ti --cost tables --num-gpu-blocks $(get num_gpu_blocks) \
     --max-num-seqs $(get max_num_seqs) --max-num-batched-tokens $(get max_num_batched_tokens) \
-    --max-model-len $(get max_model_len) $extra --step-cpu-us 2000 --no-shared-kv --no-recorded-outputs --filler-vocab 150000 --quiet \
+    --max-model-len $(get max_model_len) $extra --step-cpu-us 2000 $([ "${SHARED_KV:-off}" = on ] || echo --no-shared-kv) --no-recorded-outputs --filler-vocab 150000 --quiet \
     --workload $wl --num-entries $(get num_entries) --step-log-vllm $O/augur_steps --output $O/augur.csv > $O/augur.log 2>&1
 }
 
