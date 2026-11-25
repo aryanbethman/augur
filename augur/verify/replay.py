@@ -90,10 +90,10 @@ class ReplayCost:
     rounds: list[int] = field(default_factory=list)
     round_dummy: list[bool] = field(default_factory=list)
     # Async DP: each round (a loop iteration) as the log has it. Start; the instant of its schedule call (None if the
-    # rank scheduled nothing); whether it applied a batch output (its dummy flag then hides real work).
+    # rank scheduled nothing); when it applied a batch output (None if none: its dummy flag then hides no real work).
     round_start: list[int] = field(default_factory=list)
     round_sched: list = field(default_factory=list)
-    round_upd: list[bool] = field(default_factory=list)
+    round_upd: list = field(default_factory=list)
     # call id -> how many rounds this rank had run when the call reached it (it joins the next round). A real rank's
     # iterations drift against its peers' clocks, so only this count, not the time, says which round a call joins.
     add_round: dict[str, int] = field(default_factory=dict)
@@ -137,16 +137,16 @@ class ReplayCost:
         sched_times = sorted(t - t0 for t in sched_t.values())
         rec = [e for e in ev if e["ev"] == "round"]
         rounds, round_dummy = [e["dur"] for e in rec], [e["dummy"] for e in rec]
-        round_start, round_sched, round_upd, sched_at, upd = [e["t"] - t0 for e in rec], [], [], None, False
+        round_start, round_sched, round_upd, sched_at, upd = [e["t"] - t0 for e in rec], [], [], None, None
         for e in ev:
             if e["ev"] == "sched" and sched_at is None:
                 sched_at = e["t"] - t0
             elif e["ev"] == "upd":
-                upd = True
+                upd = e["t"] - t0
             elif e["ev"] == "round":
                 round_sched.append(sched_at)
-                round_upd.append(upd)
-                sched_at, upd = None, False
+                round_upd.append(e["upd"] if "upd" in e else upd)
+                sched_at, upd = None, None
         add_round, n = {}, 0
         for e in ev:
             n += e["ev"] == "round"
@@ -176,7 +176,8 @@ class ReplayCost:
             else:
                 d.append(u["t"] - s["t"])
         return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds,
-                   round_dummy=round_dummy, add_round=add_round, rids=rids, kv_done_step=kv_done_step)
+                   round_dummy=round_dummy, round_start=round_start, round_sched=round_sched, round_upd=round_upd,
+                   add_round=add_round, rids=rids, kv_done_step=kv_done_step)
 
     def reported_this_step(self, job_id: int) -> bool:
         """The logged worker reported offload job ``job_id`` in the step being replayed now (the last one priced).
@@ -201,7 +202,7 @@ def _drop_idle_rounds(costs: list[ReplayCost]) -> None:
         raise ValueError(f"DP ranks logged different numbers of rounds: {[len(c.rounds) for c in logged]}")
     if not logged:
         return
-    keep = [not all(c.round_dummy[i] and not (c.round_upd and c.round_upd[i]) for c in logged)
+    keep = [not all(c.round_dummy[i] and not (c.round_upd and c.round_upd[i] is not None) for c in logged)
             for i in range(len(logged[0].rounds))]
     kept_before = [0]
     for k in keep:

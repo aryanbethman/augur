@@ -644,12 +644,13 @@ class Coordinator:
         new = self._dpa_queue(r, queued, shape) if launched and shape is not None else None
         if launched:
             r.fifo.append(new)
-        end = queued if executed else start
+        end, applied = (queued if executed else start), None
         if outputs is not None:
             oldest = r.fifo.popleft()
             wait = new if new is not None else oldest
             end = queued if oldest is None else max(queued, (yield from self._dpa_wait(r, ("fwd", wait))))
             self._push(end, STEP_DONE, "dpa_done", (e, outputs))
+            applied = end
         if not executed:
             end = yield from self._dpa_wait(r, ("fwd", self._dpa_queue(r, end, None)))
         if r.n == 1 or r.n % self._dpa_interval == 0:
@@ -660,7 +661,7 @@ class Coordinator:
                 del self._dpa_arrived[key]
                 self._dpa_settle(key, [max(arrived.values())] * len(arrived))
             end = yield from self._dpa_wait(r, key)
-        self._dpa_log_round(r, start, end, not executed)
+        self._dpa_log_round(r, start, end, not executed, applied)
         r.gen = None
         self._dpa_set_at(r, end)
 
@@ -703,10 +704,12 @@ class Coordinator:
             self._dpa_settle(("fwd", j), [x.gpu_free for x in self._dpa_ranks])
         return j
 
-    def _dpa_log_round(self, r: _DpaRank, start: int, end: int, dummy: bool) -> None:
+    def _dpa_log_round(self, r: _DpaRank, start: int, end: int, dummy: bool, applied: int | None) -> None:
         log = r.e.core.scheduler._logger() if hasattr(r.e.core.scheduler, "_logger") else None
         if log:
-            log.write({"ev": "round", "t": start, "dur": end - start, "dummy": dummy})
+            # The batch update was logged when vLLM applied it, before its time was known: say it here.
+            log.write({"ev": "round", "t": start, "dur": end - start, "dummy": dummy,
+                       **({"upd": applied} if applied is not None else {})})
 
     def _dpa_replay_at(self, r: _DpaRank) -> int | None:
         """When the logged rank made its next iteration's schedule call (the iteration's start if it made none)."""
@@ -717,15 +720,17 @@ class Coordinator:
 
     def _dpa_replay_iteration(self, r: _DpaRank) -> None:
         """Replay of a real run: the iteration lasts what the log says (its sync and dummy forward included), and
-        the batch output it applies lands then."""
+        the batch output it applies lands when the log says it was applied."""
         c = r.e.ctx.cost
         start = c.round_start[r.n]
         end = start + c.rounds[r.n]
+        applied = None
         if c.round_sched[r.n] is not None:
             outputs = self._dpa_engine_step(r)[0]
             if outputs is not None:
-                self._push(end, STEP_DONE, "dpa_done", (r.e, outputs))
-        self._dpa_log_round(r, start, end, c.round_dummy[r.n])
+                applied = end if c.round_upd[r.n] is None else c.round_upd[r.n]
+                self._push(applied, STEP_DONE, "dpa_done", (r.e, outputs))
+        self._dpa_log_round(r, start, end, c.round_dummy[r.n], applied)
         if r.idx == 0:
             self.dp_rounds += 1
         self.dp_dummy_forwards += c.round_dummy[r.n]
