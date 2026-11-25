@@ -8,6 +8,9 @@
 #          settings come from its server.log; these env vars state or override them: MAX_MODEL_LEN MAX_BATCHED_TOKENS
 #          MAX_NUM_SEQS NUM_GPU_BLOCKS PREFIX_CACHING=on|off SCHEDULING_POLICY=fcfs|priority ASYNC_SCHEDULING=sync|async
 #          SHARED_KV=on (augur only: the profile's shared-KV decode term, off by default so that every simulator has one price)
+#          ACCEPT_LEN=<tokens per step> (BLIS only: one speculative acceptance length instead of the run's measured one)
+#          AUGUR_TOKENS=<tokens.jsonl> (augur only: emit these output ids, so that ngram drafts and acceptance come from
+#          the content, instead of unique ids drawn at --spec-accept-rate)
 #          BLIS_ENCODING=greedy|best (how BLIS gets prefix groups and sessions; greedy, the default, is the earlier runs').
 #          The workload's per-request "priority" goes to BLIS (blis_priority.patch, built into
 #          inference-sim-prio/blis-ext-prio) and Frontier; Vidur has none, so it is not run. Prefix caching off:
@@ -73,7 +76,7 @@ augur() {
   rm -f $O/augur_steps.*.jsonl
   $PY -m augur.cli --model Qwen/Qwen3-1.7B --hardware RTX4060Ti --cost tables --num-gpu-blocks $(get num_gpu_blocks) \
     --max-num-seqs $(get max_num_seqs) --max-num-batched-tokens $(get max_num_batched_tokens) \
-    --max-model-len $(get max_model_len) $extra --step-cpu-us 2000 $([ "${SHARED_KV:-off}" = on ] || echo --no-shared-kv) --no-recorded-outputs --filler-vocab 150000 --quiet \
+    --max-model-len $(get max_model_len) $extra --step-cpu-us 2000 $([ "${SHARED_KV:-off}" = on ] || echo --no-shared-kv) $([ -n "${AUGUR_TOKENS:-}" ] && echo "--replay-tokens $AUGUR_TOKENS" || echo --no-recorded-outputs) --filler-vocab 150000 --quiet \
     --workload $wl --num-entries $(get num_entries) --step-log-vllm $O/augur_steps --output $O/augur.csv > $O/augur.log 2>&1
 }
 
@@ -110,7 +113,7 @@ blis() {
     [ -n "$V" ] && flags="--session-mode fixed-accumulate" || flags="--session-mode closed-loop"
   fi
   if [ "$k" != 0 ]; then
-    flags="$flags --speculative-acceptance-length $(get acceptance.mean_tokens_per_step)"; export BLIS_SPEC_K=$k
+    flags="$flags --speculative-acceptance-length ${ACCEPT_LEN:-$(get acceptance.mean_tokens_per_step)}"; export BLIS_SPEC_K=$k
   fi
   [ "$(get async_scheduling)" = true ] && export BLIS_PRICER_NO_CPU=1 || unset BLIS_PRICER_NO_CPU
   # KV offload transfers as augur's control prices them: the PCIe rate measured on the real runs (12.7 GB/s), and
