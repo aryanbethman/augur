@@ -39,6 +39,7 @@ augur with the real run's arrival times and step durations
 | ShareGPT 300, TP2 (GPU 0 + 1), sync | 2,262 / 2,262 |
 | ShareGPT 300, TP2, async | 2,265 / 2,265 |
 | ShareGPT 300, small MoE (8 layers, 16 experts, dummy weights), DP2 + EP, sync | 1,919 / 1,919 and 2,151 / 2,151 |
+| ShareGPT 300, small MoE, DP2 + EP, async | 1,985 / 1,985 and 2,187 / 2,187 |
 | ShareGPT 300, KV cut to 520 blocks (228 preemptions), sync | 31,931 / 31,931 |
 | ShareGPT 300, KV cut to 520 blocks (225 preemptions), async | 31,985 / 31,985 |
 | SWE-bench 50 sessions, KV cut to 1,550 blocks, sync | 39,044 / 39,044 |
@@ -51,7 +52,21 @@ and 9 dummy forwards on the two ranks, come from a small MoE with random weights
 16 GB GPUs. The logging scheduler records those rounds (vLLM runs a dummy forward outside the scheduler), and replay
 places each call in the round the log says. Multi-GPU replays take the real run's output tokens
 (`--replay-tokens`): identical prompts decoded greedily generate identical tokens, whose blocks then share prefix-cache
-hits after a preemption. Not exact yet: a real async DP MoE run (differs from the first step).
+hits after a preemption.
+
+Async DP has replayed exactly since 2026-11-25. Before that it differed from the first step (370 and 462 identical
+steps). vLLM 0.33's DP loop (DPEngineCoreProc, batch queue of 2) does not hide scheduling behind the GPU:
+- A rank schedules batch k and launches it, then waits for batch k-1. That batch's output resolves only when the
+  forward after it ends.
+- A rank with nothing to run runs a dummy forward.
+- All ranks sync at the first iteration and every 16 iterations.
+
+augur used to schedule the next batch at once, as single-engine async does. Now each rank iterates as that loop
+does, and replay plays each rank's logged iterations. Normal async DP runs now pay the step's CPU time as sync runs
+do. On a DP2 + EP2 Qwen3-30B-A3B ShareGPT run, mean TTFT is +11% (1,475 → 1,639 ms) and mean latency +3.4% against
+the earlier model. Two gaps remain, neither affecting replay:
+- An idle DP group sleeps in augur, where vLLM keeps running dummy rounds until the next sync.
+- An empty batch's output lands about 0.35 ms later in the real logs (2 cases).
 
 Replay takes the KV block count from the server log (it varies run to run)
 and uses `--no-recorded-outputs`; runs from `augur.verify.client` add
@@ -442,7 +457,25 @@ are in the tool's CSV.
 | random 12 req/s | mean TTFT, TPOT, throughput | −1.2%, +0.4%, +0.6% | −3.4%, −2.1%, +2.0% |
 
 At 0.2 sessions/s the async SWE-bench engine is rarely saturated and the two
-schedulers agree. With speculation and a q=1 profile both price verification
+schedulers agree. Higher session rates do not separate them either. These are SWE-bench 50 runs at 0.5, 1.0 and
+2.0 sessions/s, sync and async: six real runs (2026-11-25), each replayed exactly (9,995-10,591 steps). augur is
+within −0.3 to +2.2% of real mean TTFT, TPOT and latency, and LLMServingSim within −1.6 to +3.4%:
+
+| Rate | augur, sync | LLMServingSim, sync | augur, async | LLMServingSim, async |
+| --- | --- | --- | --- | --- |
+| 0.5 sessions/s | +0.8 / +0.2 / +0.8% | −1.2 / −0.9 / −1.0% | +1.0 / +2.2 / +1.2% | +1.7 / +3.4 / +1.8% |
+| 1.0 sessions/s | +0.9 / −0.3 / +0.7% | −0.6 / −1.6 / −0.8% | +1.3 / +1.6 / +1.2% | +0.2 / +1.6 / +0.6% |
+| 2.0 sessions/s | 0.0 / +0.3 / −0.1% | −0.9 / −1.3 / −1.3% | +0.8 / +1.0 / +0.8% | +0.7 / +2.1 / +1.0% |
+
+Cells are mean TTFT / TPOT / latency, off real.
+- Real vLLM is saturated from 0.5 sessions/s: mean TTFT is 24-26 s and the run lasts 870-900 s at every rate.
+  With 24k-token contexts only a few requests fit in the KV cache, so the batch is set by KV, not by the rate. A
+  smaller KV cache, not a higher rate, is what would stress the two schedulers.
+- Preemptions (real / augur / LLMServingSim) are 12-20 / 13-20 / 15-24.
+- The exception is augur at 2.0 async, with 7 against 20 real. Replay is exact there, so step time is the cause; not
+  yet traced.
+- Percentiles are within about ±5%, except p99 TPOT: +6 to +10% for augur, up to +10% for LLMServingSim.
+- LLMServingSim takes 21-35 s a run (304 MB), augur 7-11 s. With speculation and a q=1 profile both price verification
 steps as one-token decodes (section 3); the fork reads the shipped q=2,4
 tables as augur does.
 On sync runs and at light load augur is closer: LLMServingSim has no term for
@@ -590,6 +623,32 @@ three flat workloads (TTFT +5-9%) and +49% on the agent sessions. These comparis
 shared-KV term of section 2, so against the real client every simulator was 15-85% slow here; with that term augur's
 own runs are within 1.2-5% of real mean latency (tenants +5.0%, few-shot +1.5%, RAG +3.5%, agent sessions +1.2%).
 
+**Picking a setting** (`scripts/baselines/sweep.py`, 2026-11-25). The sweep varies max-num-batched-tokens over
+six values on the tenants workload (400 requests at 6/s). Each value has one real run on GPU 0 and a run of every
+simulator. The metric, fixed before the results, is mean end-to-end latency, in seconds:
+
+| Budget | Real | augur | augur, shared price | BLIS (best encoding) | Frontier | Vidur |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256 | 58.9 | 66.3 | 113.7 | 115.7 | 113.8 | 112.7 |
+| 512 | 52.5 | 57.1 | 102.0 | 97.1 | 103.6 | 123.8 |
+| 1,024 | 44.5 | 47.1 | 83.2 | 81.6 | 84.5 | 122.8 |
+| 2,048 | 40.8 | 42.9 | 75.7 | 75.7 | 76.0 | 129.5 |
+| 4,096 | 40.3 | 42.2 | 72.7 | 73.2 | 73.3 | 115.0 |
+| 8,192 | 39.8 | 42.1 | 72.6 | 72.7 | 73.7 | 111.0 |
+
+"augur" is augur as a user runs it, with the shared-KV term of section 2. "Shared price" is the price every other
+simulator gets, without that term.
+- **Picking the best:** the real curve falls monotonically and flattens. augur, BLIS and Vidur pick the real best,
+  8,192. Kendall tau is 1.0 for augur and BLIS, but 0.2 for Vidur, whose pick is luck. Frontier swaps the near-tie
+  at the top (tau 0.87, regret 1.3%).
+- **Absolute error:** only augur with the shared-KV term is close, at 3-13% above real. The rest are 70-90% above,
+  because a simulator without vLLM's block ids cannot price decodes that share KV.
+- **Limits:** a monotone setting cannot separate the schedulers. A setting whose best lies inside the range, such
+  as KV size, is next. There is one real run per value, so run-to-run noise is not measured.
+- **Throughput:** a 100-configuration sweep (10 budgets × 10 arrival-rate scales), 4 runs at a time on 4 cores, does
+  414 configurations an hour on augur and 431 on BLIS. Both used the same Python pricer, so this compares the
+  schedulers, not BLIS's native latency model.
+
 ## 6. A KV offload policy written as a vLLM plugin
 
 vLLM 0.33's CPU offloading manager takes its eviction policy by name from the connector's extra config
@@ -682,6 +741,75 @@ on SWE-bench also building the filler prompt ids of long prompts). 1,024 GPUs ta
 (SWE-bench) of wall time. Given augur's price through a pipe, BLIS's scheduler costs 1.2-2.2x less CPU than augur.
 The pipe rows used a BLIS build with one shared pricer process whose source is not in the repo, and no longer on
 the test host either (only its binary): those rows cannot be rebuilt from the repo until that patch is recovered.
+The engines in those runs were lightly loaded, and start-up was half of augur's CPU at 16 GPUs. speed.py's defaults
+are now the production load below. The table above rebuilds with `gen --per-gpu 12 --rate 1.0` (ShareGPT) and
+`--per-gpu 1 --rate 0.1` (SWE-bench).
+
+**At production load** (2026-11-25, one run per point on a shared host, so the ratios are rough). Each GPU runs at
+the real single-GPU run's rate: ShareGPT has 100 calls per GPU at 10 req/s, SWE-bench 12 sessions per GPU at
+0.2/s. Engines are busy 80-91% of simulated time in augur. At the real run's length augur's batch matches the real
+one (57.0 against 58.7 requests a step); at 100 calls per GPU it is 42, because ramp-up and drain weigh more.
+
+| Workload | GPUs | augur CPU s (start-up + run) / RSS | BLIS CPU s / RSS |
+| --- | --- | --- | --- |
+| ShareGPT | 16 | 6.9 + 18.3 / 1.6 GB | 3.8 / 0.6 GB |
+| | 64 | 7.3 + 82 / 2.1 GB | 16 / 2.7 GB |
+| | 256 | 8.6 + 380 / 4.3 GB | 100 / 20.6 GB |
+| | 1,024 | 14.6 + 1,808 / 13.7 GB | did not finish: stopped at 81.7 GB after 309 s |
+| SWE-bench | 16 | 7.4 + 26.8 / 1.5 GB | 6.9 / 0.5 GB |
+| | 64 | 7.7 + 118.5 / 1.8 GB | 31.9 / 2.3 GB |
+| | 256 | 9.0 + 537 / 3.0 GB | 178 / 10.6 GB |
+| | 1,024 | 14.0 + 2,765 / 8.2 GB | 1,575 / 66.7 GB |
+
+- **CPU:** BLIS spends 4-7x less CPU at 16-64 GPUs and 1.8x less at 1,024 on SWE-bench.
+- **Memory:** BLIS's grows with the run. At 1,024 GPUs it needs 8x augur's on SWE-bench, and on ShareGPT more than
+  this 125 GB host allows.
+
+Where augur's time goes at 1,024 GPUs (pyinstrument, % of the run after start-up, ShareGPT / SWE-bench):
+
+| Part | ShareGPT | SWE-bench |
+| --- | --- | --- |
+| vLLM KV manager | 18% | 12% |
+| vLLM scheduler | 12% | 10% |
+| vLLM output processing | 12% | 6% |
+| Other vLLM request and engine-core code | 10% | 8% |
+| augur executor | 17% | 11% |
+| Counting shared KV blocks | 12% | 15% |
+| Pricer | 6% | 19% |
+| Event loop | 10% | 16% |
+
+Counting shared KV blocks runs even with prefix caching off, where nothing can be shared. vLLM's stats and logging
+are already off.
+
+**Parallel workers** (`--workers N`, 2026-11-25):
+- **How it works:**
+  - Workers are forked processes, each holding every N-th engine.
+  - The main process keeps the workload, router and recorder.
+  - A completion can reach the router or a session no earlier than the delivery latency after it. So workers advance
+    in windows bounded by that latency, or by 1 s of arrivals when the router reads neither completions nor engine
+    state and no session call is in flight.
+  - Routers that read engine state (least-loaded, kv-aware) stop the workers at every arrival.
+- **Byte-identical to one process:**
+  - ShareGPT and SWE-bench at 64 and 256 GPUs at production load (5,878-25,600 calls).
+  - ShareGPT at 1,024 GPUs (61,440 calls) with 4, 8 and 16 workers.
+  - Power-of-two and least-loaded at 64 GPUs.
+  - A test of every router kind, sync and async, with sessions.
+- **Timing:** 1,024 GPUs, ShareGPT at 10 req/s per GPU, 60 calls per GPU (1.1M steps), on 8 cores:
+
+| Router | Workers | Wall | CPU | Memory (summed PSS) |
+| --- | --- | --- | --- | --- |
+| round-robin | 1 | 1,150 s | 1,151 s | 9.9 GB |
+| round-robin | 4 | 288 s | 1,032 s | 13.8 GB |
+| round-robin | 8 | 222 s | 1,505 s | 13.8 GB |
+| round-robin | 16 | 222 s | 1,457 s | 13.9 GB |
+| power-of-two | 8 | 252 s | 1,424 s | 14.2 GB |
+| least-loaded | 8 | 299 s | 1,577 s | 13.9 GB |
+
+- **Speed-up:** 5.2x at 8 workers, with no gain past 8 on 8 cores. The main process is the likely limit; it has not
+  been profiled.
+- **Start-up:** building 1,024 engines still takes 33 s on one core before the fork.
+- **Not yet supported:** DP, prefill/decode engines, `--contention on`, replay and the LLMServingSim pricer are
+  refused with workers.
 
 ## Modeled, not yet checked against real vLLM
 

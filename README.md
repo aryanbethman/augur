@@ -84,6 +84,10 @@ MultiConnector of NIXL and the OffloadingConnector) and with DP.
 from the same file a real vLLM server loads (`examples/kv_offload_policies.py`;
 docs/accuracy.md section 6). `--replicate-sessions K` repeats a session
 workload K times with disjoint prefixes, for larger clusters.
+`--workers N` runs the engines in N worker processes. The output is the same bytes as one process.
+Workers sync only where engines interact: at arrivals for routers that read engine state, otherwise
+in windows bounded by the delivery latency. It does not yet support DP, prefill/decode engines,
+`--contention on` or replay (docs/accuracy.md section 7).
 
 `--contention on` turns every KV transfer (offload, tiers, prefill/decode
 pulls) into a flow through shared resources (PCIe links, the host's PCIe root
@@ -146,7 +150,7 @@ augur/
 tests/                 pytest; replay self-tests and LLMServingSim comparison need the fork
   data/llmservingsim/  LLMServingSim reference outputs for the comparison
 scripts/               real-run, profiling and test-data scripts
-  baselines/           the same-step-time test against BLIS, Frontier and Vidur (docs/accuracy.md section 5)
+  baselines/           against BLIS, Frontier and Vidur: same step times, setting sweeps, speed (docs/accuracy.md 5, 7)
 examples/              research uses: a custom scheduler, KV offload eviction policies as vLLM plugins
 docs/accuracy.md       current accuracy against real vLLM and other simulators
 augur-todo.md          open work, in priority order
