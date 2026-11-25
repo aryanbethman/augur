@@ -167,12 +167,6 @@ class SimEngine:
         self.last_progress_ns = 0  # last step that scheduled tokens, or when work arrived at an idle engine
         self.async_sched = self.core.batch_queue is not None
         self.ctx.async_cpu = self.async_sched
-        # DP + async: rounds this rank's queued batches belong to (FIFO, as
-        # vLLM's batch queue), popped outputs held until that round ends here.
-        self.dp_fifo: "deque[int]" = deque()
-        self.dp_held: dict[int, dict] = {}
-        self.dp_blocked_on: int | None = None
-        self.dp_next_round = 0
         self.gpu_free_at = 0  # async: when the GPU stream finishes its queued batches
         self.batch_finish: "deque[int]" = deque()  # async: finish time per queued batch, FIFO
         self.batch_reports: "deque[bool]" = deque()  # async: per queued batch, its KV connector worker reported something

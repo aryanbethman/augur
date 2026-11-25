@@ -229,3 +229,21 @@ def test_real_dp_logs_drop_the_rounds_nobody_needed(tmp_path):
     short = log(tmp_path / "c.jsonl", [(5, False)])
     with pytest.raises(ValueError, match="different numbers of rounds"):
         ReplayCost.from_logs([a, short])
+
+
+def test_async_dp_logs_keep_the_last_iteration_that_applied_a_batch(tmp_path):
+    """An async rank's final iteration is a dummy forward too, but it applied the last batch: only the rounds nobody
+    needed (dummy on every rank, nothing applied) are dropped."""
+    def log(path, rounds):
+        recs = []
+        for i, (d, dummy, upd) in enumerate(rounds):
+            recs += [{"ev": "upd", "t": 10 * i + 5, "k": i, "out": {}, "fin": [], "left": 0}] * upd
+            recs.append({"ev": "round", "t": 10 * i, "dur": d, "dummy": dummy})
+        path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+        return str(path)
+
+    a = log(tmp_path / "a.jsonl", [(5, False, 0), (6, True, 1), (7, True, 0), (8, True, 0)])
+    b = log(tmp_path / "b.jsonl", [(5, True, 0), (6, True, 0), (7, True, 0), (8, True, 0)])
+    costs = ReplayCost.from_logs([a, b])
+    assert [c.rounds for c in costs] == [[5, 6]] * 2
+    assert costs[0].round_upd == [None, 5 + 10] and costs[0].round_start == [0, 10]

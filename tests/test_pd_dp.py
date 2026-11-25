@@ -91,17 +91,28 @@ def _span(engines):
     return max(row[0] + row[1] for e in engines for row in e.step_log)
 
 
-def test_async_dp_round_hides_step_cpu_time_like_one_engine(tmp_path, workload):
-    """GPU round 8 ms. CPU time under it is hidden (async) except at the start of a busy period; above it,
-    the CPU is the bottleneck and every round is spaced by the CPU time. Sync pays it on every round."""
+def test_async_dp_pays_the_step_cpu_time_like_sync(tmp_path, workload):
+    """vLLM's DP loop blocks on a forward before it schedules the next batch, so async scheduling hides none of the
+    CPU time (a single engine's does): every round costs the CPU time on top of the 8 ms forward, in both modes."""
     span = {}
     for mode, cpu in [("a", 0), ("a", 2_000_000), ("a", 20_000_000), ("s", 0), ("s", 2_000_000)]:
         coord, engines, rec = dp_run(tmp_path, workload, mode == "a", cpu)
         assert len(rec.done) == 12
         span[mode, cpu] = _span(engines)
-    assert span["a", 0] < span["a", 2_000_000] - 1_000_000 < span["s", 2_000_000] - 1_000_000
-    assert span["a", 2_000_000] - span["a", 0] < (span["s", 2_000_000] - span["s", 0]) / 3
+    paid = {mode: span[mode, 2_000_000] - span[mode, 0] for mode in "as"}
+    assert paid["a"] > 1_000_000 and abs(paid["a"] - paid["s"]) < 0.05 * paid["s"]
     assert span["a", 20_000_000] > span["a", 2_000_000] + 20_000_000
+
+
+def test_async_dp_schedules_each_batch_after_the_forward_it_waited_on(tmp_path, workload):
+    """Regression (2026-11-25): augur queued the next batch while the forward ran. Both real async DP runs show
+    vLLM's loop (batch queue of 2) scheduling it only once that forward ended: back-to-back rounds are one CPU time
+    apart, and the ranks' rounds start together (the EP collectives)."""
+    _, engines, _ = dp_run(tmp_path, workload, True, 2_000_000)
+    rows = [e.step_log for e in engines]
+    assert [r[0] for r in rows[0]] == [r[0] for r in rows[1]]
+    gaps = [b[0] - a[0] - a[1] for a, b in zip(rows[0], rows[0][1:])]
+    assert len(gaps) > 100 and min(gaps) >= 0 and sum(g == 2_000_000 for g in gaps) > 0.95 * len(gaps)
 
 
 def test_async_dp_first_round_waits_for_the_cpu_when_the_gpu_is_idle(tmp_path, workload):
