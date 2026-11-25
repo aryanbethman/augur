@@ -31,7 +31,6 @@ import multiprocessing as mp
 import time
 import traceback
 from types import SimpleNamespace
-from array import array
 from collections import defaultdict
 
 from augur.sim.coordinator import ARRIVAL, Coordinator, _Event, install_step_log_clock
@@ -134,7 +133,7 @@ class _Shard(Coordinator):
 
     def _finish(self, call_id, rec, eng) -> None:
         self._done.append((call_id, rec.first_sched_ns, rec.cached_tokens, rec.num_preemptions,
-                           array("q", rec.token_times)))
+                           rec.token_times))
         del self._calls[call_id], self._records[call_id]
         eng.ctx.output_ids.pop(call_id, None)
         eng.ctx.recorded.discard(call_id)
@@ -264,7 +263,7 @@ class ParallelCoordinator(Coordinator):
             for cid, first_sched, cached, preempted, times in done:
                 rec = self._records[cid]
                 rec.first_sched_ns, rec.cached_tokens, rec.num_preemptions = first_sched, cached, preempted
-                rec.token_times = times.tolist()
+                rec.token_times = times
                 self._finish(cid, rec, self._call_engine[cid])
 
     @staticmethod
