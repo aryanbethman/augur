@@ -921,7 +921,16 @@ class Coordinator:
     def run(self) -> Recorder:
         t0 = time.perf_counter()
         self._pull_entry()
-        while self._q:
+        self._drain()
+        if self._records:
+            raise RuntimeError(f"{len(self._records)} calls never finished (e.g. {next(iter(self._records))})")
+        self.wall_s = time.perf_counter() - t0
+        return self.recorder
+
+    def _drain(self, until: int | None = None) -> None:
+        """Process every instant of the queue before ``until`` (all of it when None). A parallel worker's
+        shard (augur.sim.parallel) runs the loop in windows."""
+        while self._q and (until is None or self._q[0].t < until):
             self.now = self._q[0].t
             if self.fabric is not None:
                 self._advance_fabric()
@@ -947,7 +956,3 @@ class Coordinator:
                 self._start_steps()  # an idle engine picks the call up at once
             if self.fabric is not None:
                 self._arm_fabric()
-        if self._records:
-            raise RuntimeError(f"{len(self._records)} calls never finished (e.g. {next(iter(self._records))})")
-        self.wall_s = time.perf_counter() - t0
-        return self.recorder

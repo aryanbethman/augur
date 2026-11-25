@@ -65,6 +65,10 @@ class _Policy:
     routing until the response stream ends. Called by: Coordinator._pick
     (route), Coordinator._finish and _on_step_done (release). Calls: choose."""
 
+    # What choose reads beyond its own state, for --workers (augur.sim.parallel): "none", completions known up to
+    # the call's arrival ("completions": in-flight counts), or the engines' own state at that instant ("engines").
+    needs = "none"
+
     def __init__(self) -> None:
         self.in_flight: dict[int, int] = defaultdict(int)
         self._engine_of: dict[str, int] = {}
@@ -111,6 +115,8 @@ class LeastLoaded(_Policy):
     """Fewest waiting + running requests in the engine; ties go to the lowest
     engine id. Matches the fork's default router, which counts requests only."""
 
+    needs = "engines"
+
     def choose(self, call, engines, now_ns):
         return min(engines, key=lambda e: (e.load(), e.engine_id)).engine_id
 
@@ -125,6 +131,8 @@ class RandomChoice(_Policy):
 
 
 class PowerOfTwo(_Policy):
+    needs = "completions"
+
     def __init__(self, seed: int = 0) -> None:
         super().__init__()
         self.rng = random.Random(seed)
@@ -142,6 +150,8 @@ class PowerOfTwo(_Policy):
 
 class CacheAware(_Policy):
     """The vLLM Router's cache_aware policy, normal (token id) path. Calls: PrefixTree."""
+
+    needs = "completions"
 
     def __init__(self, cache_threshold: float = 0.3, balance_abs_threshold: int = 64,
                  balance_rel_threshold: float = 1.5, eviction_interval_s: float = 120.0,
@@ -458,6 +468,8 @@ class KvAware(_Policy):
     as the router's pick_decode does by load).
     Calls: KvIndex. Fed by: Coordinator._on_step_done (observe, first_token).
     """
+
+    needs = "engines"
 
     def __init__(self, credits: dict | None = None) -> None:
         super().__init__()

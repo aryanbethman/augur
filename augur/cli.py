@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import os
 import sys
@@ -154,6 +155,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="a session workload K times over, for a larger cluster: copy k of session S is S-r<k>, "
                         "arriving up to --replicate-jitter-s after S; copies share no prefix (workload.py)")
     p.add_argument("--replicate-jitter-s", type=float, default=5.0)
+    p.add_argument("--workers", type=int, default=1,
+                   help="run the engines in this many worker processes (same output as 1; needs the engines to be "
+                        "independent: no --dp, prefill/decode engines, --contention on or replay)")
     p.add_argument("--engines", type=int, default=1, help="colocated engines (ignored with --prefill-engines)")
     p.add_argument("--prefill-engines", type=int, default=0, help="PD: prefill engines (NIXL kv_producer)")
     p.add_argument("--decode-engines", type=int, default=0, help="PD: decode engines (NIXL kv_consumer)")
@@ -558,6 +562,11 @@ def main(argv: list[str] | None = None) -> int:
     if bool(a.prefill_engines) != bool(a.decode_engines):
         print("augur: PD needs both --prefill-engines and --decode-engines", file=sys.stderr)
         return 2
+    if a.workers > 1:
+        from augur.sim.parallel import unsupported
+        if why := unsupported(a):
+            print(f"augur: {why}", file=sys.stderr)
+            return 2
     num_engines = a.dp if a.dp > 1 else (a.prefill_engines + a.decode_engines or a.engines)
     a.num_engines = num_engines
     try:
@@ -766,7 +775,12 @@ def main(argv: list[str] | None = None) -> int:
         # Each call goes where its log says (the placing policy is not what is replayed).
         from augur.verify.replay import ReplayRouter
         entry_router, decode_router = ReplayRouter.from_logs(replay_logs)
-    coord = Coordinator(engines, entry_router, workload,
+    if a.workers > 1:
+        from augur.sim.parallel import ParallelCoordinator
+        make_coordinator = functools.partial(ParallelCoordinator, workers=a.workers)
+    else:
+        make_coordinator = Coordinator
+    coord = make_coordinator(engines, entry_router, workload,
                         lss_idle_quantum_ns=1_000_000 if a.lss_loop_compat else 0,
                         decode_router=decode_router, topology=topology,
                         pd_link=PDLink(bw_gbps=a.pd_link_bw, latency_ns=a.pd_link_latency_ns, contention=a.pd_contention),
