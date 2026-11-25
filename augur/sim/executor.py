@@ -283,7 +283,8 @@ class SimWorker:
             self.ctx.deliver_sending.clear()
 
         work: list[tuple[str, int, int]] = []  # (req_id, computed_before, num_new)
-        track = getattr(self.ctx.cost, "prices_sharing", False)  # the cost model prices KV blocks several requests read
+        # The cost model prices KV blocks several requests read; with prefix caching off no block has two owners.
+        track = getattr(self.ctx.cost, "prices_sharing", False) and bool(self.vllm_config.cache_config.enable_prefix_caching)
         # A new request's computed tokens at its first schedule are its prefix-cache hit.
         self.ctx.last_new_req_ids = {nr.req_id: nr.num_computed_tokens for nr in so.scheduled_new_reqs}
         self.ctx.last_preempted_req_ids = list(so.preempted_req_ids or ())
@@ -324,6 +325,7 @@ class SimWorker:
         shared = shared_tokens([(rid, self.reqs[rid].blocks, before) for rid, before, n in work
                                 if n == 1 or (spec.get(rid) and n == 1 + len(spec[rid]))],
                                self.vllm_config.cache_config.block_size) if track else {}
+        replay = self._replay_step()  # the cost model advances only after this loop
         for rid, before, num_new in work:
             st = self.reqs[rid]
             known = st.num_prompt + st.num_output
@@ -343,7 +345,6 @@ class SimWorker:
                 # sampled. Content decides acceptance on a GPU; augur cannot
                 # see content, so the rate is a parameter.
                 accepted = 0
-                replay = self._replay_step()
                 faithful = st.context is not None and replay is None
                 if replay is not None:
                     # Replay: the logged run's acceptance (content-dependent).
