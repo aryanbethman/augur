@@ -96,7 +96,21 @@ def _randranges(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
         words = np.frombuffer(rng.getrandbits(32 * m).to_bytes(4 * m, "little"), dtype="<u4")
         r = (words >> np.uint32(32 - k)).astype(np.int64)
         out = np.concatenate([out, r[r < n]])
-    return (out[:count] + lo).tolist()
+    return _interned(out[:count] + lo, hi)
+
+
+_INTS: dict[int, np.ndarray] = {}
+
+
+def _interned(ids: np.ndarray, hi: int) -> list[int]:
+    """``ids.tolist()`` with each id the one shared int object for its value: a prompt or output id then costs the
+    8-byte list slot instead of 40, and a request in flight holds several lists of them (the call, vLLM's Request)."""
+    if hi > 1 << 20:
+        return ids.tolist()
+    table = _INTS.get(hi)
+    if table is None:
+        table = _INTS[hi] = np.arange(hi, dtype=np.int64).astype(object)
+    return table[ids].tolist()
 
 
 @dataclass
