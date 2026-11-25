@@ -187,11 +187,20 @@ class ParallelCoordinator(Coordinator):
         self._load = defaultdict(int)
         self._unsent = defaultdict(int)
         self._sessions_in_flight = 0
+        self._pending = False  # a window is out whose answer main has not read
         self._limit = INF  # main may apply queue events before this
         for e in self.engines:  # what a router reads, as the workers last reported
             e.load = lambda e=e: self._load[e.engine_id] + e.admitting + self._unsent[e.engine_id]
 
     def _push(self, t, prio, kind, payload) -> None:
+        if kind == "admit" and self.needs != "engines":
+            # A call reaching its engine after the front end: ship it with its time now, so workers can run past the
+            # routing horizon by the front end's delay. Routers that read engine state need `admitting`, so they keep the event.
+            eng, call = payload
+            eng.admitting -= 1
+            self._out[self._owner[eng.engine_id]].append((t, eng.engine_id, call))
+            self._outmin = min(self._outmin, t)
+            return
         heapq.heappush(self._q, _Event(t, prio, (*self._ctx, next(self._seq)), kind, payload))
 
     def _admit(self, eng, call) -> None:
@@ -222,12 +231,23 @@ class ParallelCoordinator(Coordinator):
             self._on_arrival(ev)
 
     def _advance(self, until: int) -> None:
-        """Workers run every instant before `until`; their landings are applied here, in the single-process order."""
+        self._send(until)
+        self._collect()
+
+    def _send(self, until: int) -> None:
+        """Workers run every instant before `until`."""
+        if self._pending:
+            self._collect()  # not two windows ahead: main would block sending while a worker blocks replying
         for conn, out in zip(self._conns, self._out):
             conn.send(("adv", until, out, self.needs == "engines"))
         self._out = [[] for _ in range(self.workers)]
         self._unsent.clear()
         self._outmin = INF
+        self._pending = True
+
+    def _collect(self) -> None:
+        """What the workers did in the window sent last; its landings are applied here, in the single-process order."""
+        self._pending = False
         landings = []
         for i, conn in enumerate(self._conns):
             lands, loads, self._next_event[i] = self._recv(conn)
@@ -261,9 +281,17 @@ class ParallelCoordinator(Coordinator):
             raise ValueError(f"--workers > 1 with --router {type(self.router).__name__} needs --delivery-latency-ms > 0")
         horizon = 0
         while True:
+            # Without sessions and with a router that reads nothing back, no answer changes what main does next until
+            # the end: main routes the next window while the workers run this one.
+            lazy = self.needs == "none" and not self._sessions_in_flight
+            if self._pending and not lazy:
+                self._collect()
             main_next = self._q[0].t if self._q else INF
-            first = min(main_next, min(self._next_event), self._outmin)
+            first = min(main_next, self._outmin) if self._pending else min(main_next, min(self._next_event), self._outmin)
             if first >= INF:
+                if self._pending:
+                    self._collect()
+                    continue
                 return
             horizon = max(horizon, first)
             ahead = delivery if self._sessions_in_flight or self.needs == "completions" else INF
@@ -276,8 +304,9 @@ class ParallelCoordinator(Coordinator):
             until = INF if main_next >= INF and ahead >= INF else horizon + min(ahead, WINDOW_NS)
             self._limit = until
             self._apply_main_events(INF)
-            until = self._limit
-            self._advance(until)
+            # a call routed at or after the limit reaches its engine at least `front` later
+            until = self._limit if self._limit >= INF else self._limit + self.frontend_latency_ns
+            (self._send if lazy and ahead >= INF else self._advance)(until)
             horizon = until
 
     def _start(self) -> None:
