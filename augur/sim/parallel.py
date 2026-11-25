@@ -30,6 +30,7 @@ import itertools
 import multiprocessing as mp
 import time
 import traceback
+from types import SimpleNamespace
 from array import array
 from collections import defaultdict
 
@@ -50,6 +51,23 @@ def unsupported(a) -> str | None:
     if a.contention == "on" or a.replay_durations or a.replay_arrivals or a.cost == "llmservingsim" or a.lss_loop_compat:
         return "--workers > 1 does not support --contention on, replay, --cost llmservingsim or --lss-loop-compat"
     return None
+
+
+class RemoteEngine:
+    """An engine of a worker as main sees it: the id, the load the router reads, and what the run's summary and step
+    logs take from it (filled when the workers finish). ``first`` is one real engine of the run, for what is the same
+    on all of them: config, cost model, block hasher."""
+
+    def __init__(self, engine_id: int, first) -> None:
+        self.engine_id, self.spec, self.max_model_len = engine_id, first.spec, first.max_model_len
+        self.vllm_config, self.async_sched, self.block_hasher = first.vllm_config, first.async_sched, first.block_hasher
+        self.ctx = SimpleNamespace(cost=first.ctx.cost, offload=None, output_ids={}, recorded=set())
+        self.busy, self.idle_since, self.admitting = False, None, 0
+        self.steps, self.sched_cpu_s, self.step_log = 0, 0.0, None
+
+    @property
+    def vllm_engine_id(self) -> str:
+        return f"augur-{self.engine_id}"
 
 
 class _NoWorkload:
@@ -122,8 +140,9 @@ class _Shard(Coordinator):
         eng.ctx.recorded.discard(call_id)
 
 
-def _serve(conn, engines, delivery_ns: int, kv: bool) -> None:
+def _serve(conn, build, ids, delivery_ns: int, kv: bool) -> None:
     try:
+        engines = build(ids)
         shard = _Shard(engines, delivery_ns, kv)
         install_step_log_clock(shard)
         while True:
@@ -155,8 +174,9 @@ def _serve(conn, engines, delivery_ns: int, kv: bool) -> None:
 
 
 class ParallelCoordinator(Coordinator):
-    def __init__(self, *args, workers: int, **kw) -> None:
+    def __init__(self, *args, workers: int, build, **kw) -> None:
         super().__init__(*args, **kw)
+        self._build = build  # ids -> the engines of that worker, built in it
         self.workers = min(workers, len(self.engines))
         self.needs = getattr(self.router, "needs", "engines")
         self._ctx = (0, 0, 0, 0)  # the instant being applied: what a pushed event is keyed by
@@ -266,9 +286,9 @@ class ParallelCoordinator(Coordinator):
         self._conns, self._procs = [], []
         gc.freeze()  # the workers share the built engines copy-on-write
         for i in range(self.workers):
-            mine = [e for e in self.engines if self._owner[e.engine_id] == i]
+            mine = [e.engine_id for e in self.engines if self._owner[e.engine_id] == i]
             parent, child = ctx.Pipe()
-            p = ctx.Process(target=_serve, args=(child, mine, self.delivery_latency_ns, kv), daemon=True)
+            p = ctx.Process(target=_serve, args=(child, self._build, mine, self.delivery_latency_ns, kv), daemon=True)
             p.start()
             child.close()
             self._conns.append(parent)
@@ -289,7 +309,7 @@ class ParallelCoordinator(Coordinator):
                     if log is not None:
                         e.step_log = log
                     if jobs is not None:
-                        e.ctx.offload.job_ns = jobs
+                        e.ctx.offload = SimpleNamespace(job_ns=jobs)
                 if extra is not None:  # each worker counts from the value it inherited
                     base = self._beyond0
                     beyond = (beyond or base) + extra - base

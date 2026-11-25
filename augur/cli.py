@@ -474,9 +474,9 @@ def _kv_reserve_bytes(a, mdir, profile) -> int:
     return reserve
 
 
-def _build_engines(a, spec, cost, replay_costs, topology) -> list:
+def _build_engines(a, spec, cost, replay_costs, topology, ids=None) -> list:
     """The run's engines: DP ranks, prefill + decode engines, or colocated ones, with augur's per-step terms.
-    Called by: main."""
+    ids picks which colocated engines to build (--workers: each worker builds its own). Called by: main."""
     from augur.sim.engine import SimEngine
     net_of = (lambda i: topology.net(i)) if a.contention == "on" else (lambda i: None)
     if a.dp > 1:
@@ -489,7 +489,7 @@ def _build_engines(a, spec, cost, replay_costs, topology) -> list:
         engines = [SimEngine(i, dataclasses.replace(spec, kv_role=r), replay_costs[i] if replay_costs else cost, net_of(i))
                    for i, r in enumerate(roles)]
     else:
-        engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost, net_of(i)) for i in range(a.engines)]
+        engines = [SimEngine(i, spec, replay_costs[i] if replay_costs else cost, net_of(i)) for i in (range(a.engines) if ids is None else ids)]
     if not a.replay_durations:  # a logged step's duration already holds its CPU time
         class_scales = parse_class_scales(a.step_class_scales)
         for e in engines:
@@ -724,7 +724,13 @@ def main(argv: list[str] | None = None) -> int:
         from augur.sim.fabric import Topology  # each decode engine's pulls share its pd.<engine> link
         topology = Topology.build([(i, a.tp) for i in range(a.num_engines)], nic_gbps=a.pd_link_bw,
                                   pd_mode="decode-link")
-    engines = _build_engines(a, spec, cost, replay_costs, topology)
+    if a.workers > 1:  # the workers build the engines; main keeps stand-ins and one real engine's config
+        from augur.sim.parallel import RemoteEngine
+        first = _build_engines(a, spec, cost, replay_costs, topology, ids=[0])[0]
+        engines = [RemoteEngine(i, first) for i in range(a.engines)]
+        build = functools.partial(_build_engines, a, spec, cost, replay_costs, topology)
+    else:
+        engines = _build_engines(a, spec, cost, replay_costs, topology)
     k_decode = 1.1 if a.hbm_interference is None else a.hbm_interference
     k_prefill = a.hbm_interference_prefill
     if k_prefill is None:  # --hbm-interference 0 alone turns interference off for every step
@@ -777,7 +783,7 @@ def main(argv: list[str] | None = None) -> int:
         entry_router, decode_router = ReplayRouter.from_logs(replay_logs)
     if a.workers > 1:
         from augur.sim.parallel import ParallelCoordinator
-        make_coordinator = functools.partial(ParallelCoordinator, workers=a.workers)
+        make_coordinator = functools.partial(ParallelCoordinator, workers=a.workers, build=build)
     else:
         make_coordinator = Coordinator
     coord = make_coordinator(engines, entry_router, workload,
