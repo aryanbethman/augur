@@ -9,11 +9,21 @@ simulator, so no sharing to encode), the router is round-robin in both, and the 
     python scripts/baselines/speed.py gen  OUT --kind sharegpt|swe --gpus N [--per-gpu R --rate L]
     python scripts/baselines/speed.py run  OUT --sim augur|blis|blis-pipe [--cores 4,5] [--rep K] [--results F]
     python scripts/baselines/speed.py table F...                      # median and spread over repetitions
-    python scripts/baselines/speed.py profile OUT [--top 40]          # pyinstrument of augur: self time by code, inclusive by function
+    python scripts/baselines/speed.py profile OUT [--top 40]          # pyinstrument of augur: self time by code and function, inclusive by function
+    python scripts/baselines/speed.py real LOGDIR                     # busy share and batch size of a real run's steps.*.jsonl
+
+The default load is production-like: ShareGPT at the real sharegpt300 run's 10 req/s per GPU (100 calls per GPU, 10 s of
+arrivals), SWE-bench at the real swe50 run's 0.2 sessions/s per GPU (``PER_GPU``). The 2026-11-24 runs used
+``--per-gpu 12 --rate 1.0`` (ShareGPT) and ``--per-gpu 1 --rate 0.1`` (SWE-bench); the same seed rebuilds those inputs.
 
 ``run`` is one measurement: the simulator under ``taskset -c CORES /usr/bin/time -v`` (wall, user+sys CPU, peak RSS),
 with the load average read before and after, appended to ``--results`` as a JSON line with the simulated time and the
-steps the simulator took. ``blis`` is BLIS's own latency model (qwen3-14b on an H100 from its catalog: no Qwen3-1.7B
+steps the simulator took, the share of simulated time each engine is busy (mean and min over engines), the mean batch
+size (requests per step) and, for augur, the CPU of start-up (imports and engine setup, up to the event loop) apart from
+the event loop's, and steps per steady-state CPU second. augur gets these from ``child`` (this script, run in its place:
+it counts steps as they are logged); BLIS from its Result (per-instance busy_share; batch size is output tokens per step,
+which leaves out a request still in prefill, and needs the step count of its ``--count`` build, run once after the timed
+run; its start-up CPU is not separable). ``blis`` is BLIS's own latency model (qwen3-14b on an H100 from its catalog: no Qwen3-1.7B
 or RTX 4060 Ti there, so its steps differ from augur's); ``blis-pipe`` takes augur's step price through
 pricer.py, as run.sh does, so its steps match augur's and the difference is the pipe.
 """
@@ -39,6 +49,9 @@ BASE_FILES = {"sharegpt": "sharegpt-qwen3-32b-300-sps10.jsonl", "swe": "swe-benc
 ENGINE = {"sharegpt": dict(max_model_len=8192, blocks=5334), "swe": dict(max_model_len=24576, blocks=5480)}
 FRONT_S, FRONT_PER_TOKEN_S, DELIVERY_S = 3.4e-3, 3e-6, 8e-3  # augur's default front end and delivery, which BLIS lacks
 SEQS, BATCHED = 128, 2048
+# default load per GPU: the real runs' rates (sharegpt300 10 req/s, swe50 0.2 sessions/s) and the entries per GPU
+PER_GPU = {"sharegpt": 100, "swe": 12}
+RATE = {"sharegpt": 10.0, "swe": 0.2}
 SHARED = os.environ.get("BLIS_SHARED", f"{HOME}/speedrun/blis-ext-count")
 
 
@@ -58,8 +71,8 @@ def _base(kind: str) -> list[dict]:
 
 def gen(a) -> int:
     kind, n = a.kind, a.gpus
-    per = a.per_gpu or (12 if kind == "sharegpt" else 1)
-    rate = a.rate or (1.0 if kind == "sharegpt" else 0.1)
+    per = a.per_gpu or PER_GPU[kind]
+    rate = a.rate or RATE[kind]
     rng = random.Random(a.seed)
     base = _base(kind)
     count = n * per
@@ -149,9 +162,47 @@ router:
                          capture_output=True, text=True, check=True).stdout
     open(os.path.join(a.out, "scen", "round-robin.yaml"), "w").write(cfg)
     json.dump(dict(kind=kind, gpus=n, per_gpu=per, rate=rate, seed=a.seed, entries=len(entries), calls=calls,
-                   **e), open(os.path.join(a.out, "meta.json"), "w"))
+                   last_arrival_ns=entries[-1]["arrival_time_ns"], **e), open(os.path.join(a.out, "meta.json"), "w"))
     print(f"{kind} {n} GPUs: {len(entries)} entries, {calls} calls, {os.path.getsize(os.path.join(a.out, 'wl.jsonl')) >> 10} KiB")
     return 0
+
+
+def child(extra: str, window_ns: int, argv: list[str]) -> int:
+    """augur's CLI in this process, plus what ``run`` reports: per engine the steps, busy time (the logged step
+    durations; all, and up to ``window_ns``, the last arrival), requests per step, and the process CPU at the start of
+    the event loop (imports and engine setup before it) and at its end. Written to ``extra`` as JSON."""
+    from augur import cli
+    from augur.sim.coordinator import Coordinator
+
+    class Agg:  # stands in for an engine's --step-log list (rows: start, dur, total, prefill tokens, n_decode, n_prefill, ...)
+        def __init__(s):
+            s.n = s.busy = s.win = s.reqs = 0
+
+        def append(s, row):
+            st, d = row[0], row[1]
+            s.n += 1
+            s.busy += d
+            s.win += max(0, min(st + d, window_ns) - st)
+            s.reqs += row[4] + row[5]
+    engines, cpu = [], {}
+    build, run = cli._build_engines, Coordinator.run
+
+    def build_agg(*x, **k):
+        engines[:] = build(*x, **k)
+        for e in engines:
+            e.step_log = Agg()
+        return engines
+
+    def timed_run(self):
+        cpu["loop_start"] = time.process_time()
+        r = run(self)
+        cpu["loop_end"] = time.process_time()
+        return r
+    cli._build_engines, Coordinator.run = build_agg, timed_run
+    rc = cli.main(argv)
+    json.dump(dict(cpu, engines=[[e.engine_id, e.step_log.n, e.step_log.busy, e.step_log.win, e.step_log.reqs]
+                                 for e in engines]), open(extra, "w"))
+    return rc
 
 
 def _load() -> float:
@@ -163,7 +214,7 @@ def _cmd(sim: str, out: str, m: dict, startup: bool = False, count: bool = False
     """The command, its extra environment and where its result goes."""
     n = m["gpus"]
     if sim == "augur":
-        c = [PY, "-m", "augur.cli", "--model", "Qwen/Qwen3-1.7B", "--hardware", "RTX4060Ti", "--cost", "tables",
+        c = [PY, os.path.abspath(__file__), "child", f"{out}/augur_extra.json", str(m.get("last_arrival_ns", 1 << 62)), "--model", "Qwen/Qwen3-1.7B", "--hardware", "RTX4060Ti", "--cost", "tables",
              "--engines", str(n), "--router", "round-robin", "--num-gpu-blocks", str(m["blocks"]),
              "--max-num-seqs", str(SEQS), "--max-num-batched-tokens", str(BATCHED), "--max-model-len",
              str(m["max_model_len"]), "--no-prefix-caching", "--no-async-scheduling", "--step-cpu-us", "2000",
@@ -199,7 +250,25 @@ def run(a) -> int:
     tfile = os.path.join(a.out, f"time_{a.sim}.txt")
     full = ["taskset", "-c", a.cores, "/usr/bin/time", "-v", "-o", tfile] + cmd
     l0, t0 = _load(), time.time()
-    p = subprocess.run(full, env={**os.environ, **env}, capture_output=True, text=True)
+    p = subprocess.Popen(full, env={**os.environ, **env}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         start_new_session=True)
+    while True:  # watch the resident memory of the whole process group: BLIS's grows with the GPUs
+        try:
+            p.stdout_s, p.stderr_s = p.communicate(timeout=5)
+            break
+        except subprocess.TimeoutExpired:
+            kb = sum(int(x) for x in subprocess.run(["ps", "-o", "rss=", "--sid", str(p.pid)], capture_output=True,
+                                                    text=True).stdout.split())
+            if kb / 2**20 > a.max_rss_gb:
+                os.killpg(p.pid, 9)
+                p.communicate()
+                r = dict(sim=a.sim, kind=m["kind"], gpus=m["gpus"], rep=a.rep, killed_rss_gb=kb / 2**20,
+                         elapsed_s=time.time() - t0, load_before=l0, load_after=_load())
+                if a.results:
+                    open(a.results, "a").write(json.dumps(r) + "\n")
+                print(json.dumps(r))
+                return 3
+    p.stdout, p.stderr = p.stdout_s, p.stderr_s
     l1, wall = _load(), time.time() - t0
     if p.returncode:
         print(p.stderr[-2000:], file=sys.stderr)
@@ -230,13 +299,33 @@ def run(a) -> int:
         r["steps"], r["sim_s"] = s.get("steps"), s.get("sim_seconds")
         r["augur_wall_s"] = s.get("wall_s")
         r["done"] = s.get("calls")
+        x = json.load(open(os.path.join(a.out, "augur_extra.json")))
+        es = [e for e in x["engines"] if e[1]]
+        T, W = r["sim_s"] * 1e9, min(m["last_arrival_ns"], r["sim_s"] * 1e9)
+        b = [e[2] / T for e in es] + [0.0] * (m["gpus"] - len(es))  # an engine that never stepped is idle
+        r["busy_mean"], r["busy_min"] = statistics.fmean(b), min(b)
+        bw = [e[3] / W for e in es] + [0.0] * (m["gpus"] - len(es))
+        r["busy_win_mean"], r["busy_win_min"] = statistics.fmean(bw), min(bw)  # up to the last arrival
+        r["batch_mean"] = sum(e[4] for e in es) / max(sum(e[1] for e in es), 1)
+        if not a.startup:
+            r["startup_cpu_s"], r["steady_cpu_s"] = x["loop_start"], x["loop_end"] - x["loop_start"]
+            r["steady_steps_per_cpu_s"] = r["steps"] / r["steady_cpu_s"]
     else:
         d = json.load(open(res))
         r["sim_s"] = d["window"]["duration_s"]
         r["done"] = d["requests"]["completed"]
         r["timed_out"] = d["requests"]["timed_out"]
         sf = os.path.join(a.out, f"steps_{a.sim}.txt")
+        if not os.path.exists(sf) and not a.no_count:  # untimed, once: the step count of BLIS's own model
+            c2, e2, _ = _cmd(a.sim, a.out, m, count=True)
+            e2["BLIS_STEP_COUNT_FILE"] = sf
+            subprocess.run(["nice", "-n", "10"] + c2, env={**os.environ, **e2}, capture_output=True, check=True)
         r["steps"] = int(open(sf).read()) if os.path.exists(sf) and open(sf).read().strip() else None
+        ins = d["reports"]["engine"]["instances"].values()
+        b = [i["measured_window"]["busy_share"] for i in ins if "measured_window" in i]
+        r["busy_mean"], r["busy_min"] = statistics.fmean(b), min(b)  # first arrival to last completion
+        if r["steps"]:  # output tokens per step: a request still in prefill emits none, so a little below requests per step
+            r["batch_mean"] = d["reports"]["engine"]["cluster"]["total_output_tokens"] / r["steps"]
     if a.results:
         with open(a.results, "a") as f:
             f.write(json.dumps(r) + "\n")
@@ -248,18 +337,50 @@ def table(a) -> int:
     runs = [json.loads(l) for fn in a.files for l in open(fn)]
     groups: dict = {}
     for r in runs:
-        groups.setdefault((r["kind"], r["gpus"], r["sim"]), []).append(r)
+        if "killed_rss_gb" in r:
+            print(r["kind"], r["gpus"], r["sim"], f"killed at {r['killed_rss_gb']:.0f} GB resident after {r['elapsed_s']:.0f} s")
+        else:
+            groups.setdefault((r["kind"], r["gpus"], r["sim"]), []).append(r)
 
     def ms(xs, f="{:.1f}"):
-        return f.format(statistics.median(xs)) + (f" ({f.format(min(xs))}-{f.format(max(xs))})" if len(xs) > 1 else "")
-    print("workload gpus sim n | wall s | cpu s | rss MB | sim/wall | steps | steps/cpu-s | load before..after")
+        return f.format(statistics.median(xs)) + (f" ({f.format(min(xs))}-{f.format(max(xs))})" if len(xs) > 1 else "") if xs else "-"
+
+    def col(rs, k, f="{:.1f}"):
+        return ms([r[k] for r in rs if r.get(k) is not None], f)
+    print("workload gpus sim n | wall s | cpu s | startup/steady cpu s | rss MB | sim s | busy mean/min | batch | steps | steps/cpu-s | steady steps/cpu-s | load before..after")
     for (k, n, s), rs in sorted(groups.items()):
-        st = [r["steps"] for r in rs if r.get("steps")]
-        print(k, n, s, len(rs), "|", ms([r["wall_s"] for r in rs]), "|", ms([r["cpu_s"] for r in rs]), "|",
-              ms([r["rss_mb"] for r in rs], "{:.0f}"), "|", ms([r["sim_s"] / r["wall_s"] for r in rs if r.get("sim_s")], "{:.2f}"), "|",
-              f"{statistics.median(st):.0f}" if st else "-", "|",
-              ms([r["steps"] / r["cpu_s"] for r in rs if r.get("steps")], "{:.0f}") if st else "-", "|",
+        print(k, n, s, len(rs), "|", col(rs, "wall_s"), "|", col(rs, "cpu_s"), "|",
+              col(rs, "startup_cpu_s"), "/", col(rs, "steady_cpu_s"), "|", col(rs, "rss_mb", "{:.0f}"), "|", col(rs, "sim_s"), "|",
+              col(rs, "busy_mean", "{:.2f}"), "/", col(rs, "busy_min", "{:.2f}"), "|", col(rs, "batch_mean"), "|",
+              col(rs, "steps", "{:.0f}"), "|",
+              ms([r["steps"] / r["cpu_s"] for r in rs if r.get("steps")], "{:.0f}"), "|", col(rs, "steady_steps_per_cpu_s", "{:.0f}"), "|",
               f"{min(r['load_before'] for r in rs):.1f}-{max(r['load_after'] for r in rs):.1f}")
+    return 0
+
+
+def real(a) -> int:
+    """A real run's step log (steps.*.jsonl: sched and upd events): busy share and requests per step. Busy is the time from a
+    step's schedule to its update (as augur's logged step duration), over first arrival to last update; also over the
+    arrival window (up to the last arrival), the steady part."""
+    import glob
+    for fn in sorted(glob.glob(os.path.join(a.dir, "steps.*.jsonl"))):
+        sched, steps, arrivals = {}, [], []  # steps: (start, end, requests)
+        for line in open(fn):
+            e = json.loads(line)
+            if e["ev"] == "add":
+                arrivals.append(e["t"])
+            elif e["ev"] == "sched":
+                sched[e["k"]] = (e["t"], len(e["tok"]))
+            elif e["ev"] == "upd" and e["k"] in sched:
+                t0, n = sched.pop(e["k"])
+                steps.append((t0, e["t"], n))
+        t_a, t_b, t_w = arrivals[0], steps[-1][1], arrivals[-1]
+        busy = sum(e - s for s, e, _ in steps) / (t_b - t_a)
+        win = [(s, min(e, t_w), n) for s, e, n in steps if s < t_w]
+        bw = sum(e - s for s, e, _ in win) / (t_w - t_a)
+        print(f"{fn}: {len(steps)} steps over {(t_b - t_a) / 1e9:.1f} s ({(t_w - t_a) / 1e9:.1f} s of arrivals); busy {busy:.3f}; "
+              f"requests per step {statistics.fmean(n for *_, n in steps):.2f}; in the arrival window busy {bw:.3f}, "
+              f"requests per step {statistics.fmean(n for *_, n in win):.2f}, max {max(n for *_, n in steps)}")
     return 0
 
 
@@ -269,7 +390,9 @@ def profile(a) -> int:
     m = json.load(open(os.path.join(a.out, "meta.json")))
     cmd, env, _ = _cmd("augur", a.out, m)
     os.environ.update(env)
-    argv = cmd[3:]
+    argv = cmd[cmd.index("--model"):]
+    if a.prefix_caching:  # the workloads carry no token ids, so there is nothing to share, but every block is still hashed
+        argv.remove("--no-prefix-caching")
     argv[argv.index("--output") + 1] = f"{a.out}/augur_prof.csv"
     from augur import cli
     pr = Profiler(interval=a.interval)
@@ -279,29 +402,48 @@ def profile(a) -> int:
     pr.stop()
     wall = time.time() - t0
     root = pr.last_session.root_frame()
-    groups = [  # first match wins
-        ("vLLM scheduler (v1/core/sched)", "vllm/v1/core/sched"),
-        ("vLLM KV-cache manager and block pool", "vllm/v1/core/"),
-        ("vLLM request, engine core, other", "vllm/"),
-        ("augur coordinator", "augur/sim/coordinator"),
-        ("augur router", "augur/sim/router"),
-        ("augur cost model (pricer)", "augur/cost"),
-        ("augur engine, executor, other sim", "augur/"),
-        ("numpy, torch", "site-packages/numpy"), ("numpy, torch", "site-packages/torch"),
-    ]
-    own, incl = {}, {}
 
-    def walk(f, stack, path):
-        path = f.file_path if f.function != "[self]" else path  # pyinstrument's [self] leaf is its parent's own time
-        kids = f.children
-        g = next((n for n, k in groups if k in (path or "")), "other (stdlib, third party, builtins)")
-        if f.function == "[self]" or not kids:
-            own[g] = own.get(g, 0.0) + f.time
+    def where(f):
+        return (f.file_path or "").replace(HOME, "~")
+
+    def category(f):  # the innermost frame that matches decides; a frame that matches nothing takes its caller's
+        p, fn = where(f), f.function
+        if "kv_cache_utils" in p and "hash" in fn.lower() or "hash" in fn.lower() and "/vllm/" in p or "vllm/utils/hashing" in p:
+            return "prefix-cache hashing"
+        if "make_stats" in fn or "vllm/v1/metrics" in p or "vllm/logger" in p or fn == "record_function_or_nullcontext":
+            return "vLLM stats, logging, profiling hooks"
+        if fn in ("update_from_output", "_update_request_with_output", "check_stop", "append_output_token_ids"):
+            return "vLLM output processing (update_from_output)"
+        if "vllm/v1/core/sched" in p:
+            return "vLLM scheduler"
+        if "vllm/v1/core/" in p:
+            return "vLLM KV-cache manager and block pool"
+        if "/vllm/" in p:
+            return "vLLM request, engine core, other"
+        if "prefix_share" in p:
+            return "augur prefix_share (called by the executor)"
+        if "augur/sim/executor" in p:
+            return "augur executor"
+        if "augur/cost" in p:
+            return "augur pricer (augur/cost)"
+        if "augur/sim/coordinator" in p or "augur/sim/router" in p or "augur/sim/workload" in p:
+            return "augur event loop (coordinator, router, workload)"
+        if "augur/" in p:
+            return "augur engine wrapper, other"
+        return None
+    own, selfk, incl = {}, {}, {}
+
+    def walk(f, stack, cat, parent):
+        c = category(f) or cat
         key = f"{f.function} ({os.path.basename(f.file_path or '')})"
+        if f.function == "[self]" or not f.children:
+            own[c] = own.get(c, 0.0) + f.time
+            k = parent if f.function == "[self]" or not f.file_path else key  # a built-in's own time is its caller's
+            selfk[k] = selfk.get(k, 0.0) + f.time
         if key not in stack and f.function != "[self]":
             incl[key] = incl.get(key, 0.0) + f.time
-        for c in kids:
-            walk(c, stack | {key}, path)
+        for ch in f.children:
+            walk(ch, stack | {key}, c, key)
 
     def find(f, fn, file):
         if f.function == fn and (f.file_path or "").endswith(file):
@@ -310,14 +452,17 @@ def profile(a) -> int:
     sys.setrecursionlimit(100000)
     runs = find(root, "run", "coordinator.py")
     builds = find(root, "_build_engines", "cli.py")
-    loop = sum(f.time for f in runs)
-    print(f"{a.out}: profiled {root.time:.1f} s of {wall:.1f} s wall; engine setup {sum(f.time for f in builds):.1f} s, "
-          f"event loop (Coordinator.run) {loop:.1f} s, the rest is imports and output")
+    loop, setup = sum(f.time for f in runs), sum(f.time for f in builds)
+    print(f"{a.out}: profiled {root.time:.1f} s of {wall:.1f} s wall; engine setup {setup:.1f} s, "
+          f"event loop (Coordinator.run) {loop:.1f} s, the rest ({root.time - loop - setup:.1f} s) is imports and output")
     for f in runs:
-        walk(f, frozenset(), "")
-    print("\nevent loop: self time by code")
+        walk(f, frozenset(), "augur event loop (coordinator, router, workload)", "run (coordinator.py)")
+    print(f"\nevent loop: self time by code, % of the event loop (engine start-up is {100 * setup / loop:.1f}% of it)")
     for g, t in sorted(own.items(), key=lambda x: -x[1]):
         print(f"  {100 * t / loop:5.1f}%  {t:7.1f} s  {g}")
+    print("\nevent loop: top self-time functions (a built-in's time is its caller's)")
+    for k, t in sorted(selfk.items(), key=lambda x: -x[1])[:a.top]:
+        print(f"  {100 * t / loop:5.1f}%  {t:7.1f} s  {k}")
     print("\nevent loop: inclusive time of the top functions (a function inside another counts in both)")
     for k, t in sorted(incl.items(), key=lambda x: -x[1])[:a.top]:
         print(f"  {100 * t / loop:5.1f}%  {t:7.1f} s  {k}")
@@ -325,14 +470,17 @@ def profile(a) -> int:
 
 
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["child"]:  # speed.py child EXTRA_JSON WINDOW_NS AUGUR_ARGS...: what run times for augur
+        return child(argv[1], int(argv[2]), argv[3:])
     p = argparse.ArgumentParser(prog="speed")
     sub = p.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gen")
     g.add_argument("out")
     g.add_argument("--kind", choices=("sharegpt", "swe"), required=True)
     g.add_argument("--gpus", type=int, required=True)
-    g.add_argument("--per-gpu", type=int, default=None, help="calls (sharegpt) or sessions (swe) per GPU; default 12 / 1")
-    g.add_argument("--rate", type=float, default=None, help="arrivals per GPU per second; default 1.0 / 0.1")
+    g.add_argument("--per-gpu", type=int, default=None, help=f"calls (sharegpt) or sessions (swe) per GPU; default {PER_GPU}")
+    g.add_argument("--rate", type=float, default=None, help=f"arrivals per GPU per second; default {RATE}")
     g.add_argument("--seed", type=int, default=0)
     r = sub.add_parser("run")
     r.add_argument("out")
@@ -340,16 +488,21 @@ def main(argv=None) -> int:
     r.add_argument("--cores", default="4,5")
     r.add_argument("--rep", type=int, default=0)
     r.add_argument("--results", default=None)
+    r.add_argument("--max-rss-gb", type=float, default=80, help="kill the run past this resident memory (all its processes)")
+    r.add_argument("--no-count", action="store_true", help="BLIS: skip the untimed step-counting run after the timed one")
     r.add_argument("--count", action="store_true", help="BLIS only, untimed: count its steps into OUT/steps_SIM.txt")
     r.add_argument("--startup", action="store_true", help="augur on its first entry only: the fixed cost of import and engine setup")
     t = sub.add_parser("table")
     t.add_argument("files", nargs="+")
+    rl = sub.add_parser("real")
+    rl.add_argument("dir", help="a real run's directory: its steps.*.jsonl")
     pf = sub.add_parser("profile")
     pf.add_argument("out")
     pf.add_argument("--top", type=int, default=40)
+    pf.add_argument("--prefix-caching", action="store_true", help="augur with prefix caching on (the speed runs have it off)")
     pf.add_argument("--interval", type=float, default=0.002)
     a = p.parse_args(argv)
-    return {"gen": gen, "run": run, "table": table, "profile": profile}[a.cmd](a)
+    return {"gen": gen, "run": run, "table": table, "profile": profile, "real": real}[a.cmd](a)
 
 
 if __name__ == "__main__":
