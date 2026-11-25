@@ -17,6 +17,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from augur.cost import adjust_gpu_ns
@@ -92,6 +93,21 @@ def _empty(sch) -> bool:
     return not sch.requests and not sch.finished_req_ids and sch.connector is None and sch.ec_connector is None
 
 
+@dataclass
+class _DpaRank:
+    """One rank of an async DP group, running vLLM's DPEngineCoreProc loop: one forward per iteration."""
+
+    e: SimEngine
+    idx: int
+    n: int = 0  # iterations in this wave (vLLM's step_counter)
+    nfwd: int = 0  # forwards this rank has queued, real or dummy
+    gpu_free: int = 0  # when its last queued forward ends
+    fifo: deque = field(default_factory=deque)  # its batch queue: each batch's forward, None for an empty batch
+    at: int | None = None  # when its next iteration starts
+    asleep: bool = True  # no rank has work: the group waits for a request
+    gen: object = None  # the iteration under way (a generator that waits on forwards and the sync)
+
+
 class Coordinator:
     def __init__(self, engines: list[SimEngine], router: Router, workload: Workload,
                  lss_idle_quantum_ns: int = 0, decode_router: Router | None = None,
@@ -133,13 +149,15 @@ class Coordinator:
         self._dp_ready_at: int | None = None  # --lss-loop-compat only
         # DP + async scheduling
         self._dpa = bool(self.dp_group) and self.dp_group[0].async_sched
-        self._dpa_shapes: dict[int, dict] = {}  # round -> engine_id -> shape (None: empty)
-        self._dpa_ready: dict[int, int] = {}  # round -> when its slowest rank's CPU has the batch ready
-        self._dpa_wake_at: int | None = None
-        self._dpa_next_form = 0
-        self._dpa_running: int | None = None  # round on the GPU
-        self._dpa_left: set = set()  # ranks still running that round
-        self._dpa_finished: dict[int, set] = {}  # round -> ranks done with it
+        self._dpa_ranks = [_DpaRank(e, i) for i, e in enumerate(self.dp_group)] if self._dpa else []
+        self._dpa_replay = self._dpa and all(hasattr(e.ctx.cost, "round_start") for e in self.dp_group)
+        self._dpa_interval = self.dp_group[0].vllm_config.parallel_config.dp_sync_interval if self._dpa else 1
+        self._dpa_regs: dict[int, dict] = {}  # forward -> rank -> (when queued, shape or None), until every rank has one
+        self._dpa_res: dict[tuple, list] = {}  # a settled wait (forward or sync) -> the time it ends for each rank
+        self._dpa_waiting: dict[tuple, list] = {}  # a wait -> the ranks blocked on it
+        self._dpa_arrived: dict[tuple, dict] = {}  # sync -> rank -> when the rank got there
+        self._dpa_wave = 0
+        self._dpa_started = False
         self._entries_done = False
         self._xfers_started: set[str] = set()
         # LLMServingSim loop compatibility, for comparisons only (off by
@@ -545,108 +563,182 @@ class Coordinator:
         raise RuntimeError("async engine loop did not settle")
 
     # ---- DP + async scheduling -------------------------------------------------
-    def _dpa_run_rank(self, e: SimEngine) -> None:
-        """Run a rank's vLLM async loop (step_with_batch_queue) until it pops
-        a batch (then it waits for that batch's round) or has nothing to do."""
-        for _ in range(1000):
-            if e.dp_blocked_on is not None:
-                return
-            if not e.core.scheduler.has_requests() and not e.dp_fifo:
-                return
-            t0 = time.perf_counter()
-            self._set_step_clock(e, gpu_free_ns=self.now)
-            outputs, executed = e.core.step_fn()
-            e.sched_cpu_s += time.perf_counter() - t0
-            e.steps += 1
-            self._poll_when_transfers_finish(e)
-            launched = bool(e.ctx.launches)
-            for shape in e.ctx.launch_shapes:
-                r = max(e.dp_next_round, self._dpa_next_form)
-                e.dp_next_round = r + 1
-                self._dpa_shapes.setdefault(r, {})[e.engine_id] = shape
-                if shape is not None:
-                    # As single-engine async: the CPU prepares the batch while the GPU runs the previous
-                    # one, so it only delays the round when the GPU would otherwise be waiting for it.
-                    self._dpa_ready[r] = max(self._dpa_ready.get(r, 0), self.now + e.ctx.last_cpu_ns)
-                e.dp_fifo.append(r)
-            e.ctx.launches.clear()
-            e.ctx.launch_shapes.clear()
-            self._after_step(e)
-            if outputs is None:
-                if launched:
+    # vLLM's DP loop (DPEngineCoreProc.run_busy_loop) with a batch queue of 2 runs per iteration: schedule a batch and
+    # launch it; if the queue is full block on the oldest batch, whose output resolves when the forward after it
+    # ends (its own if none follows); a rank that ran nothing then runs a dummy forward; every dp_sync_interval
+    # iterations (and the first) the ranks meet in a CPU all-reduce. The next batch is therefore scheduled after
+    # the forward, not during it. Forward j of every rank is one collective round, so it starts when the last rank
+    # has queued it. In a replay the log's iteration times stand in for all of that.
+    def _dpa_kick(self) -> None:
+        """Start the iterations whose time has come; wake the group when work reaches it."""
+        ranks = self._dpa_ranks
+        if self._dpa_replay and not self._dpa_started:
+            self._dpa_started = True
+            for r in ranks:
+                self._dpa_set_at(r, self._dpa_replay_at(r))
+        for _ in range(10_000):
+            started = False
+            for r in ranks:
+                if r.gen is not None:
                     continue
+                if not self._dpa_replay:
+                    work = self._dpa_work()
+                    if r.asleep and work:
+                        if all(x.asleep for x in ranks):
+                            self._dpa_wave += 1  # the loop's step_counter starts over with a wave
+                            for x in ranks:
+                                x.n = 0
+                        r.asleep, r.at = False, self.now
+                    elif not r.asleep and not work and r.at is not None and r.at <= self.now:
+                        r.asleep, r.at = True, None
+                if r.at is None or r.at > self.now:
+                    continue
+                r.at = None
+                started = True
+                if self._dpa_replay:
+                    self._dpa_replay_iteration(r)
+                else:
+                    r.gen = self._dpa_iteration(r)
+                    self._dpa_resume(r, None)
+            if not started:
                 return
-            r = e.dp_fifo.popleft()
-            if e.engine_id in self._dpa_finished.get(r, ()):
-                self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, outputs)))
-                continue
-            e.dp_held[r] = outputs
-            e.dp_blocked_on = r
-            return
         raise RuntimeError("DP async rank loop did not settle")
 
-    def _dpa_try_form(self) -> bool:
-        """Start the next GPU round once the previous one is done on every rank.
-        Returns True if it settled a round with no GPU work (all batches
-        empty), so ranks waiting on it can go on."""
-        if self._dpa_running is not None:
-            return False
-        x = self._dpa_next_form
-        shapes = self._dpa_shapes.get(x, {})
-        if not shapes:
-            return False
-        ready = self._dpa_ready.get(x, 0)
-        if ready > self.now:
-            if self._dpa_wake_at != ready:
-                self._dpa_wake_at = ready
-                self._push(ready, ARRIVAL, "dpa_wake", None)
-            return False
-        self._dpa_ready.pop(x, None)
-        self._dpa_wake_at = None
-        if all(s is None for s in shapes.values()):
-            del self._dpa_shapes[x]
-            self._dpa_next_form = x + 1
-            for e in self.dp_group:
-                self._dpa_finished.setdefault(x, set()).add(e.engine_id)
-                if e.dp_blocked_on == x:
-                    e.dp_blocked_on = None
-                    self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, e.dp_held.pop(x))))
-            return True
-        g = self.dp_group
-        final = self._round_shapes([shapes.get(e.engine_id) for e in g])
-        replay = self._replay_rounds(g)
-        per_rank = replay or self._scaled(g, g[0].ctx.cost.round_ns(final), final)
-        self._log_round(g, final, per_rank)
-        self.dp_rounds += 1
-        self._dpa_running = x
-        self._dpa_left = {e.engine_id for e in g}
-        for e, sh, ns in zip(g, final, per_rank):
-            self._log_step(e, self.now, ns, sh)
-        self._dpa_next_form = x + 1
-        del self._dpa_shapes[x]
-        for e, ns in zip(g, per_rank):
-            self._push(self.now + ns, STEP_DONE, "dpa_done", (e, x))
-        return False
+    def _dpa_work(self) -> bool:
+        """Some rank has requests or a queued batch, or a forward waits for a rank that has not queued it."""
+        return bool(self._dpa_regs or self._dpa_arrived) or any(
+            r.fifo or r.e.core.scheduler.has_requests() for r in self._dpa_ranks)
+
+    def _dpa_set_at(self, r: _DpaRank, t: int | None) -> None:
+        r.at = t
+        if t is not None and t > self.now:
+            self._push(t, ARRIVAL, "dpa_wake", None)
+
+    def _dpa_engine_step(self, r: _DpaRank):
+        """One call of the rank's EngineCore.step_with_batch_queue. Returns (outputs, executed, launched, shape, cpu_ns):
+        the output of the batch it applied, if any; whether it launched a forward; the launch's shape (None for an
+        empty batch); the CPU time the batch took to prepare."""
+        e = r.e
+        t0 = time.perf_counter()
+        self._set_step_clock(e, gpu_free_ns=self.now)
+        outputs, executed = e.core.step_fn()
+        e.sched_cpu_s += time.perf_counter() - t0
+        e.steps += 1
+        self._poll_when_transfers_finish(e)
+        launched = bool(e.ctx.launches)
+        shape = e.ctx.launch_shapes[-1] if launched else None
+        cpu = e.ctx.last_cpu_ns if shape is not None else 0
+        e.ctx.launches.clear()
+        e.ctx.launch_shapes.clear()
+        self._after_step(e)
+        return outputs, executed, launched, shape, cpu
+
+    def _dpa_iteration(self, r: _DpaRank):
+        """One iteration of the rank's loop, as a generator that yields what it waits for."""
+        e, start = r.e, self.now
+        r.n += 1
+        outputs, executed, launched, shape, cpu = None, False, False, None, 0
+        if e.core.scheduler.has_requests() or r.fifo:
+            outputs, executed, launched, shape, cpu = self._dpa_engine_step(r)
+        queued = start + cpu
+        new = self._dpa_queue(r, queued, shape) if launched and shape is not None else None
+        if launched:
+            r.fifo.append(new)
+        end = queued if executed else start
+        if outputs is not None:
+            oldest = r.fifo.popleft()
+            wait = new if new is not None else oldest
+            end = queued if oldest is None else max(queued, (yield from self._dpa_wait(r, ("fwd", wait))))
+            self._push(end, STEP_DONE, "dpa_done", (e, outputs))
+        if not executed:
+            end = yield from self._dpa_wait(r, ("fwd", self._dpa_queue(r, end, None)))
+        if r.n == 1 or r.n % self._dpa_interval == 0:
+            key = ("sync", self._dpa_wave, r.n)
+            arrived = self._dpa_arrived.setdefault(key, {})
+            arrived[r.idx] = end
+            if len(arrived) == len(self._dpa_ranks):
+                del self._dpa_arrived[key]
+                self._dpa_settle(key, [max(arrived.values())] * len(arrived))
+            end = yield from self._dpa_wait(r, key)
+        self._dpa_log_round(r, start, end, not executed)
+        r.gen = None
+        self._dpa_set_at(r, end)
+
+    def _dpa_wait(self, r: _DpaRank, key: tuple):
+        res = self._dpa_res.get(key)
+        if res is None:
+            res = yield key
+        return res[r.idx]
+
+    def _dpa_resume(self, r: _DpaRank, value) -> None:
+        try:
+            key = r.gen.send(value)
+        except StopIteration:
+            return
+        self._dpa_waiting.setdefault(key, []).append(r)
+
+    def _dpa_settle(self, key: tuple, ends: list) -> None:
+        self._dpa_res[key] = ends
+        for r in self._dpa_waiting.pop(key, ()):
+            self._dpa_resume(r, ends)
+
+    def _dpa_queue(self, r: _DpaRank, when: int, shape) -> int:
+        """The rank queues its next forward (a dummy if shape is None). Once every rank has, the round runs."""
+        j = r.nfwd
+        r.nfwd += 1
+        regs = self._dpa_regs.setdefault(j, {})
+        regs[r.idx] = (when, shape)
+        if len(regs) == len(self._dpa_ranks):
+            del self._dpa_regs[j]
+            g = self.dp_group
+            final = self._round_shapes([regs[i][1] for i in range(len(g))])
+            per_rank = self._scaled(g, g[0].ctx.cost.round_ns(final), final)
+            # Each rank's forward waits for its own previous one; the collectives hold the round for the slowest.
+            begin = max([w for w, _ in regs.values()] + [x.gpu_free for x in self._dpa_ranks])
+            for x, e, sh, ns in zip(self._dpa_ranks, g, final, per_rank):
+                x.gpu_free = begin + ns
+                self._log_step(e, begin, ns, sh)
+            self.dp_rounds += 1
+            self._dpa_res.pop(("fwd", j - 8), None)
+            self._dpa_settle(("fwd", j), [x.gpu_free for x in self._dpa_ranks])
+        return j
+
+    def _dpa_log_round(self, r: _DpaRank, start: int, end: int, dummy: bool) -> None:
+        log = r.e.core.scheduler._logger() if hasattr(r.e.core.scheduler, "_logger") else None
+        if log:
+            log.write({"ev": "round", "t": start, "dur": end - start, "dummy": dummy})
+
+    def _dpa_replay_at(self, r: _DpaRank) -> int | None:
+        """When the logged rank made its next iteration's schedule call (the iteration's start if it made none)."""
+        c = r.e.ctx.cost
+        if r.n >= len(c.rounds):
+            return None
+        return c.round_start[r.n] if c.round_sched[r.n] is None else c.round_sched[r.n]
+
+    def _dpa_replay_iteration(self, r: _DpaRank) -> None:
+        """Replay of a real run: the iteration lasts what the log says (its sync and dummy forward included), and
+        the batch output it applies lands then."""
+        c = r.e.ctx.cost
+        start = c.round_start[r.n]
+        end = start + c.rounds[r.n]
+        if c.round_sched[r.n] is not None:
+            outputs = self._dpa_engine_step(r)[0]
+            if outputs is not None:
+                self._push(end, STEP_DONE, "dpa_done", (r.e, outputs))
+        self._dpa_log_round(r, start, end, c.round_dummy[r.n])
+        if r.idx == 0:
+            self.dp_rounds += 1
+        self.dp_dummy_forwards += c.round_dummy[r.n]
+        r.n += 1
+        self._dpa_set_at(r, self._dpa_replay_at(r))
 
     def _dpa_done(self, ev: _Event) -> None:
-        e, x = ev.payload
-        self._dpa_finished.setdefault(x, set()).add(e.engine_id)
-        self._dpa_left.discard(e.engine_id)
-        if e.dp_blocked_on == x:
-            e.dp_blocked_on = None
-            self._on_step_done(_Event(self.now, STEP_DONE, 0, "step_done", (e, e.dp_held.pop(x))))
-        if not self._dpa_left:
-            self._dpa_running = None
-            self._dpa_finished.pop(x - 2, None)
+        self._on_step_done(ev)
 
     def _start_steps(self) -> None:
         q = self.lss_idle_quantum_ns
         if self._dpa:
-            for _ in range(1000):
-                for e in self.dp_group:
-                    self._dpa_run_rank(e)
-                if not self._dpa_try_form():
-                    break
+            self._dpa_kick()
         elif self.dp_group:
             self._start_dp_round()
         for eng in self.engines:

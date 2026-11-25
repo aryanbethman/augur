@@ -89,6 +89,11 @@ class ReplayCost:
     # DP (augur's own logs): this rank's duration in each round it took part in, dummy forwards too.
     rounds: list[int] = field(default_factory=list)
     round_dummy: list[bool] = field(default_factory=list)
+    # Async DP: each round (a loop iteration) as the log has it. Start; the instant of its schedule call (None if the
+    # rank scheduled nothing); whether it applied a batch output (its dummy flag then hides real work).
+    round_start: list[int] = field(default_factory=list)
+    round_sched: list = field(default_factory=list)
+    round_upd: list[bool] = field(default_factory=list)
     # call id -> how many rounds this rank had run when the call reached it (it joins the next round). A real rank's
     # iterations drift against its peers' clocks, so only this count, not the time, says which round a call joins.
     add_round: dict[str, int] = field(default_factory=dict)
@@ -132,6 +137,16 @@ class ReplayCost:
         sched_times = sorted(t - t0 for t in sched_t.values())
         rec = [e for e in ev if e["ev"] == "round"]
         rounds, round_dummy = [e["dur"] for e in rec], [e["dummy"] for e in rec]
+        round_start, round_sched, round_upd, sched_at, upd = [e["t"] - t0 for e in rec], [], [], None, False
+        for e in ev:
+            if e["ev"] == "sched" and sched_at is None:
+                sched_at = e["t"] - t0
+            elif e["ev"] == "upd":
+                upd = True
+            elif e["ev"] == "round":
+                round_sched.append(sched_at)
+                round_upd.append(upd)
+                sched_at, upd = None, False
         add_round, n = {}, 0
         for e in ev:
             n += e["ev"] == "round"
@@ -152,7 +167,8 @@ class ReplayCost:
             for _ in range(_unlogged_tail(ev) if d else 0):
                 d.append(d[-1])
             return cls(d, [s["t"] - t0 for s, _ in st], outs, toks, kv_done, sched_times, rounds=rounds,
-                       round_dummy=round_dummy, add_round=add_round, rids=rids, kv_done_step=kv_done_step)
+                       round_dummy=round_dummy, round_start=round_start, round_sched=round_sched,
+                       round_upd=round_upd, add_round=add_round, rids=rids, kv_done_step=kv_done_step)
         d = []
         for i, (s, u) in enumerate(st):
             if u["left"] > 0 and i + 1 < len(st):
@@ -179,19 +195,22 @@ def _drop_idle_rounds(costs: list[ReplayCost]) -> None:
     """A real DP group goes on running dummy forwards on every rank until its next finish-sync after the last
     request is done (vLLM's dp_sync_interval); augur's group sleeps then, so those rounds have no counterpart.
     Rank logs hold the same rounds in the same order (a forward is a collective): drop those where every rank was
-    idle."""
+    idle. An async rank's last iteration is a dummy too but applied its final batch, so it stays."""
     logged = [c for c in costs if c.rounds]
     if len({len(c.rounds) for c in logged}) > 1:
         raise ValueError(f"DP ranks logged different numbers of rounds: {[len(c.rounds) for c in logged]}")
     if not logged:
         return
-    keep = [not all(c.round_dummy[i] for c in logged) for i in range(len(logged[0].rounds))]
+    keep = [not all(c.round_dummy[i] and not (c.round_upd and c.round_upd[i]) for c in logged)
+            for i in range(len(logged[0].rounds))]
     kept_before = [0]
     for k in keep:
         kept_before.append(kept_before[-1] + k)
     for c in logged:
-        c.rounds = [d for d, k in zip(c.rounds, keep) if k]
-        c.round_dummy = [d for d, k in zip(c.round_dummy, keep) if k]
+        for f in ("rounds", "round_dummy", "round_start", "round_sched", "round_upd"):
+            v = getattr(c, f)
+            if v:
+                setattr(c, f, [x for x, k in zip(v, keep) if k])
         c.add_round = {cid: kept_before[n] for cid, n in c.add_round.items()}
 
 
