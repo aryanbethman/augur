@@ -189,6 +189,11 @@ def _anchor_index(anchors, n):
     return lo
 
 
+# Price caches are cleared when full: prices are pure, and step shapes grow with the cluster (about 400 B a key;
+# 375k keys at 256 GPUs), so an unbounded cache costs memory at scale.
+CACHE_MAX = 1 << 17
+
+
 class _Attention:
     """One kernel at one decode query length: slices keyed by (chunk, decodes)."""
 
@@ -231,6 +236,8 @@ class _Attention:
         key = (prefill_chunk, prefill_key, n_decode, kv)
         hit = self._memo.get(key)
         if hit is None:
+            if len(self._memo) >= CACHE_MAX:
+                self._memo.clear()
             hit = self._memo[key] = self._lookup(prefill_chunk, prefill_key, n_decode, kv)
         return hit
 
@@ -636,6 +643,8 @@ class TableCost(RingTP):
         if self.tp > 1:  # the drafter's token ids never leave the GPU: no CPU-memory terms; two all-reduces a layer
             _, ar, _, ag = self._ring_ns(tokens, rows)
             ns += 2 * layers * ar + ag
+        if len(self._cache) >= CACHE_MAX:
+            self._cache.clear()
         self._cache[key] = ns
         return ns
 
@@ -725,5 +734,7 @@ class TableCost(RingTP):
         else:  # token ids in, sampled ids out: both in CPU memory ("REMOTE")
             ns += self.cpu_mem_latency_ns + int(self._in_bytes_per_token * tokens / self.cpu_mem_bw)
             ns += self.cpu_mem_latency_ns + int(self._out_bytes_per_seq * rows / self.cpu_mem_bw)
+        if len(self._cache) >= CACHE_MAX:
+            self._cache.clear()
         self._cache[key] = ns
         return ns

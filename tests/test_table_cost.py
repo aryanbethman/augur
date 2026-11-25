@@ -70,6 +70,16 @@ def test_regression_exact(name):
     assert mismatches(other, cv["rows"]) == []
 
 
+def test_prices_hold_when_the_caches_fill(monkeypatch):
+    # A full cache is cleared; prices must not depend on what it held.
+    import augur.cost.tables as tables
+    d = load(TP1_FILES[0])
+    path = bundled_profile(d["hardware"], d["model"], 1, d.get("variant", "bf16"))
+    monkeypatch.setattr(tables, "CACHE_MAX", 7)
+    rows = d["workload"][:300] + d["random"][:300]
+    assert mismatches(TableCost(path), rows + rows) == []
+
+
 @needs_fork
 @pytest.mark.parametrize("name", TP1_FILES)
 def test_live_against_fork(name):
