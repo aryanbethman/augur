@@ -50,7 +50,9 @@ priced as bf16).
 
 `--scheduler-cls DOTTED.PATH` runs your own vLLM scheduler class (a `Scheduler`
 subclass, or `AsyncScheduler` with `--async-scheduling`) in place of vLLM's;
-`--step-log-vllm` still logs it. `examples/shortest_prompt_first.py` is one.
+`--step-log-vllm` still logs it. `examples/shortest_prompt_first.py` is one;
+`examples/scheduler_policies.py` holds deadline-first and aging shortest-first, which a real
+`vllm serve --scheduler-cls` loads unchanged (docs/accuracy.md section 6).
 
 Each layer's KV-cache spec comes from vLLM's own model definition, built on the
 meta device without weights: sliding-window, MLA, Mamba-hybrid and mixed models

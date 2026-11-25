@@ -643,13 +643,46 @@ simulator gets, without that term.
   at the top (tau 0.87, regret 1.3%).
 - **Absolute error:** only augur with the shared-KV term is close, at 3-13% above real. The rest are 70-90% above,
   because a simulator without vLLM's block ids cannot price decodes that share KV.
-- **Limits:** a monotone setting cannot separate the schedulers. A setting whose best lies inside the range, such
-  as KV size, is next. There is one real run per value, so run-to-run noise is not measured.
+- **Limits:** a monotone setting cannot separate the schedulers, and there is one real run per value, so run-to-run
+  noise is not measured.
 - **Throughput:** a 100-configuration sweep (10 budgets × 10 arrival-rate scales), 4 runs at a time on 4 cores, does
   414 configurations an hour on augur and 431 on BLIS. Both used the same Python pricer, so this compares the
   schedulers, not BLIS's native latency model.
 
-## 6. A KV offload policy written as a vLLM plugin
+**Settings whose answer depends on token content** (`sweep.py spec-*`, `kv-*`, `router-*`, 2026-11-26).
+
+*ngram speculation depth* k = 0-5. Each (workload, k) has one real run on GPU 0 (Qwen3-1.7B, sync, all overloaded):
+code (20 SWE-bench sessions, 316 calls), RAG (250 requests) and chat (ShareGPT 300). Acceptance is what the
+content allows, so it differs by workload: at k = 5 a decode emits 2.64 tokens a step on code, 2.03 on RAG and 2.53
+on chat. Each simulator's pick of k by mean end-to-end latency, with its regret in real latency:
+
+| Workload | Real best | augur | BLIS, one fixed acceptance (2.05) | BLIS, each run's measured acceptance |
+| --- | --- | --- | --- | --- |
+| code | k=5 | k=5 (0%) | k=2 (27%) | k=5 (0%) |
+| RAG | k=4 | k=5 (0.9%) | k=3 (5.3%) | k=5 (0.9%) |
+| chat | k=4 | k=5 (4.3%) | k=2 (14.5%) | k=4 (0%) |
+
+- **How augur ran:** token-faithful, with the outputs recorded in the real k = 0 run. Greedy decoding gives the same
+  outputs at every k, so its drafts and acceptance come from the text, as on the GPU. By mean TPOT instead, regret is
+  3.7-8.2% for fixed-rate BLIS and 0-1.8% for augur.
+- **BLIS with one fixed acceptance rate**, the mean over all real runs (what a user would supply), picks the wrong k
+  on every workload. Its ranking barely correlates with the real one: Kendall tau −0.07 to +0.33.
+- **BLIS given each run's own measured acceptance**, which the user cannot know before running, picks as well as
+  augur. So the error comes from the missing content, not from BLIS's scheduler.
+- **Noise:** repeat real runs at k = 4 and 5 differ by 2-6% in TPOT, so augur's k = 5 picks on RAG and chat are within
+  noise. BLIS got its greedy prefix-group encoding on code, since "best" broke on sessions there.
+
+*KV size* (tenants workload, 400 requests, 1,000-5,334 blocks, one real run each). This setting is monotone too: every
+simulator picks the largest cache. augur is within −0.7 to +6.1% of real mean latency at every size; BLIS is 36-86%
+high.
+
+*Router choice* (simulated only). Round-robin, cache-aware and kv-aware ran on overlapping-prompt cells at 64, 256 and
+1,024 engines. BLIS ran its nearest configurations (round-robin, its default scorers, precise prefix-cache
+routing), which are not the same algorithms as augur's. The two rank the routers the same at 256 engines and
+differently at 64 and 1,024; at 1,024 augur puts cache-aware first and BLIS puts kv-aware first. There is no real run
+at this scale to say which is right.
+
+## 6. Research code written once for vLLM and augur
 
 vLLM 0.33's CPU offloading manager takes its eviction policy by name from the connector's extra config
 (`eviction_policy`, `cache_policy_module_path`), so a policy can live outside vLLM. `examples/kv_offload_policies.py`
@@ -676,6 +709,35 @@ LRU); at that load per engine each engine behaves like the validated one, so thi
 check of it. Limits: one workload, model and GPU, one run per policy, and margins only a few times augur's 1-2%
 error. The ranking belongs to this configuration (a CPU tier small for the working set, long tool waits). A port such
 as BLIS would need each policy rewritten first.
+
+**Scheduler policies** (2026-11-26, `examples/scheduler_policies.py`, `scripts/sched_compare.py`). Each policy is a
+vLLM Scheduler subclass in one file, loaded unchanged by a real `vllm serve --scheduler-cls` and by augur:
+- FCFS, vLLM's default;
+- shortest prompt first (SPF);
+- earliest deadline first (EDF): deadline = arrival + 5 s + 10 ms per prompt token;
+- aging shortest-first: each admission takes 4 tokens off every waiting prompt's length.
+
+The workload is ShareGPT 300 at 2.5 req/s, Qwen3-1.7B on the 4060 Ti, async. The metric, fixed before the runs, is
+mean TTFT, with p90 TTFT and SLO attainment (TTFT within the deadline) as secondary. Real / augur:
+
+| Policy | Mean TTFT (s) | p90 TTFT (s) | SLO met | Replay, identical steps |
+| --- | --- | --- | --- | --- |
+| Aging shortest-first | 11.72 / 13.45 | 41.5 / 46.6 | 75.0 / 70.0% | 3,723 / 3,723 |
+| SPF | 13.18 / 14.42 | 59.4 / 65.3 | 78.7 / 78.3% | 3,701 / 3,701 |
+| EDF | 17.84 / 19.15 | 39.4 / 42.5 | 43.0 / 43.0% | 3,103 of about 3,700; differs from step 1,169 |
+| FCFS | 19.53 / 20.83 | 39.9 / 43.0 | 40.7 / 39.3% | 3,706 / 3,706 |
+
+- **Rankings:** augur ranks the policies as the real runs do on all three metrics. Its mean TTFT is 7-15% high for every
+  policy.
+- **Replays:** the three policies that never read the clock replay exactly. EDF reads each request's arrival time,
+  which real vLLM stamps from the wall clock and augur from the virtual clock. Near-tied deadlines then order
+  differently, and at step 1,169 a different request is preempted. That cause is inferred, not traced.
+- **At 1,024 GPUs:** 100 requests per GPU at 10 req/s, 8 workers. The order on mean TTFT holds (Aging 1.86 s, SPF
+  2.55, EDF 2.56, FCFS 2.96), but the run is a 10 s burst, not the validated load.
+- **Porting to BLIS:** reading its Go engine, SPF already exists as `sjf`. EDF is about 20-25 lines and aging about 30
+  (an `OrderQueue` each); its blis-vllm path needs about 40 more lines. Simple ordering policies are cheap to port,
+  so the gain here is checking the same code against the real server, not avoiding a large rewrite.
+- **Limits:** one real run per policy.
 
 ## 7. Speed
 
@@ -778,8 +840,8 @@ Where augur's time goes at 1,024 GPUs (pyinstrument, % of the run after start-up
 | Pricer | 6% | 19% |
 | Event loop | 10% | 16% |
 
-Counting shared KV blocks runs even with prefix caching off, where nothing can be shared. vLLM's stats and logging
-are already off.
+This profile predates 2026-11-26. Counting shared KV blocks then ran even with prefix caching off, where nothing can
+be shared; it no longer does (CPU per step, below). vLLM's stats and logging are already off.
 
 **Parallel workers** (`--workers N`, 2026-11-25):
 - **How it works:**
@@ -794,22 +856,61 @@ are already off.
   - ShareGPT at 1,024 GPUs (61,440 calls) with 4, 8 and 16 workers.
   - Power-of-two and least-loaded at 64 GPUs.
   - A test of every router kind, sync and async, with sessions.
-- **Timing:** 1,024 GPUs, ShareGPT at 10 req/s per GPU, 60 calls per GPU (1.1M steps), on 8 cores:
+- **Since 2026-11-26:**
+  - Each worker builds its own engines.
+  - Windows run past the routing horizon by the front-end delay.
+  - With a router that reads no feedback and no sessions, the main process routes the next window while the workers
+    run.
+  - Byte-identical to one worker:
+    - ShareGPT at 256 GPUs with 4, 6, 8 and 16 workers;
+    - ShareGPT at 1,024 GPUs with 4, 8 and 16 workers;
+    - SWE-bench at 256 GPUs with 8 workers;
+    - least-loaded at 8 workers.
+- **Timing:** speed.py's production load, ShareGPT, measured on a busy host (load 10-25) and before the per-step
+  savings below. Wall time (CPU):
 
-| Router | Workers | Wall | CPU | Memory (summed PSS) |
-| --- | --- | --- | --- | --- |
-| round-robin | 1 | 1,150 s | 1,151 s | 9.9 GB |
-| round-robin | 4 | 288 s | 1,032 s | 13.8 GB |
-| round-robin | 8 | 222 s | 1,505 s | 13.8 GB |
-| round-robin | 16 | 222 s | 1,457 s | 13.9 GB |
-| power-of-two | 8 | 252 s | 1,424 s | 14.2 GB |
-| least-loaded | 8 | 299 s | 1,577 s | 13.9 GB |
+| GPUs | 1 worker | 4 workers | 8 workers | 16 workers | 8 workers, power-of-two | 8 workers, least-loaded |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256 | 421 s (425) | 113 s (405) | 87 s (598) | 74 s (582) | 123 s | 111 s |
+| 1,024 | 2,031 s (2,035) | 463 s (1,733) | 351 s (2,519) | 294 s (2,492) | 431 s | 508 s |
 
-- **Speed-up:** 5.2x at 8 workers, with no gain past 8 on 8 cores. The main process is the likely limit; it has not
-  been profiled.
-- **Start-up:** building 1,024 engines still takes 33 s on one core before the fork.
+- **Against BLIS:** at 256 GPUs on ShareGPT, augur with 8 workers finishes in 87 s of wall time against BLIS's
+  100 s of CPU on one core. On SWE-bench at 256 GPUs it is a draw, 175 s against 178 s. Sessions limit it: a next
+  turn is known only the delivery latency (8 ms) plus front end after a completion, so the run needs about 29k
+  barriers, each waiting for the slowest worker.
+- **What limits scaling:**
+  - 4 workers on 4 physical cores cost 405 CPU s, and 8 workers on those cores' 8 hyperthreads 598 CPU s. That
+    sharing, not the main process, sets the CPU cost; the main process spends about 0.2 s per run applying results.
+  - Least-loaded stops the workers twice per arrival.
+- **Start-up:** the 33 s measured on 2026-11-25 did not reproduce. A one-call run at 1,024 GPUs takes 9 s, 5.4 s of it
+  imports.
 - **Not yet supported:** DP, prefill/decode engines, `--contention on`, replay and the LLMServingSim pricer are
   refused with workers.
+
+**CPU per step** (2026-11-26, 256 GPUs, production load, cores 2-3, after start-up; output byte-identical):
+
+| Workload | CPU before | CPU after | Steps per CPU s before | after |
+| --- | --- | --- | --- | --- |
+| ShareGPT | 418.7 s | 327.9 s | 1,019 | 1,322 |
+| SWE-bench | 563.6 s | 380.0 s | 3,074 | 4,644 |
+
+- **What changed:**
+  - Shared KV blocks are counted only when prefix caching can share them; that counting was 13-16% of the run.
+  - Attention table lookups are memoized.
+  - The batch key is built in one pass.
+  - Pricer caches are cleared when full, since they grew with the cluster.
+- **Speed-up:** 1.30x on ShareGPT and 1.51x on SWE-bench. vLLM's own output processing (`update_from_output`, 6-12%)
+  is untouched.
+
+**Memory** (2026-11-26):
+- **Fixed per engine:** about 0.75 MB, 0.69 MB of it vLLM's block pool (about 129 B per KV block).
+- **Per request:** what grew with requests was token ids and times held as Python ints.
+  - Each call's token times are now an int64 array (8 B a token, not 40 B).
+  - Filler token ids share one int object per id.
+  - That cuts about 70 KB of resident memory per request to about 20 KB.
+- **Result:** peak RSS at 1,024 GPUs on ShareGPT went from 13.6 to 9.1 GB, with the same steps and calls. At that
+  rate 16,384 GPUs would need about 140 GB, still more than the 125 GB host. The rest per engine is not yet split
+  (in-flight request state and allocator retention).
 
 ## Modeled, not yet checked against real vLLM
 
