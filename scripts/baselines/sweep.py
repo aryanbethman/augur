@@ -384,6 +384,52 @@ def cmd_router_table(a):
                 print(f"  {sim} ranking by mean E2E (best first) at {n}: " + " < ".join(f"{k} {v:.2f}" for k, v in sorted(ok.items(), key=lambda kv: kv[1])))
 
 
+# KV size sweep: --num-gpu-blocks-override on the tenants workload (None: the engine's own 5,334 blocks)
+KV_BLOCKS = [1000, 1800, 2800, 4000, 5334]
+
+
+def kv_dir(b, tag=""):
+    return os.path.join(ROOT, "out/real", f"sweep_kv{b}{tag}")
+
+
+def cmd_kv_real(a):
+    for b in a.blocks:
+        d = kv_dir(b, a.tag)
+        if os.path.exists(f"{d}/client.json") and os.path.getsize(f"{d}/client.json"):
+            continue
+        t = time.time()
+        r = sh(f"flock ~/gpu0.lock {ROOT}/scripts/real_trace_run.sh sweep_kv{b}{a.tag} {WORKLOAD} '' --num-gpu-blocks-override {b}",
+               cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("kv", b, "exit", r.returncode, f"{time.time() - t:.0f}s", flush=True)
+
+
+def cmd_kv_sims(a):
+    def one(b):
+        n = f"sweep_kv{b}"
+        run_sh(n, kv_dir(b), WORKLOAD, "prepare augur blis compare", {"SHARED_KV": "on", "NUM_GPU_BLOCKS": str(b)}, pin=True)
+        sh(f"rm -f {base_dir(n)}/*_steps*.jsonl")
+    with cf.ThreadPoolExecutor(a.jobs) as ex:
+        list(ex.map(one, a.blocks))
+
+
+def cmd_kv_table(a):
+    sims = ("real", "augur", "blis")
+    for m in ("e2e", "ttft"):
+        res = {b: {k: json.load(open(f"{base_dir(f'sweep_kv{b}')}/results.json"))[0]["sims"][k]["abs"][m][0] for k in sims}
+               for b in a.blocks}
+        print(f"\nmean {m} (s)\n| blocks | " + " | ".join(sims) + " | preemptions real / augur / BLIS |\n|" + " --- |" * (len(sims) + 2))
+        for b in a.blocks:
+            r = json.load(open(f"{base_dir(f'sweep_kv{b}')}/results.json"))[0]["sims"]
+            print(f"| {b} | " + " | ".join(f"{res[b][k]:.2f}" for k in sims) + " | " +
+                  " / ".join(str(r[k].get("pre", "-")) for k in sims) + " |")
+        real = [res[b]["real"] for b in a.blocks]
+        for k in sims[1:]:
+            y = [res[b][k] for b in a.blocks]
+            p = int(np.argmin(y))
+            print(f"{k}: picks {a.blocks[p]} (real best {a.blocks[int(np.argmin(real))]}), regret {100 * (real[p] / min(real) - 1):.1f}%, "
+                  f"tau {kendall(real, y):+.2f}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -410,6 +456,12 @@ def main(argv=None):
         sub.choices[n].add_argument("--routers", nargs="+", default=list(ROUTERS))
     sub.choices["router-run"].add_argument("--sims", nargs="+", default=["augur", "blis"])
     sub.choices["router-run"].add_argument("--workers", type=int, default=3)
+    for n, f in (("kv-real", cmd_kv_real), ("kv-sims", cmd_kv_sims), ("kv-table", cmd_kv_table)):
+        s = sub.add_parser(n)
+        s.add_argument("--blocks", type=int, nargs="+", default=KV_BLOCKS)
+        s.set_defaults(f=f)
+    sub.choices["kv-real"].add_argument("--tag", default="")
+    sub.choices["kv-sims"].add_argument("--jobs", type=int, default=3)
     a = p.parse_args(argv)
     a.f(a)
     return 0
