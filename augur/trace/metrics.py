@@ -12,6 +12,7 @@ import csv
 import os
 from array import array
 from dataclasses import dataclass, field
+from itertools import accumulate
 
 import numpy as np
 
@@ -27,7 +28,54 @@ def ensure_parent_dir(path: str | None) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
 
-@dataclass
+_BIG = (1 << 32) - 1  # a gap that does not fit 32 bits (a preempted call's stall) is kept apart
+
+
+class PackedTimes:
+    """A finished call's token times as the first time and the gaps after it, 4 bytes a token instead of 8. Every
+    finished call keeps its times to the end of the run, so this is what grows with the request count."""
+
+    __slots__ = ("first", "gaps", "big")
+
+    def __init__(self, first: int, gaps: array, big: dict) -> None:
+        self.first, self.gaps, self.big = first, gaps, big  # big: index in gaps -> its real value
+
+    def __len__(self) -> int:
+        return len(self.gaps) + 1
+
+    def deltas(self) -> list[int]:
+        out = self.gaps.tolist()
+        for i, g in self.big.items():
+            out[i] = g
+        return out
+
+    def __iter__(self):
+        return accumulate(self.deltas(), initial=self.first)
+
+    def __getitem__(self, i: int) -> int:
+        return self.first if i == 0 else list(self)[i]
+
+
+def pack_times(t: array):
+    """``t`` as PackedTimes, or unchanged when it has fewer than two times."""
+    if len(t) < 2:
+        return t
+    gaps = [b - a for a, b in zip(t, t[1:])]
+    big = {i: g for i, g in enumerate(gaps) if g >= _BIG}
+    for i in big:
+        gaps[i] = _BIG
+    return PackedTimes(t[0], array("I", gaps), big)
+
+
+class _Done(list):
+    """Recorder.done: a call's times are packed as it is added, since none changes after it finishes."""
+
+    def append(self, rec) -> None:
+        rec.token_times = pack_times(rec.token_times)
+        super().append(rec)
+
+
+@dataclass(slots=True)  # a record per finished call, kept to the end of the run: no per-instance dict
 class CallRecord:
     num_id: int
     call_id: str
@@ -61,12 +109,12 @@ class CallRecord:
     @property
     def itl(self) -> list[int]:
         t = self.token_times
-        return [b - a for a, b in zip(t, t[1:])]
+        return t.deltas() if isinstance(t, PackedTimes) else [b - a for a, b in zip(t, t[1:])]
 
 
 class Recorder:
     def __init__(self) -> None:
-        self.done: list[CallRecord] = []
+        self.done: list[CallRecord] = _Done()
 
     def write_csv(self, path: str) -> None:
         with open(path, 'w', newline='') as f:
@@ -80,12 +128,27 @@ class Recorder:
                             r.session_id or '', r.index, r.cached_tokens, r.num_preemptions,
                             r.prefill_done_ns if r.prefill_done_ns is not None else ''])
 
+    def _itl_ms(self) -> np.ndarray:
+        """Every call's inter-token gaps in ms, in call order, filled in place: a Python list of them held 40 B a token
+        (2.7 GB at 1,024 GPUs of ShareGPT, the run's peak). The mean must be taken before the percentile reorders it."""
+        out = np.empty(sum(max(len(r.token_times) - 1, 0) for r in self.done))
+        i = 0
+        for r in self.done:
+            t = r.token_times
+            n = max(len(t) - 1, 0)
+            if isinstance(t, PackedTimes) and not t.big:
+                np.divide(np.frombuffer(t.gaps, dtype=np.uint32), 1e6, out=out[i:i + n], dtype=np.float64)
+            else:
+                out[i:i + n] = np.array(r.itl, dtype=np.int64) / 1e6
+            i += n
+        return out if len(out) else np.zeros(1)
+
     def summary(self) -> dict:
         if not self.done:
             return {"calls": 0}
         ttft = np.array([r.ttft for r in self.done]) / 1e6
         tpot = np.array([r.tpot for r in self.done]) / 1e6
-        itl = np.array([x for r in self.done for x in r.itl] or [0]) / 1e6
+        itl = self._itl_ms()
         out_tokens = sum(len(r.token_times) for r in self.done)
         start = min(r.arrival_ns for r in self.done)
         end = max(r.end_ns for r in self.done)
@@ -98,7 +161,7 @@ class Recorder:
             "sim_seconds": round(end / 1e9, 3),
             "ttft_ms": {"mean": ttft.mean(), "p50": np.median(ttft), "p99": np.percentile(ttft, 99)},
             "tpot_ms": {"mean": tpot.mean(), "p50": np.median(tpot), "p99": np.percentile(tpot, 99)},
-            "itl_ms": {"mean": itl.mean(), "p99": np.percentile(itl, 99)},
+            "itl_ms": {"mean": itl.mean(), "p99": np.percentile(itl, 99, overwrite_input=True)},
             "output_tok_per_s": out_tokens / span_s,
             "prefix_hit_rate": cached / max(in_tokens, 1),
             "preemptions": sum(r.num_preemptions for r in self.done),

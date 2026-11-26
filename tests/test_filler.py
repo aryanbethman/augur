@@ -20,3 +20,13 @@ def test_bulk_draw_gives_randranges_ids(lo, hi, count):
 def test_vocab_filler_is_seeded_by_the_key():
     rng = random.Random(zlib.crc32(b"session_3#2/in"))
     assert _Filler(150000).ids(500, "session_3#2/in") == [rng.randrange(1000, 150000) for _ in range(500)]
+
+
+@pytest.mark.parametrize("vocab", [150000, None])
+@pytest.mark.parametrize("count", [1, 127, 128, 129, 700])
+def test_lazy_filler_reads_as_the_list(vocab, count):
+    eager, lazy = _Filler(vocab), _Filler(vocab)
+    want, got = eager.ids(count, "c#1/out"), lazy.lazy(count, "c#1/out")
+    assert len(got) == count and [got[i] for i in range(count)] == want
+    assert list(got[count // 2:count // 2 + 5]) == want[count // 2:count // 2 + 5] and got[-1] == want[-1]
+    assert [got[i] for i in range(count - 1, -1, -1)] == want[::-1]  # out of order: windows are rebuilt
