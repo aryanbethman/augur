@@ -9,7 +9,7 @@ Finished work lives in docs/accuracy.md and git history, not here.
 Rule for every change: output stays byte-identical unless the change is meant to move it, the six real-GPU replays
 stay exact, and the full test suite passes.
 
-Rule for large-scale runs (items 1, 2, 3, 5, 17): engines must be loaded as in production, so time goes to real
+Rule for large-scale runs (items 1, 2, 4, 15): engines must be loaded as in production, so time goes to real
 scheduling work, not start-up, idle engines or a draining tail. scripts/baselines/speed.py's defaults do this:
 replicated ShareGPT at 10 req/s per GPU and SWE-bench at 0.2 sessions/s per GPU (the real single-GPU runs' rates).
 Report each run's busy share, mean batch against the real run's, and start-up CPU apart from the run
@@ -18,79 +18,69 @@ Report each run's busy share, mean batch against the real run's, and start-up CP
 ## 1. Scale, speed and utility (no new hardware)
 
 Where things stand (docs/accuracy.md sections 5-7):
-- **Speed:** with `--workers 8`, augur finishes 256 GPUs of ShareGPT in 87 s of wall time against BLIS's 100 s of
-  CPU; SWE-bench at 256 GPUs is a draw (175 against 178 s). CPU per step fell 1.3x (ShareGPT) and 1.5x (SWE-bench)
-  on 2026-11-26; BLIS still spends less CPU per step.
-- **Memory:** augur needs 9.1 GB at 1,024 GPUs on ShareGPT. BLIS's memory grows with the run: it needs 8x augur's on
-  SWE-bench at 1,024 GPUs and more than 125 GB on ShareGPT, so it does not finish there.
-- **Utility:** BLIS with one fixed speculation acceptance rate picks the wrong ngram depth on code, RAG and chat
-  (4-27% regret); augur picks the real best or one within noise. Scheduler policies written once rank the same in
-  real vLLM and augur.
+- **Speed:** with `--workers 8`, every 256-GPU run finishes inside BLIS's CPU time: ShareGPT 67-87 s and SWE-bench
+  118 s, against 100 and 178 s. Measured on a busy host. BLIS still spends less CPU per step.
+- **Memory:** augur needs 5.9 GB at 1,024 GPUs on ShareGPT, which projects to ~78 GB at 16,384. BLIS's memory grows with
+  the run: it needs more than 125 GB on ShareGPT at 1,024 GPUs and does not finish.
+- **Utility:**
+  - BLIS with one fixed speculation acceptance rate picks the wrong ngram depth on code, RAG and chat, outside
+    run-to-run noise. augur's picks hold within noise.
+  - Scheduler policies written once rank the same in real vLLM and augur, over two real runs each.
+  - On 2 real engines augur places 95-100% of requests where real round-robin and cache-aware routing did; BLIS
+    places 50-54%.
 
 BLIS's scheduler port is exact on our runs, so better scheduling logic is not a claim augur can make. augur wins
 where the answer depends on token content and vLLM's own block ids (overlapping prompts, shared-KV pricing,
 speculation acceptance), on memory at scale, and on running a researcher's code unchanged. It will not win CPU per
-step. The items below push on those wins.
+step. Compiling vLLM's scheduler with Cython was tried and gave 5-7% (not adopted; docs/accuracy.md section 7).
 
-1. [ ] **Workers for sessions and state-reading routers.**
-   - Sessions: a next turn is known only 8 ms (delivery) plus the front end after a completion, so SWE-bench at 256
-     GPUs needs ~29k barriers, each waiting for the slowest worker.
-   - Least-loaded stops the workers twice per arrival.
-   - Then lift the limits: a DP group inside one worker; PD running ahead by the minimum KV transfer time; KV offload
-     (untested with workers).
-   - Retime on a quiet host with the 2026-11-26 CPU savings.
-
-   Target: augur's wall time below BLIS's CPU time from 256 GPUs up on both workloads.
-2. [ ] **Memory, the rest.** 9.1 GB at 1,024 GPUs projects to ~140 GB at 16,384, more than this 125 GB host. The fixed
-   cost is ~0.75 MB an engine (vLLM's block pool). Split the remaining ~6.9 MB an engine (in-flight request state,
-   allocator retention, `scheduler.requests`) and cut it without changing vLLM's code. Target: 16,384 GPUs at
-   production load on one host.
-3. [ ] **Real anchors and repeats for the utility results.**
-   - Router choice: augur and BLIS rank round-robin, cache-aware and kv-aware differently at 64 and 1,024 engines.
-     Add a real anchor at 2 engines (GPU 0 + 1, decisions only, GPU 1 is clock-locked), or with rented GPUs.
-   - ngram depth: repeat real runs at every k and on the code workload (noise is measured only at k = 4, 5 on RAG
-     and chat).
-   - Scheduler policies: more than one real run each.
-   - EDF replay differs from step 1,169: real vLLM stamps arrival times from the wall clock, augur from the virtual
-     clock. Trace it and make replay use the logged arrival times.
-4. [ ] **Compile vLLM's scheduler and KV manager with Cython, source unchanged.** Exact replays prove the decisions
-   are identical. Possibly 1.3-2x on the ~45% of time in vLLM's code. Experimental: vLLM's code may not compile
-   cleanly. Needs Cython installed (download; ask first).
-5. [ ] **Scale study against BLIS** (after 1 and 2): 16 to 16,384 GPUs at production load on a quiet host, 3 runs a
-   point. Report wall time with workers, CPU, peak memory, and the size at which BLIS outgrows the host.
-6. [ ] **Structured outputs** (grammar-constrained decoding) in augur, running vLLM's structured-output manager.
+1. [ ] **Scale study against BLIS:** 16 to 16,384 GPUs at production load on a quiet host, 3 runs a point.
+   - Report wall time with workers, CPU, peak memory, and the size at which BLIS outgrows the host.
+   - Confirm the 78 GB projection with real 4,096- and 16,384-GPU runs.
+   - Measure CPU per step and workers together; they have only been measured apart.
+2. [ ] **The main process in worker runs.** On SWE-bench at 256 GPUs its own work is ~40 of 112 s, on the critical path:
+   drawing filler token ids (~17 s) and pickling long prompts (~9 s). Draw ids in the workers, or ship prompts once.
+   Then lift the limits:
+   - a DP group inside one worker;
+   - PD running ahead by the minimum KV transfer time;
+   - KV offload (untested with workers);
+   - least-loaded still stops every worker at each arrival.
+3. [ ] **Structured outputs** (grammar-constrained decoding) in augur, running vLLM's structured-output manager.
    BLIS's Go code has no structured outputs, grammars or xgrammar (it does have LoRA and multimodal, so those do not
    set augur apart). The work is pricing the grammar compile on the virtual clock.
+4. [ ] **Router choice at scale, for real.** 2 real engines anchor placement (augur matches 95-100%), but GPU 1's clock
+   lock hides timing, and augur and BLIS rank the routers differently at 64 and 1,024 engines. Settling which router
+   is best needs unlocked GPUs (rented, item 13).
 
 ## 2. Standalone and reusable
 
-7. [ ] **Install and run anywhere.** A clean `pip install` (needs vllm 0.33.0 and its dependencies from the network),
+5. [ ] **Install and run anywhere.** A clean `pip install` (needs vllm 0.33.0 and its dependencies from the network),
    a Dockerfile, CI for the tests that need no fork, a setup script for the LLMServingSim fork and ASTRA-Sim
    (still manual), and a LICENSE (needs the owner's choice). The wheel already builds offline and runs from outside
    the repo with a shipped profile.
-8. [ ] **Profile your own GPU, end to end.** `python -m augur.profile --model M --hardware H --tp N` is written and its
+6. [ ] **Profile your own GPU, end to end.** `python -m augur.profile --model M --hardware H --tp N` is written and its
    dry run and conversion are tested, but its GPU stages have never run. Run it on the 4060 Ti first (also shakes out
    the memory probe).
-9. [ ] **Push fork commit e8625e0** (feature/vllm-sim-20261114), which the shipped 4060 Ti profile's provenance points
+7. [ ] **Push fork commit e8625e0** (feature/vllm-sim-20261114), which the shipped 4060 Ti profile's provenance points
    at. Needs the owner, from a machine with access.
-10. [ ] **BLIS's porting lag, from its git history** (no download): for each vLLM release BLIS followed, the Go lines
-    changed and the days between the vLLM release and BLIS's port.
-11. [ ] **augur's vLLM upgrade.** Move augur to the next vLLM release: lines changed, the six real replays rerun, and
-    a decision change that only the new code produces. Needs the new vLLM wheel (download).
-12. [ ] **Third-party and unreleased code on day one.** LMCache's connector unmodified, replayed against a real LMCache
+8. [ ] **BLIS's porting lag, from its git history** (no download): for each vLLM release BLIS followed, the Go lines
+   changed and the days between the vLLM release and BLIS's port.
+9. [ ] **augur's vLLM upgrade.** Move augur to the next vLLM release: lines changed, the six real replays rerun, and
+   a decision change that only the new code produces. Needs the new vLLM wheel (download).
+10. [ ] **Third-party and unreleased code on day one.** LMCache's connector unmodified, replayed against a real LMCache
     run, and a vLLM release candidate or open pull request run without changes to augur. Needs downloads.
 
 ## 3. Needs rented GPUs
 
-13. [ ] **H100 profiles** for Llama-3.1-70B TP4 out to 32k KV tokens (the shipped one stops at 2,048 KV tokens and
+11. [ ] **H100 profiles** for Llama-3.1-70B TP4 out to 32k KV tokens (the shipped one stops at 2,048 KV tokens and
     2,048 tokens per step; augur warns and reports steps_beyond_profile). About 4-12 GPU hours.
-14. [ ] **MoE with wider expert parallelism** than DP2 + EP2 of TP1 ranks: profile those layouts, then price them from
+12. [ ] **MoE with wider expert parallelism** than DP2 + EP2 of TP1 ranks: profile those layouts, then price them from
     tables. Today they fall back to the fork's legacy EP table (unverified; its collective rule was derived for two
     ranks, and DP rounds through ASTRA-Sim cost ~25 ms each). MoE TP8 has no profile to fit against.
-15. [ ] **Real prefill/decode replay** (one prefill and one decode engine; needs NIXL), and multi-GPU timing on
+13. [ ] **Real prefill/decode replay** (one prefill and one decode engine; needs NIXL), and multi-GPU timing on
     GPUs without a clock lock (GPU 1 here is locked).
-16. [ ] **The per-step CPU term on a second host.** 1.3 ms is one host's value (i7-12700, vLLM 0.33).
-17. [ ] **Engines across hosts** (after items 1 and 2): the same sync over the network, for 100k+ GPUs.
+14. [ ] **The per-step CPU term on a second host.** 1.3 ms is one host's value (i7-12700, vLLM 0.33).
+15. [ ] **Engines across hosts** (after items 1 and 2): the same sync over the network, for 100k+ GPUs.
 
 ## 4. Parked
 
