@@ -128,12 +128,27 @@ class Recorder:
                             r.session_id or '', r.index, r.cached_tokens, r.num_preemptions,
                             r.prefill_done_ns if r.prefill_done_ns is not None else ''])
 
+    def _itl_ms(self) -> np.ndarray:
+        """Every call's inter-token gaps in ms, in call order, filled in place: a Python list of them held 40 B a token
+        (2.7 GB at 1,024 GPUs of ShareGPT, the run's peak). The mean must be taken before the percentile reorders it."""
+        out = np.empty(sum(max(len(r.token_times) - 1, 0) for r in self.done))
+        i = 0
+        for r in self.done:
+            t = r.token_times
+            n = max(len(t) - 1, 0)
+            if isinstance(t, PackedTimes) and not t.big:
+                np.divide(np.frombuffer(t.gaps, dtype=np.uint32), 1e6, out=out[i:i + n], dtype=np.float64)
+            else:
+                out[i:i + n] = np.array(r.itl, dtype=np.int64) / 1e6
+            i += n
+        return out if len(out) else np.zeros(1)
+
     def summary(self) -> dict:
         if not self.done:
             return {"calls": 0}
         ttft = np.array([r.ttft for r in self.done]) / 1e6
         tpot = np.array([r.tpot for r in self.done]) / 1e6
-        itl = np.array([x for r in self.done for x in r.itl] or [0]) / 1e6
+        itl = self._itl_ms()
         out_tokens = sum(len(r.token_times) for r in self.done)
         start = min(r.arrival_ns for r in self.done)
         end = max(r.end_ns for r in self.done)
@@ -146,7 +161,7 @@ class Recorder:
             "sim_seconds": round(end / 1e9, 3),
             "ttft_ms": {"mean": ttft.mean(), "p50": np.median(ttft), "p99": np.percentile(ttft, 99)},
             "tpot_ms": {"mean": tpot.mean(), "p50": np.median(tpot), "p99": np.percentile(tpot, 99)},
-            "itl_ms": {"mean": itl.mean(), "p99": np.percentile(itl, 99)},
+            "itl_ms": {"mean": itl.mean(), "p99": np.percentile(itl, 99, overwrite_input=True)},
             "output_tok_per_s": out_tokens / span_s,
             "prefix_hit_rate": cached / max(in_tokens, 1),
             "preemptions": sum(r.num_preemptions for r in self.done),
