@@ -74,6 +74,14 @@ class _Filler:
         self._n = itertools.count()
         self.vocab = vocab
 
+    def lazy(self, count: int, key: str):
+        """The ids ``ids(count, key)`` would return, as a sequence that holds only the part being read (an output is
+        read in order as the call decodes, so a call in flight need not hold all of it). Called by: make_call."""
+        if self.vocab:
+            return _LazyRandom(zlib.crc32(key.encode()), self.vocab, count)
+        base = _FILLER_BASE + next(self._n) * _FILLER_STRIDE
+        return range(base, base + count)
+
     def ids(self, count: int, key: str = "") -> list[int]:
         if self.vocab:
             return _randranges(random.Random(zlib.crc32(key.encode())), 1000, self.vocab, count)
@@ -97,6 +105,34 @@ def _randranges(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
         r = (words >> np.uint32(32 - k)).astype(np.int64)
         out = np.concatenate([out, r[r < n]])
     return _interned(out[:count] + lo, hi)
+
+
+class _LazyRandom:
+    """``_randranges(Random(seed), 1000, hi, n)`` made a window at a time. The first k ids do not depend on n, so a
+    window is the prefix up to its end, cut: more generation work than one go, but a decoding call holds
+    ``_WINDOW`` ids instead of its whole output."""
+
+    __slots__ = ("seed", "hi", "n", "lo", "win")
+    _WINDOW = 128
+
+    def __init__(self, seed: int, hi: int, n: int) -> None:
+        self.seed, self.hi, self.n, self.lo, self.win = seed, hi, n, 0, []
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(self.n))]
+        if i < 0:
+            i += self.n
+        if not 0 <= i < self.n:
+            raise IndexError(i)
+        if not self.lo <= i < self.lo + len(self.win):
+            self.lo = i - i % self._WINDOW
+            end = min(self.lo + self._WINDOW, self.n)
+            self.win = _randranges(random.Random(self.seed), 1000, self.hi, end)[self.lo:]
+        return self.win[i - self.lo]
 
 
 _INTS: dict[int, np.ndarray] = {}
@@ -203,7 +239,9 @@ class Workload:
             rec_out = [(t + shift) % REPLICA_VOCAB for t in rec_out]
         rec_out = self._generated.get(call_id, rec_out)[:n_out]
         recorded = n_out > 0 and len(rec_out) == n_out
-        if len(rec_out) < n_out:
+        if not rec_out and n_out:
+            rec_out = self._filler.lazy(n_out, call_id + "/out")
+        elif len(rec_out) < n_out:
             rec_out += self._filler.ids(n_out - len(rec_out), call_id + "/out")
         return Call(call_id=call_id, session_id=session_id, index=index, arrival_ns=arrival_ns,
                     prompt_ids=rec_in, output_toks=n_out, output_ids=rec_out, recorded=recorded,
