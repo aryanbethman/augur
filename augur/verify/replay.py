@@ -224,6 +224,7 @@ class ReplayWorkload(Workload):
     log_path: str = ""
     log_paths: list | None = None  # several engines' logs (their requests reach the cluster at the earliest add)
     _arrivals: dict = field(default_factory=dict)
+    _arr_time: dict = field(default_factory=dict)  # logged Request.arrival_time (a scheduler may order by it)
     _after_sched: set = field(default_factory=set)
 
     def __post_init__(self):
@@ -242,6 +243,7 @@ class ReplayWorkload(Workload):
                     if cid in self._arrivals:
                         continue
                     self._arrivals[cid] = e["t"] - t0
+                    self._arr_time[cid] = e.get("arr")
                     # Logged after a step that started at this same instant: it
                     # reached the engine after that schedule, so it must not join
                     # that step (only augur's own logs have such exact ties).
@@ -262,6 +264,7 @@ class ReplayWorkload(Workload):
             if t is None:
                 continue  # not in this run (e.g. a shorter run of the trace)
             c.arrival_ns = t
+            c.arrival_time = self._arr_time.get(c.call_id)
             c.session_id = None  # released by time, not by the previous call
             c.after_step_start = c.call_id in self._after_sched
             out.append(c)
