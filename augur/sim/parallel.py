@@ -13,7 +13,10 @@ Why the order is the same. Engines meet only through the router and through sess
   the single-process queue's sequence numbers. Landings are merged across workers by that same key.
 * A completion at time t makes the router's release at t + delivery and a session's next call at
   t + delivery + tool wait. So once every completion before H is known, nothing unknown can reach the router or the
-  queue before H + delivery: that is how far main may run ahead of the workers.
+  queue before H + delivery: that is how far main may run ahead of the workers. Better, a call cannot finish before
+  its engine's next landing plus one step per further token it still needs (each step lasts at least the step CPU
+  time and gives at most 1 + speculated tokens). Workers report the earliest such time plus the tool wait of the
+  call's successor (``_Shard.bound``), and main may run to that plus delivery.
 * ``Router.needs`` says what a placement reads. "none": nothing from the engines (round-robin, hashes, ...), so
   main routes a whole window at once. "completions": in-flight counts, which are exact inside that window.
   "engines": the engines' queue lengths and KV events, so the workers stop at every arrival instant and report.
@@ -40,6 +43,13 @@ INF = 1 << 62
 WINDOW_NS = 1_000_000_000  # without sessions or in-flight counts to wait for, how much arrival time main ships at once
 
 
+def step_floor(eng, tokens: int, done: int = 0) -> int:
+    """Least virtual time `tokens` more output tokens take on `eng`, less `done` steps already counted (the landing in
+    flight). A step gives at most 1 + speculated tokens; a synchronous one lasts at least its CPU time, an async one is
+    priced by the GPU alone, so it has no floor."""
+    return max(0, -(-tokens // (1 + eng.ctx.spec_k)) - done) * (0 if eng.async_sched else eng.ctx.cpu_fixed_ns)
+
+
 def unsupported(a) -> str | None:
     """Why this configuration cannot use --workers > 1, or None. Called by: cli.main."""
     # shortcut: DP and PD engines meet outside the router (a DP group's lockstep rounds, KV pulls), so main would have
@@ -61,6 +71,7 @@ class RemoteEngine:
         self.engine_id, self.spec, self.max_model_len = engine_id, first.spec, first.max_model_len
         self.vllm_config, self.async_sched, self.block_hasher = first.vllm_config, first.async_sched, first.block_hasher
         self.ctx = SimpleNamespace(cost=first.ctx.cost, offload=None, output_ids={}, recorded=set())
+        self.ctx.spec_k, self.ctx.cpu_fixed_ns = getattr(first.ctx, "spec_k", 0), getattr(first.ctx, "cpu_fixed_ns", 0)
         self.busy, self.idle_since, self.admitting = False, None, 0
         self.steps, self.sched_cpu_s, self.step_log = 0, 0.0, None
 
@@ -104,6 +115,29 @@ class _Shard(Coordinator):
         self._pushed_at: dict[int, int] = {}
         self.landings: list = []
         self._done: list = []
+        self.w: dict[str, tuple] = {}  # call id -> (tool wait of its successor, or 0, and its engine)
+
+    def bound(self, until: int) -> int:
+        """The earliest a call that has a ``w`` can finish, plus its w (module docstring); INF if none."""
+        if until >= INF or not self.w:
+            return INF
+        land = {}
+        best = INF
+        for ev in self._q:
+            if ev.kind == "step_done":
+                eid = ev.payload[0].engine_id
+                land[eid] = min(land.get(eid, INF), ev.t)
+            elif ev.kind == "wadmit":
+                eng, call = ev.payload
+                if call.call_id in self.w:
+                    best = min(best, ev.t + step_floor(eng, call.output_toks) + self.w[call.call_id][0])
+        for cid, (w, eng) in self.w.items():
+            rec = self._records.get(cid)
+            if rec is not None:  # a call not yet in its engine is counted above
+                left = self._calls[cid].output_toks - len(rec.token_times)
+                at = land.get(eng.engine_id)
+                best = min(best, (at + step_floor(eng, left, 1) if at is not None else until + step_floor(eng, left)) + w)
+        return best
 
     def _push(self, t, prio, kind, payload) -> None:
         if kind == "step_done":
@@ -135,6 +169,7 @@ class _Shard(Coordinator):
         self._done.append((call_id, rec.first_sched_ns, rec.cached_tokens, rec.num_preemptions,
                            rec.token_times))
         del self._calls[call_id], self._records[call_id]
+        self.w.pop(call_id, None)
         eng.ctx.output_ids.pop(call_id, None)
         eng.ctx.recorded.discard(call_id)
 
@@ -148,13 +183,15 @@ def _serve(conn, build, ids, delivery_ns: int, kv: bool) -> None:
             msg = conn.recv()
             if msg[0] == "adv":
                 _, until, admits, loads = msg
-                for t, eid, call in admits:
+                for t, eid, call, w in admits:
                     shard.queued[eid] += 1
+                    if w is not None:
+                        shard.w[call.call_id] = (w, shard.by_id[eid])
                     shard._push(t, ARRIVAL, "wadmit", (shard.by_id[eid], call))
                 shard._drain(None if until >= INF else until)
                 landings, shard.landings = shard.landings, []
                 conn.send((landings, {e.engine_id: type(e).load(e) + shard.queued[e.engine_id] for e in engines}  # not main's patched load
-                           if loads else None, shard._q[0].t if shard._q else INF))
+                           if loads else None, shard._q[0].t if shard._q else INF, shard.bound(until)))
                 continue
             for e in engines:
                 log = getattr(e.core.scheduler, "_log", None)
@@ -188,33 +225,53 @@ class ParallelCoordinator(Coordinator):
         self._sessions_in_flight = 0
         self._pending = False  # a window is out whose answer main has not read
         self._limit = INF  # main may apply queue events before this
+        self._wb = [INF] * self.workers  # each worker's bound (``_Shard.bound``) as of its last answer
+        self._unsent_b = self._pend_b = INF  # the same for calls not yet sent to a worker, and sent in the window out
+        self._wcall: dict[str, int] = {}  # call id -> w, from its release to its shipping
         for e in self.engines:  # what a router reads, as the workers last reported
             e.load = lambda e=e: self._load[e.engine_id] + e.admitting + self._unsent[e.engine_id]
 
     def _push(self, t, prio, kind, payload) -> None:
-        if kind == "admit" and self.needs != "engines":
+        if kind == "admit":
             # A call reaching its engine after the front end: ship it with its time now, so workers can run past the
-            # routing horizon by the front end's delay. Routers that read engine state need `admitting`, so they keep the event.
+            # routing horizon by the front end's delay and need no stop at the admit. A router reading engine state
+            # sees it in the worker's `queued` count, or in `_unsent` within the instant it was routed.
             eng, call = payload
             eng.admitting -= 1
-            self._out[self._owner[eng.engine_id]].append((t, eng.engine_id, call))
+            if self.needs == "engines":
+                self._unsent[eng.engine_id] += 1
+            self._out[self._owner[eng.engine_id]].append((t, eng.engine_id, call, self._wcall.pop(call.call_id, None)))
             self._outmin = min(self._outmin, t)
             return
         heapq.heappush(self._q, _Event(t, prio, (*self._ctx, next(self._seq)), kind, payload))
 
     def _admit(self, eng, call) -> None:
-        self._out[self._owner[eng.engine_id]].append((self.now, eng.engine_id, call))
+        self._out[self._owner[eng.engine_id]].append((self.now, eng.engine_id, call, self._wcall.pop(call.call_id, None)))
         self._unsent[eng.engine_id] += 1
         self._outmin = min(self._outmin, self.now)
 
+    def _successor_wait(self, call) -> int | None:
+        """How long after this call finishes (plus delivery) main can next act because of it: at once for a router
+        counting calls in flight, the tool wait for a session's next call, never for the rest."""
+        if self.needs == "completions":
+            return 0
+        s = self._sessions.get(call.session_id)
+        return call.tool_wait_ns if s is not None and s.next_index < len(s.sub_requests) else None
+
     def _release(self, call, exact: bool = True) -> None:
+        w = self._successor_wait(call)
+        if w is not None:
+            delay = self.frontend_latency_ns + int(self.frontend_ns_per_token * len(call.prompt_ids))
+            b = self.now + delay + step_floor(self.engines[0], call.output_toks) + w
+            self._wcall[call.call_id] = w
+            self._unsent_b = min(self._unsent_b, b)
+            self._limit = min(self._limit, b + self.delivery_latency_ns)
         if call.session_id is not None:
             # shortcut: with no delivery latency a session's next call can follow a completion at the same instant,
             # which only the single-process loop orders; lift by syncing workers at every completion then.
             if self.delivery_latency_ns == 0:
                 raise ValueError("--workers > 1 needs --delivery-latency-ms > 0 for sessions")
             self._sessions_in_flight += 1
-            self._limit = min(self._limit, self.now + self.delivery_latency_ns)
         super()._release(call, exact)
 
     def _finish(self, call_id, rec, eng) -> None:
@@ -239,6 +296,7 @@ class ParallelCoordinator(Coordinator):
             self._collect()  # not two windows ahead: main would block sending while a worker blocks replying
         for conn, out in zip(self._conns, self._out):
             conn.send(("adv", until, out, self.needs == "engines"))
+        self._pend_b, self._unsent_b = self._unsent_b, INF
         self._out = [[] for _ in range(self.workers)]
         self._unsent.clear()
         self._outmin = INF
@@ -247,9 +305,10 @@ class ParallelCoordinator(Coordinator):
     def _collect(self) -> None:
         """What the workers did in the window sent last; its landings are applied here, in the single-process order."""
         self._pending = False
+        self._pend_b = INF
         landings = []
         for i, conn in enumerate(self._conns):
-            lands, loads, self._next_event[i] = self._recv(conn)
+            lands, loads, self._next_event[i], self._wb[i] = self._recv(conn)
             landings += lands
             if loads:
                 self._load.update(loads)
@@ -265,6 +324,11 @@ class ParallelCoordinator(Coordinator):
                 rec.first_sched_ns, rec.cached_tokens, rec.num_preemptions = first_sched, cached, preempted
                 rec.token_times = times
                 self._finish(cid, rec, self._call_engine[cid])
+
+    def _bound(self) -> int:
+        """Before this, nothing a call still out there does can reach the router or the queue."""
+        b = min(min(self._wb), self._unsent_b, self._pend_b)
+        return INF if b >= INF else b + self.delivery_latency_ns
 
     @staticmethod
     def _recv(conn):
@@ -293,19 +357,19 @@ class ParallelCoordinator(Coordinator):
                     continue
                 return
             horizon = max(horizon, first)
-            ahead = delivery if self._sessions_in_flight or self.needs == "completions" else INF
+            bound = self._bound()
             if self.needs == "engines":
-                until = min(main_next, horizon + ahead)
+                until = min(main_next, bound)
                 self._advance(until)
                 horizon, self._limit = until, INF
                 self._apply_main_events(until + 1)  # the instant `until` itself, now that the engines are there
                 continue
-            until = INF if main_next >= INF and ahead >= INF else horizon + min(ahead, WINDOW_NS)
-            self._limit = until
+            until = INF if main_next >= INF and bound >= INF else horizon + WINDOW_NS
+            self._limit = min(until, bound)
             self._apply_main_events(INF)
             # a call routed at or after the limit reaches its engine at least `front` later
             until = self._limit if self._limit >= INF else self._limit + self.frontend_latency_ns
-            (self._send if lazy and ahead >= INF else self._advance)(until)
+            (self._send if lazy else self._advance)(until)
             horizon = until
 
     def _start(self) -> None:
