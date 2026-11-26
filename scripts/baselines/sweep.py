@@ -22,7 +22,9 @@ import concurrent.futures as cf
 import csv
 import itertools
 import json
+import glob
 import os
+import re
 import subprocess
 import sys
 import time
@@ -238,10 +240,44 @@ def cmd_spec_table(a):
     print(open(base_dir("spec_fixed.json")).read())
 
 
+def cmd_spec_noise(a):
+    """Run-to-run noise of the real runs (the first and every ``_r*`` repeat of a cell, from client.csv) and whether each
+    simulator's pick of k holds within it: a pick holds when its real mean (over the runs) is within the cell spreads
+    (max - min over runs, the larger of pick's and best's) of the best k's. The simulators' values are the first-run sweep's."""
+    col = {"tpot": "TPOT", "e2e": "latency"}
+    def real(w, k, m):
+        out = []
+        for t in ("", "_r2", "_r3"):
+            f = f"{spec_dir(w, k, t)}/client.csv"
+            if os.path.exists(f) and os.path.exists(f"{spec_dir(w, k, t)}/client.json") and os.path.getsize(f"{spec_dir(w, k, t)}/client.json"):
+                out.append(float(np.mean([float(r[col[m]]) for r in csv.DictReader(open(f))])) / 1e9)
+        return out
+    cols = {"augur": ("", "augur"), "blis_fixed": ("_fix", "blis"), "blis_oracle": ("", "blis")}
+    for m in ("tpot", "e2e"):
+        for w in a.workloads:
+            runs = {k: real(w, k, m) for k in a.ks}
+            mean = {k: float(np.mean(v)) for k, v in runs.items()}
+            spread = {k: (max(v) - min(v)) if len(v) > 1 else float("nan") for k, v in runs.items()}
+            print(f"\n{w}, mean {m} (s), real runs\n| k | runs | mean | spread % of mean |\n| --- | --- | --- | --- |")
+            for k in a.ks:
+                print(f"| {k} | {' / '.join(f'{x:.4f}' for x in runs[k])} | {mean[k]:.4f} | {100 * spread[k] / mean[k]:.1f} |")
+            sp = [100 * spread[k] / mean[k] for k in a.ks if spread[k] == spread[k]]
+            best = min(a.ks, key=mean.get)
+            print(f"real best (mean of runs) k={best}; spread median {np.median(sp):.1f}%, max {max(sp):.1f}%")
+            for c, (sfx, sim) in cols.items():
+                v = {k: json.load(open(f"{base_dir(f'spec_{w}_k{k}' + ('' if k == 0 else sfx))}/results.json"))[0]["sims"][sim]["abs"][m][0] for k in a.ks}
+                pk = min(a.ks, key=v.get)
+                gap = mean[pk] - mean[best]
+                tol = max(x for x in (spread[pk], spread[best], 0) if x == x)
+                print(f"{c}: picks k={pk}, real gap to best {100 * gap / mean[best]:.1f}% vs spread {100 * tol / mean[best]:.1f}% -> "
+                      f"{'holds within noise' if gap <= tol else 'outside noise'}")
+
+
 # Router sweep: simulated only. N engines get the tenants pattern in cells of 400 requests (each cell its own seed:
 # its own platform preamble and 24 tenants), ROUTER_PER_ENGINE requests per engine arriving at ROUTER_RATE per engine.
 # augur sees the token ids; BLIS gets the best prefix-group encoding of each cell (workloads._map_prefixes "best").
-ROUTER_PER_ENGINE, ROUTER_RATE, BLOCKS, MML = 12, 6.0, 5334, 8192
+ROUTER_PER_ENGINE, ROUTER_RATE, MML = 12, 6.0, 8192
+BLOCKS = int(os.environ.get("ROUTER_BLOCKS", 5334))  # 5,480 for the real 2-engine anchor (its servers report that)
 ROUTERS = {"round-robin": ("round-robin", "round-robin.yaml"), "cache-aware": ("cache-aware", "default.yaml"),
            "kv-aware": ("kv-aware", "guides/precise-prefix-cache-routing.yaml")}  # augur name, BLIS's nearest configuration
 BLIS_PIPE = os.path.expanduser("~/speedrun/blis-ext-count")  # a BLIS build whose engines share one pricer process
@@ -384,6 +420,194 @@ def cmd_router_table(a):
                 print(f"  {sim} ranking by mean E2E (best first) at {n}: " + " < ".join(f"{k} {v:.2f}" for k, v in sorted(ok.items(), key=lambda kv: kv[1])))
 
 
+# Real two-engine anchor: no vLLM Router binary here (and no downloads), so the client places each request with augur's
+# own port of the router policy (augur/sim/router.py) over two real `vllm serve` engines, GPU 0 and GPU 1. kv-aware is
+# fed by the servers' real KV events (zmq); in-flight counts are the client's. Round-robin needs nothing.
+def real_router_dir(n, name):
+    return os.path.join(ROOT, "out/real", f"router_n{n}_{name}")
+
+
+def cmd_router_real(a):
+    import asyncio
+    import collections
+    import signal
+    import threading
+    import msgspec
+    import zmq
+    from vllm.distributed.kv_events import KVEventBatch
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash, maybe_convert_block_hash
+    from types import SimpleNamespace
+    from augur.sim.router import make_router
+    from augur.trace.workload import Workload
+    from augur.verify.client import Client
+    n = 2
+    for name in a.routers:
+        d = real_router_dir(n, name)
+        if os.path.exists(f"{d}/client.csv"):
+            continue
+        os.makedirs(d, exist_ok=True)
+        srv = []
+        for i in range(n):
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(i), "HF_HUB_OFFLINE": "1", "PYTHONHASHSEED": "0",
+                   "AUGUR_STEP_LOG": f"{d}/steps.e{i}", "PYTHONPATH": ROOT}
+            cfg = json.dumps({"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": f"tcp://*:{5560 + i}"})
+            srv.append(subprocess.Popen(
+                [os.path.expanduser("~/augur/.venv/bin/vllm"), "serve", "Qwen/Qwen3-1.7B", "--port", str(8011 + i),
+                 "--seed", "0", "--max-num-seqs", "128", "--max-num-batched-tokens", "2048", "--max-model-len", str(MML),
+                 "--gpu-memory-utilization", "0.85", "--no-async-scheduling", "--scheduler-cls",
+                 "augur.verify.hooks.LoggingScheduler", "--kv-events-config", cfg],
+                env=env, stdout=open(f"{d}/server{i}.log", "w"), stderr=subprocess.STDOUT))
+        stop = threading.Event()
+        try:
+            for i in range(n):
+                for _ in range(300):
+                    if sh(f"curl -sf http://localhost:{8011 + i}/health", stdout=subprocess.DEVNULL).returncode == 0:
+                        break
+                    assert srv[i].poll() is None, f"server {i} died"
+                    time.sleep(2)
+            fn = get_hash_fn_by_name("sha256")
+            init_none_hash(fn)
+            hasher = get_request_block_hasher(16, fn)
+            q = collections.deque()
+
+            def listen(i):
+                sock = zmq.Context.instance().socket(zmq.SUB)
+                sock.connect(f"tcp://localhost:{5560 + i}")
+                sock.setsockopt(zmq.SUBSCRIBE, b"")
+                dec = msgspec.msgpack.Decoder(KVEventBatch)
+                while not stop.is_set():
+                    if sock.poll(200):
+                        q.append((i, dec.decode(sock.recv_multipart()[-1]).events))
+            for i in range(n):
+                threading.Thread(target=listen, args=(i,), daemon=True).start()
+            time.sleep(1)
+
+            class E:
+                def __init__(s, i):
+                    s.engine_id, s.n, s.spec = i, 0, SimpleNamespace(block_size=16)
+
+                def load(s):
+                    return s.n
+
+                def block_hasher(s, ids):
+                    req = SimpleNamespace(all_token_ids=list(ids), num_tokens=len(ids), block_hashes=[], mm_features=None,
+                                          lora_request=None, cache_salt=None, prompt_embeds=None)
+                    return [maybe_convert_block_hash(h) for h in hasher(req)]
+            engines = [E(i) for i in range(n)]
+            router = make_router(ROUTERS[name][0])
+            placed = {}
+
+            class RouterClient(Client):
+                async def _send(s, http, call):
+                    while q:
+                        i, ev = q.popleft()
+                        if hasattr(router, "observe"):
+                            router.observe(i, ev)
+                    e = router.route(call, engines, s._now())
+                    placed[call.call_id] = e
+                    engines[e].n += 1
+                    s.url = f"http://localhost:{8011 + e}/v1/completions"
+                    try:
+                        await Client._send(s, http, call)
+                    finally:
+                        engines[e].n -= 1
+                        router.release(call, s._now())
+
+            c = RouterClient("http://localhost:8011", "Qwen/Qwen3-1.7B",
+                             Workload(f"{router_dir(n)}/wl.jsonl", filler_vocab=150000), f"{d}/tokens.jsonl")
+            if hasattr(router, "first_token"):
+                c.on_first_token = lambda call: router.first_token(call, c._now())
+            rec = asyncio.run(c.run())
+            rec.write_csv(f"{d}/client.csv")
+            json.dump({"placement": placed, "failed": len(c.failed)}, open(f"{d}/placement.json", "w"))
+            print(name, "done", len(rec.done), "failed", len(c.failed), flush=True)
+        finally:
+            stop.set()
+            for p_ in srv:
+                p_.send_signal(signal.SIGINT)
+            for p_ in srv:
+                p_.wait()
+            time.sleep(5)
+
+def _hits(logs):
+    """Prefix-hit share of prompt tokens and requests per engine, from step logs (a request's computed tokens at its first schedule)."""
+    out = []
+    for f in logs:
+        prompt, hit = {}, {}
+        for line in open(f):
+            e = json.loads(line)
+            if e["ev"] == "add":
+                prompt[e["rid"]] = e["prompt"]
+            elif e["ev"] == "sched":
+                hit.update({r: c for r, c in e["new"].items() if r not in hit})
+        out.append((sum(hit.values()), sum(prompt.values()), len(prompt)))
+    return out
+
+
+def cmd_router_real_table(a):
+    """Real vs augur vs BLIS at 2 engines: client TTFT / E2E, prefix-hit share, placement, and augur's replay of the real run."""
+    n = 2
+    d0 = router_dir(n)
+    print("| router | who | TTFT mean / p99 (s) | E2E mean (s) | prefix hit | engine 0 / 1 requests | same engine as real |\n| --- | --- | --- | --- | --- | --- | --- |")
+    for name in a.routers:
+        rd = real_router_dir(n, name)
+        rows = {c: np.array([[float(r["TTFT"]), float(r["latency"])] for r in csv.DictReader(open(f))]) / 1e9
+                for c, f in (("real", f"{rd}/client.csv"), ("augur", f"{d0}/augur_{name}.csv")) if os.path.exists(f)}
+        place = {"real": {k: v for k, v in json.load(open(f"{rd}/placement.json"))["placement"].items()}}
+        logs = sorted(glob.glob(f"{rd}/steps.e*.jsonl"))
+        hit = {"real": _hits(logs)}
+        for who in ("augur",):
+            rr = list(csv.DictReader(open(f"{d0}/augur_{name}.csv")))
+            place[who] = {f"req_{r['request id']}": int(r["instance id"]) for r in rr}  # calls are req_<index> in router-gen's trace
+            hit[who] = [(sum(int(r["cached_tokens"]) for r in rr if int(r["instance id"]) == i),
+                         sum(int(r["input"]) for r in rr if int(r["instance id"]) == i), 0) for i in range(n)]
+        b = json.load(open(f"{d0}/blis_{name}.json"))
+        place["blis"] = {f"req_{r['id'].split('_')[-1]}": int(r["instance"].split("_")[-1]) for r in b["request_rows"]}
+        wl = [json.loads(l)["input_toks"] for l in open(f"{d0}/wl.jsonl")]
+        te = np.array([[r["ttft_us"] / 1e6 + FRONT_S + FRONT_PER_TOKEN_S * wl[int(r["id"].split("_")[-1])],
+                        r["e2e_us"] / 1e6 + FRONT_S + FRONT_PER_TOKEN_S * wl[int(r["id"].split("_")[-1])] + DELIVERY_S]
+                       for r in b["request_rows"] if r["fate"] == "completed"])
+        rows["blis"] = te
+        hit["blis"] = None
+        for who in ("real", "augur", "blis"):
+            m = rows[who]
+            share = (f"{100 * sum(h[0] for h in hit[who]) / sum(h[1] for h in hit[who]):.1f}%" if hit[who]
+                     else f"{100 * b['reports']['engine']['cluster']['cache_hit_rate']:.1f}% (cluster)")
+            pl = place[who]
+            agree = "-" if who == "real" else f"{100 * np.mean([pl[k] == place['real'][k] for k in place['real']]):.0f}%"
+            print(f"| {name} | {who} | {m[:, 0].mean():.2f} / {np.percentile(m[:, 0], 99):.2f} | {m[:, 1].mean():.2f} | {share} | "
+                  f"{sum(v == 0 for v in pl.values())} / {sum(v == 1 for v in pl.values())} | {agree} |")
+        if os.path.exists(f"{rd}/replay.json"):
+            print("  augur replay of the real run, steps identical per engine:", open(f"{rd}/replay.json").read().strip())
+
+
+def cmd_router_real_replay(a):
+    """augur replays each real 2-engine run (the logged durations, arrivals and placement), then compares each engine's steps."""
+    n = 2
+    for name in a.routers:
+        rd = real_router_dir(n, name)
+        logs = sorted(glob.glob(f"{rd}/steps.e*.jsonl"))
+        blocks = [int(re.findall(r"GPU KV cache size: ([0-9,]+)", open(f"{rd}/server{i}.log").read())[-1].replace(",", "")) // 16
+                  for i in range(n)]
+        if len(set(blocks)) != 1:
+            print("note: engines have different KV sizes", blocks)
+        sh(f"rm -f {rd}/augur_replay.*.jsonl")
+        sh(f"taskset -c {CORES} nice -n 10 {PY} -m augur.cli --model Qwen/Qwen3-1.7B --engines {n} --num-gpu-blocks {blocks[0]} "
+           f"--max-num-seqs 128 --max-num-batched-tokens 2048 --max-model-len {MML} --no-async-scheduling --no-recorded-outputs "
+           f"--filler-vocab 150000 --quiet --workload {router_dir(n)}/wl.jsonl --replay-durations {rd}/steps "
+           f"--step-log-vllm {rd}/augur_replay --output {rd}/augur_replay.csv > {rd}/augur_replay.log 2>&1",
+           {"VLLM_LOGGING_LEVEL": "ERROR", "PYTHONPATH": ROOT})
+        res = []
+        for i in range(n):
+            f = sorted(glob.glob(f"{rd}/augur_replay.e{i}.*.jsonl"))
+            r = json.loads(sh(f"{PY} -m augur.verify.replay compare {logs[i]} {f[0]}", capture_output=True, text=True,
+                              env={"PYTHONPATH": ROOT}).stdout)
+            res.append(f"e{i} {r['identical_steps']} of {r['steps_a']}")
+        open(f"{rd}/replay.json", "w").write(", ".join(res) + "\n")
+        print(name, ", ".join(res), flush=True)
+
+
 # KV size sweep: --num-gpu-blocks-override on the tenants workload (None: the engine's own 5,334 blocks)
 KV_BLOCKS = [1000, 1800, 2800, 4000, 5334]
 
@@ -441,7 +665,7 @@ def main(argv=None):
     sub.choices["throughput"].add_argument("--budgets", type=int, default=10)
     sub.choices["throughput"].add_argument("--rates", type=int, default=10)
     sub.choices["throughput"].add_argument("--parallel", type=int, default=4)
-    for n, f in (("spec-real", cmd_spec_real), ("spec-sims", cmd_spec_sims), ("spec-table", cmd_spec_table)):
+    for n, f in (("spec-real", cmd_spec_real), ("spec-sims", cmd_spec_sims), ("spec-table", cmd_spec_table), ("spec-noise", cmd_spec_noise)):
         s = sub.add_parser(n)
         s.add_argument("--workloads", nargs="+", default=list(SPEC_WL))
         s.add_argument("--ks", type=int, nargs="+", default=SPEC_K)
@@ -456,6 +680,13 @@ def main(argv=None):
         sub.choices[n].add_argument("--routers", nargs="+", default=list(ROUTERS))
     sub.choices["router-run"].add_argument("--sims", nargs="+", default=["augur", "blis"])
     sub.choices["router-run"].add_argument("--workers", type=int, default=3)
+    for n, f in (("router-real-table", cmd_router_real_table), ("router-real-replay", cmd_router_real_replay)):
+        s = sub.add_parser(n)
+        s.add_argument("--routers", nargs="+", default=list(ROUTERS))
+        s.set_defaults(f=f)
+    s = sub.add_parser("router-real")
+    s.add_argument("--routers", nargs="+", default=list(ROUTERS))
+    s.set_defaults(f=cmd_router_real)
     for n, f in (("kv-real", cmd_kv_real), ("kv-sims", cmd_kv_sims), ("kv-table", cmd_kv_table)):
         s = sub.add_parser(n)
         s.add_argument("--blocks", type=int, nargs="+", default=KV_BLOCKS)

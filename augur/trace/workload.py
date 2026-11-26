@@ -50,6 +50,7 @@ class Call:
     after_step_start: bool = False  # replay only: reached the engine just after a step began
     priority: int = 0  # vLLM request priority (only --scheduling-policy priority looks at it)
     recorded: bool = False  # output_ids are all recorded ids (none is filler): speculation can verify against them
+    arrival_time: float | None = None  # replay only: the logged Request.arrival_time (real vLLM stamps the wall clock)
 
 
 @dataclass

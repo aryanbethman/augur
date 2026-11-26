@@ -49,15 +49,27 @@ def main():
         r = {"augur": stats(os.path.join(d, "augur.csv"))}
         if os.path.exists(os.path.join(d, "client.csv")):
             r["real"] = stats(os.path.join(d, "client.csv"))
+        rep = os.path.join(d.rstrip("/") + "_r2", "client.csv")  # a second real run of the policy, beside DIR
+        if os.path.exists(rep):
+            r["real_r2"] = stats(rep)
         res[os.path.basename(d.rstrip("/"))] = r
     print(f"{'policy':26}{'':7}{'mean TTFT s':>12}{'p90 s':>9}{'SLO met':>9}")
     for p, r in res.items():
-        for who, x in r.items():
+        for who, x in r.items():  # real, augur, real_r2
             print(f"{p:26}{who:7}{x['mean']:12.2f}{x['p90']:9.2f}{100 * x['slo']:8.1f}%")
-    for who in ("real", "augur"):
+    for who in ("real", "augur"):  # (the second real run, real_r2, is reported below)
         if all(who in r for r in res.values()):
             for key in ("mean", "p90", "slo"):
                 print(f"rank by {key:5} {who:6}", " > ".join(rank(res, who, key)))
+    reps = {p: r for p, r in res.items() if "real_r2" in r}
+    if reps:
+        print("run-to-run noise of the real runs (spread = |run 1 - run 2| / mean of the two)")
+        for p, r in reps.items():
+            print(f"{p:26}" + "".join(f"  {k} {abs(r["real"][k] - r["real_r2"][k]) / ((r["real"][k] + r["real_r2"][k]) / 2) * 100:.1f}%"
+                                      for k in ("mean", "p90", "slo")))
+        for key in ("mean", "p90", "slo"):
+            r2 = {p: {"real": r["real_r2"]} for p, r in reps.items()}
+            print(f"rank by {key:5} real r2", " > ".join(rank(r2, "real", key)))
     if a.json:
         json.dump(res, open(a.json, "w"), indent=1)
 

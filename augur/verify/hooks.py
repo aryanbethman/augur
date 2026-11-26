@@ -9,7 +9,7 @@ These subclass vLLM's Scheduler / AsyncScheduler and only observe: every
 decision is still vLLM's. Set ``AUGUR_STEP_LOG=<path>``; each process writes
 ``<path>.<pid>.jsonl`` with one line per event:
 
-    {"ev": "add",   "t": ns, "rid": ..., "prompt": n}
+    {"ev": "add",   "t": ns, "rid": ..., "prompt": n, "arr": Request.arrival_time}
     {"ev": "sched", "t": ns, "k": step, "tok": {rid: n}, "new": {rid: computed},
      "pre": [rid...]}
     {"ev": "upd",   "t": ns, "k": step, "out": {rid: n}, "fin": [rid...], "left": n,
@@ -99,7 +99,7 @@ class _LoggingMixin:
         log = self._logger()
         if log:
             log.write({"ev": "add", "t": CLOCK("add"), "rid": request.request_id,
-                       "prompt": request.num_prompt_tokens})
+                       "prompt": request.num_prompt_tokens, "arr": request.arrival_time})
 
     def schedule(self, *args, **kwargs):
         t = CLOCK("sched")

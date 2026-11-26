@@ -256,7 +256,7 @@ class SimEngine:
             self.last_progress_ns = now_ns
         req = EngineCoreRequest(
             request_id=rid, prompt_token_ids=call.prompt_ids, mm_features=None,
-            sampling_params=sp, pooling_params=None, arrival_time=now_ns / 1e9,
+            sampling_params=sp, pooling_params=None, arrival_time=now_ns / 1e9 if call.arrival_time is None else call.arrival_time,
             lora_request=None, cache_salt=None, data_parallel_rank=None, priority=call.priority,
         )
         self.ctx.output_ids[rid] = call.output_ids

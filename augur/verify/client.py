@@ -40,6 +40,7 @@ class Client:
         self._ids = 0
         self._t0 = 0
         self._tok_f = open(tokens_out, "w") if tokens_out else None
+        self.on_first_token = None  # optional callback(call), e.g. a router that counts calls still in prefill
 
     def _now(self) -> int:
         return time.monotonic_ns() - self._t0
@@ -69,6 +70,8 @@ class Client:
                         ids = choice.get("token_ids") or []
                         n = len(ids) if ids else (1 if choice.get("text") else 0)
                         if n:
+                            if not rec.token_times and self.on_first_token:
+                                self.on_first_token(call)
                             rec.token_times.extend([self._now()] * n)
                             generated.extend(ids)
         except (aiohttp.ClientError, TimeoutError, ConnectionError) as e:
